@@ -1,0 +1,5 @@
+# Session/orchestrator tooling - not project code
+.claude/
+
+# Rust
+/target
