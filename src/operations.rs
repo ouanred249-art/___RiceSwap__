@@ -1,12 +1,16 @@
 //! The ten operations.
 //!
-//! Each one is an honest stub: it streams its real progress lines, probes the
-//! external tools its real implementation will need, and returns the real
-//! envelope with placeholder data marked `"stub": true`. Snapshot pipelines,
-//! switch sequences, and package operations arrive in later tickets.
+//! The profile-store operations are real: `list` and `info` read manifests
+//! through the store, and `switch` verifies its target then flips the `current`
+//! symlink — the activation primitive later tickets build on. The rest are
+//! honest stubs: they stream their real progress lines, probe the external
+//! tools their real implementation will need, and return the real envelope
+//! with placeholder data marked `"stub": true`. Snapshot pipelines, switch
+//! sequences, and package operations arrive in later tickets.
 
 use crate::cli::Invocation;
 use crate::envelope::{Emitter, Envelope};
+use crate::profile::Store;
 use crate::state::StateStore;
 use crate::tools::{self, Tool};
 use serde_json::{Value, json};
@@ -20,20 +24,22 @@ const WALLPAPER_TOOLS: &[Tool] = &[Tool::Hyprctl, Tool::Grim];
 
 /// Everything an operation needs from its environment.
 pub struct Context {
+    store: Store,
     state: StateStore,
 }
 
 impl Context {
-    /// Locates `$HOME` and loads the state document.
+    /// Locates `$HOME`, opens the profile store, and loads the state document.
     fn new() -> Result<Context, Envelope> {
         let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
             return Err(Envelope::failed(
                 "cannot locate $HOME; RiceSwap needs it to find its state directory",
             ));
         };
-        let home = PathBuf::from(home);
+        let store = Store::new(PathBuf::from(home));
         Ok(Context {
-            state: StateStore::load(state_path(&home)),
+            state: StateStore::load(store.data_dir().join("state.json")),
+            store,
         })
     }
 
@@ -44,14 +50,13 @@ impl Context {
         self.state.set_step(emitter.step());
         self.state.write();
     }
-}
 
-/// The frozen state directory: `~/.local/share/riceswap`.
-fn state_path(home: &std::path::Path) -> PathBuf {
-    home.join(".local")
-        .join("share")
-        .join("riceswap")
-        .join("state.json")
+    /// Mirrors whatever the `current` symlink names into `state.json`, so the
+    /// active-profile badge always agrees with the filesystem.
+    fn sync_active(&mut self) {
+        let active = self.store.active();
+        self.state.set_active_profile(active.name);
+    }
 }
 
 /// Runs one parsed invocation, emitting exactly one envelope.
@@ -61,9 +66,13 @@ pub fn run(invocation: Invocation) {
         Err(envelope) => return envelope.emit(),
     };
     context.state.begin(invocation.name(), invocation.target());
+    context.sync_active();
     context.state.write();
 
     let envelope = dispatch(&invocation, &mut context);
+    // Re-read after dispatch: `switch` flips `current`, and the document must
+    // agree with the symlink it just wrote.
+    context.sync_active();
     context.state.finish(envelope.ok, envelope.warnings.clone());
     context.state.write();
     envelope.emit();
@@ -156,14 +165,22 @@ fn snapshot(context: &mut Context, name: &str) -> Envelope {
     envelope
 }
 
-/// The switch sequence. Real implementations stream each step here and honour
-/// cancellation at step boundaries; the stub only proves the progress stream.
+/// The switch sequence's first real step: verify the target exists, then flip
+/// the `current` symlink. The package, config, and service steps between them
+/// remain stubs until their tickets land.
 fn switch(context: &mut Context, target: &str) -> Envelope {
     let mut emitter = Emitter::new("switch");
     context.progress(&mut emitter, &format!("verifying profile `{target}`"));
+    if let Err(error) = context.store.load(target) {
+        return Envelope::failed(error);
+    }
     context.progress(&mut emitter, "installing missing packages");
     context.progress(&mut emitter, "linking managed config paths");
     context.progress(&mut emitter, "applying services and wallpaper");
+    context.progress(&mut emitter, &format!("activating profile `{target}`"));
+    if let Err(error) = context.store.flip(target) {
+        return Envelope::failed(error);
+    }
 
     let mut envelope = Envelope::ok(json!({
         "stub": true,
@@ -175,28 +192,49 @@ fn switch(context: &mut Context, target: &str) -> Envelope {
     envelope
 }
 
-/// Every profile in the store, with manifest data.
+/// Every profile in the store, with manifest data, plus whichever profile the
+/// `current` symlink names. A broken manifest is a warning, never a blank list.
 fn list(context: &mut Context) -> Envelope {
     let mut emitter = Emitter::new("list");
     context.progress(&mut emitter, "reading the profile store");
 
-    Envelope::ok(json!({
-        "stub": true,
-        "profiles": [],
-        "active_profile": Value::Null,
-    }))
+    let (profiles, mut warnings) = context.store.list();
+    let active = context.store.active();
+    let profiles: Vec<Value> = profiles
+        .into_iter()
+        .map(|listed| {
+            json!({
+                "name": listed.name,
+                "manifest": serde_json::to_value(&listed.manifest)
+                    .expect("manifest is always serializable"),
+            })
+        })
+        .collect();
+    if let Some(warning) = active.warning {
+        warnings.push(warning);
+    }
+    let mut envelope = Envelope::ok(json!({
+        "profiles": profiles,
+        "active_profile": active.name,
+    }));
+    envelope.warnings.extend(warnings);
+    envelope
 }
 
-/// One profile's full manifest.
+/// One profile's full manifest. A profile that is missing, malformed, or from
+/// an unknown future version is a failed envelope naming the file and field.
 fn info(context: &mut Context, name: &str) -> Envelope {
     let mut emitter = Emitter::new("info");
     context.progress(&mut emitter, &format!("reading manifest for `{name}`"));
 
-    Envelope::ok(json!({
-        "stub": true,
-        "name": name,
-        "manifest": Value::Null,
-    }))
+    match context.store.load(name) {
+        Ok(manifest) => Envelope::ok(json!({
+            "name": name,
+            "manifest": serde_json::to_value(&manifest)
+                .expect("manifest is always serializable"),
+        })),
+        Err(error) => Envelope::failed(error),
+    }
 }
 
 /// Removes a profile, refusing the active one unless forced.

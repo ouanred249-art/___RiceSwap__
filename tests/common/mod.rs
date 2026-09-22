@@ -12,8 +12,8 @@ use assert_cmd::Command;
 use serde_json::Value;
 use std::ffi::OsStr;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::os::unix::fs::{PermissionsExt, symlink};
+use std::path::{Path, PathBuf};
 use std::process::Output;
 use tempfile::TempDir;
 
@@ -156,6 +156,103 @@ impl Sandbox {
     }
 }
 
+/// The profile store's helpers. Fixtures are built by hand here, exactly the way
+/// the spec's testing seam describes: profiles are files on disk, and the
+/// `current` symlink is flipped by writing a symlink.
+impl Sandbox {
+    /// The fake `$HOME`, for building fixtures beside the store.
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
+    /// `~/.local/share/riceswap`.
+    pub fn data_dir(&self) -> PathBuf {
+        self.home.join(".local").join("share").join("riceswap")
+    }
+
+    /// `~/.local/share/riceswap/profiles`.
+    pub fn profiles_dir(&self) -> PathBuf {
+        self.data_dir().join("profiles")
+    }
+
+    /// `~/.local/share/riceswap/profiles/<name>`.
+    pub fn profile_dir(&self, name: &str) -> PathBuf {
+        self.profiles_dir().join(name)
+    }
+
+    /// `~/.local/share/riceswap/current`.
+    pub fn current_link(&self) -> PathBuf {
+        self.data_dir().join("current")
+    }
+
+    /// Writes a profile directory with `manifest` as its `profile.toml`.
+    pub fn write_profile(&self, name: &str, manifest: &str) -> PathBuf {
+        let path = self.profile_dir(name).join("profile.toml");
+        fs::create_dir_all(self.profile_dir(name)).expect("create profile directory");
+        fs::write(&path, manifest).expect("write profile.toml");
+        path
+    }
+
+    /// Points `current` at `profiles/<name>`, the way a flip does.
+    pub fn activate(&self, name: &str) -> PathBuf {
+        self.point_current_at(Path::new("profiles").join(name))
+    }
+
+    /// Points `current` at an arbitrary target, for dangling and outside cases.
+    pub fn point_current_at(&self, target: impl AsRef<Path>) -> PathBuf {
+        let link = self.current_link();
+        fs::create_dir_all(self.data_dir()).expect("create data directory");
+        let _ = fs::remove_file(&link);
+        symlink(target.as_ref(), &link).expect("create current symlink");
+        link
+    }
+
+    /// What `current` points at, read independently of the backend.
+    pub fn current_target(&self) -> Option<PathBuf> {
+        fs::read_link(self.current_link()).ok()
+    }
+}
+
+/// A complete, valid manifest for `name`: every locked field filled in, so a
+/// test can break one thing and leave the rest honest. The display name is
+/// distinct from the directory name on purpose — the directory is the id.
+pub fn manifest_toml(name: &str) -> String {
+    format!(
+        r#"manifest_version = 1
+
+[profile]
+name = "{name} rice"
+description = "fixture rice for {name}"
+created_at = "2026-09-21T10:30:00Z"
+updated_at = "2026-09-22T08:00:00Z"
+screenshot = "screenshot.png"
+source_url = "https://example.invalid/{name}"
+source_commit = "abc123"
+
+[packages]
+official = ["waybar", "kitty"]
+aur = ["ags"]
+
+[[services]]
+name = "ags"
+start = "ags"
+stop = "pkill ags"
+
+[[files]]
+path = ".config/hypr"
+
+[[files]]
+path = ".zshrc"
+optional = true
+
+[rice_info]
+bar = "ags"
+terminal = "kitty"
+colors = "matugen"
+"#
+    )
+}
+
 /// One finished invocation.
 pub struct Run {
     pub stdout: String,
@@ -264,7 +361,7 @@ impl Run {
     }
 }
 
-fn write_stub(bin: &PathBuf, tool: &str) {
+fn write_stub(bin: &Path, tool: &str) {
     let path = bin.join(tool);
     fs::write(&path, STUB).expect("write stub");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod stub");

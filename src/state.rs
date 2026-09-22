@@ -103,6 +103,12 @@ impl StateStore {
         self.state.initialized = initialized;
     }
 
+    /// Re-reads the active profile from the `current` symlink, so the document
+    /// can never disagree with the filesystem the GUI badges from.
+    pub fn set_active_profile(&mut self, active: Option<String>) {
+        self.state.active_profile = active;
+    }
+
     /// Rewrites the document. Failures are swallowed: the envelope on stdout is
     /// the authoritative result, and a read-only `$HOME` must not become a panic.
     pub fn write(&self) {

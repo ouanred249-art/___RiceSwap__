@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{Mode, STUB_TOOLS, Sandbox};
+use common::{Mode, STUB_TOOLS, Sandbox, manifest_toml};
 use serde_json::{Value, json};
 use std::fs;
 
@@ -62,6 +62,7 @@ fn the_envelope_is_the_last_stdout_line() {
 #[test]
 fn state_json_keeps_its_frozen_shape() {
     let sandbox = Sandbox::new();
+    sandbox.write_profile("demo", &manifest_toml("demo"));
     sandbox.run(&["switch", "demo"]).assert_ok();
 
     let state = sandbox.state();

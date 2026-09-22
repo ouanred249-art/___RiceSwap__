@@ -8,6 +8,7 @@
 mod cli;
 mod envelope;
 mod operations;
+mod profile;
 mod state;
 mod tools;
 

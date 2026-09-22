@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{STUB_TOOLS, Sandbox};
+use common::{STUB_TOOLS, Sandbox, manifest_toml};
 use serde_json::json;
 
 /// Class: pre-flight detection.
@@ -83,6 +83,7 @@ fn snapshot_takes_a_profile_name_and_probes_the_package_managers() {
 #[test]
 fn switch_streams_step_progress_before_the_envelope() {
     let sandbox = Sandbox::new();
+    sandbox.write_profile("demo", &manifest_toml("demo"));
     let run = sandbox.run(&["switch", "demo"]);
     let data = run.assert_ok();
 
@@ -129,14 +130,26 @@ fn list_returns_the_profile_store_without_shelling_out() {
 #[test]
 fn info_returns_one_profile_manifest() {
     let sandbox = Sandbox::new();
+    sandbox.write_profile("demo", &manifest_toml("demo"));
     let run = sandbox.run(&["info", "demo"]);
     let data = run.assert_ok();
 
     assert_eq!(data["name"], json!("demo"));
-    assert_eq!(data["manifest"], json!(null));
+    assert_eq!(
+        data["manifest"]["manifest_version"],
+        json!(1),
+        "the envelope carries the parsed manifest"
+    );
+    assert_eq!(data["manifest"]["profile"]["name"], json!("demo rice"));
     assert!(
         sandbox.log().is_empty(),
         "info must not consult external tools"
+    );
+
+    let message = sandbox.run(&["info", "ghost"]).assert_failed();
+    assert!(
+        message.contains("ghost"),
+        "a missing profile is a clear error: {message}"
     );
 }
 
