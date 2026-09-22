@@ -43,6 +43,13 @@ impl Mode {
 
 /// The stub every tool name is given. It logs its invocation, snapshots the
 /// watched `state.json` if it exists, then answers per its scripted mode.
+///
+/// Scripted behaviour beyond versioning, so the snapshot pipeline can run
+/// end-to-end: `pacman -Qo` reports the owning package for any query the
+/// `RICESWAP_STUB_OWNERS` fixture maps (by exact name or by basename, so a
+/// PATH-resolved path answers too) and exits 1 for anything unowned;
+/// `pacman -Qm` lists the fixture entries marked `aur`; `grim <path>` writes
+/// the screenshot file it was pointed at.
 const STUB: &str = r#"#!/bin/sh
 name=${0##*/}
 printf '%s %s\n' "$name" "$*" >> "$RICESWAP_STUB_LOG"
@@ -51,6 +58,35 @@ if [ -n "$RICESWAP_STUB_STATE_DIR" ] && [ -f "$HOME/.local/share/riceswap/state.
 fi
 mode=ok
 if [ -r "$RICESWAP_STUB_MODE_DIR/$name" ]; then read -r mode < "$RICESWAP_STUB_MODE_DIR/$name"; fi
+if [ "$mode" = "ok" ]; then
+  if [ "$name" = "pacman" ] && [ "$1" = "-Qo" ]; then
+    query=$2
+    base=${query##*/}
+    if [ -r "$RICESWAP_STUB_OWNERS" ]; then
+      while read -r binary package origin; do
+        if [ -n "$binary" ] && { [ "$query" = "$binary" ] || [ "$base" = "$binary" ]; }; then
+          printf '%s is owned by %s 1.0.0-1\n' "$query" "$package"
+          exit 0
+        fi
+      done < "$RICESWAP_STUB_OWNERS"
+    fi
+    printf "error: no possible owner found for '%s'\n" "$query" >&2
+    exit 1
+  fi
+  if [ "$name" = "pacman" ] && [ "$1" = "-Qm" ]; then
+    if [ -r "$RICESWAP_STUB_OWNERS" ]; then
+      while read -r binary package origin; do
+        if [ "$origin" = "aur" ]; then printf '%s 1.0.0-1\n' "$package"; fi
+      done < "$RICESWAP_STUB_OWNERS"
+    fi
+    exit 0
+  fi
+  if [ "$name" = "grim" ] && [ "$1" != "--version" ]; then
+    for argument in "$@"; do destination=$argument; done
+    printf 'stub screenshot' > "$destination"
+    exit 0
+  fi
+fi
 case "$mode" in
   ok) printf '%s 1.0.0-stub\n' "$name"; exit 0 ;;
   conflict) printf '%s: stub conflict: conflicting package stub-conflict\n' "$name" >&2; exit 2 ;;
@@ -66,6 +102,7 @@ pub struct Sandbox {
     modes: PathBuf,
     states: PathBuf,
     stub_log: PathBuf,
+    owners: PathBuf,
 }
 
 impl Sandbox {
@@ -76,6 +113,7 @@ impl Sandbox {
         let modes = root.path().join("modes");
         let states = root.path().join("state-snapshots");
         let stub_log = root.path().join("stub-invocations.log");
+        let owners = root.path().join("package-owners.txt");
         for dir in [&home, &bin, &modes, &states] {
             fs::create_dir_all(dir).expect("create sandbox directory");
         }
@@ -83,6 +121,7 @@ impl Sandbox {
             write_stub(&bin, tool);
         }
         fs::write(&stub_log, "").expect("create stub log");
+        fs::write(&owners, "").expect("create package owner fixture");
         Sandbox {
             _root: root,
             home,
@@ -90,6 +129,7 @@ impl Sandbox {
             modes,
             states,
             stub_log,
+            owners,
         }
     }
 
@@ -97,6 +137,16 @@ impl Sandbox {
     pub fn script(&self, tool: &str, mode: Mode) {
         assert!(STUB_TOOLS.contains(&tool), "unknown stub tool {tool}");
         fs::write(self.modes.join(tool), format!("{}\n", mode.as_str())).expect("script stub mode");
+    }
+
+    /// Records that `pacman -Qo` resolves `binary` to `package`, and (when
+    /// `aur`) that `pacman -Qm` lists it as foreign — the fixture the owner
+    /// stub answers the binary-reference scan from.
+    pub fn own(&self, binary: &str, package: &str, aur: bool) {
+        let origin = if aur { "aur" } else { "official" };
+        let mut owners = fs::read_to_string(&self.owners).expect("read owner fixture");
+        owners.push_str(&format!("{binary} {package} {origin}\n"));
+        fs::write(&self.owners, owners).expect("write owner fixture");
     }
 
     /// Runs the binary with `args` under the sandbox.
@@ -109,6 +159,7 @@ impl Sandbox {
             .env("RICESWAP_STUB_LOG", &self.stub_log)
             .env("RICESWAP_STUB_MODE_DIR", &self.modes)
             .env("RICESWAP_STUB_STATE_DIR", &self.states)
+            .env("RICESWAP_STUB_OWNERS", &self.owners)
             .args(args)
             .output()
             .expect("run riceswap");
@@ -236,6 +287,13 @@ impl Sandbox {
         fs::create_dir_all(self.profile_dir(name)).expect("create profile directory");
         fs::write(&path, manifest).expect("write profile.toml");
         path
+    }
+
+    /// The raw `profile.toml` text a profile holds on disk, for asserting on
+    /// exactly what `snapshot` wrote — before the loader normalizes anything.
+    pub fn profile_manifest(&self, name: &str) -> String {
+        let path = self.profile_dir(name).join("profile.toml");
+        fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
     }
 
     /// Points `current` at `profiles/<name>`, the way a flip does.

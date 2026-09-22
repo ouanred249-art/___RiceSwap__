@@ -6,7 +6,10 @@ mod common;
 use common::{STUB_TOOLS, Sandbox, manifest_toml};
 use serde_json::json;
 
-/// Class: pre-flight detection.
+/// Class: pre-flight detection. On a fake `$HOME` with nothing in it, detect
+/// proposes nothing and reports the environment honestly: every candidate
+/// list is empty, and every tool the snapshot pipeline shells out to was
+/// probed.
 #[test]
 fn detect_probes_every_tool_and_reports_the_candidate_environment() {
     let sandbox = Sandbox::new();
@@ -14,13 +17,18 @@ fn detect_probes_every_tool_and_reports_the_candidate_environment() {
     let data = run.assert_ok();
 
     assert_eq!(
-        data["stub"],
-        json!(true),
-        "the scaffold marks placeholder data"
+        data.get("stub"),
+        None,
+        "detection is a real scan now, not a stub: {data:?}"
     );
     assert_eq!(data["config_dirs"], json!([]));
-    assert_eq!(data["packages"], json!([]));
+    assert_eq!(
+        data["packages"],
+        json!({ "official": [], "aur": [] }),
+        "packages are reported as the official/AUR split"
+    );
     assert_eq!(data["assets"], json!([]));
+    assert_eq!(data["wallpapers"], json!([]));
     for tool in STUB_TOOLS {
         assert_eq!(
             data["tools"][tool]["exit_code"],
@@ -60,7 +68,9 @@ fn plan_reports_the_switch_preflight_shape() {
     );
 }
 
-/// Class: profile write.
+/// Class: profile write. A snapshot on an empty fake `$HOME` still writes a
+/// complete profile: the directory, the manifest against the locked schema,
+/// and the `grim` screenshot — alongside the probes it reports.
 #[test]
 fn snapshot_takes_a_profile_name_and_probes_the_package_managers() {
     let sandbox = Sandbox::new();
@@ -68,10 +78,22 @@ fn snapshot_takes_a_profile_name_and_probes_the_package_managers() {
     let data = run.assert_ok();
 
     assert_eq!(data["profile"], json!("demo"));
-    assert_eq!(data["manifest_written"], json!(false));
+    assert_eq!(data["forked"], json!(false), "nothing was active");
+    assert_eq!(data["manifest_written"], json!(true));
     assert_eq!(data["checked_paths"], json!([]));
-    assert_eq!(data["checked_packages"], json!([]));
-    for tool in ["pacman", "yay", "paru"] {
+    assert_eq!(
+        data["checked_packages"],
+        json!({ "official": [], "aur": [] })
+    );
+    assert!(
+        sandbox.profile_dir("demo").join("profile.toml").is_file(),
+        "the manifest lands in the profile directory"
+    );
+    assert!(
+        sandbox.profile_dir("demo").join("screenshot.png").is_file(),
+        "grim captured the profile screenshot"
+    );
+    for tool in ["pacman", "yay", "paru", "grim"] {
         assert!(
             sandbox.log_contains(&format!("{tool} --version")),
             "{tool} was not probed"

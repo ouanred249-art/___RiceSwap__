@@ -6,6 +6,7 @@
 //! invocation is a reportable result, not a crash.
 
 mod cli;
+mod detection;
 mod envelope;
 mod operations;
 mod profile;

@@ -7,14 +7,14 @@ use std::fmt;
 
 /// The full operation surface, for error messages.
 pub const USAGE: &str = "expected one of: \
-     detect, snapshot <name>, plan <target>, switch <target>, list, info <name>, \
+     detect, snapshot <name> [--force], plan <target>, switch <target>, list, info <name>, \
      delete <name> [--force], diff <a> <b>, wallpaper-import <path>, init";
 
 /// One parsed operation invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Invocation {
     Detect,
-    Snapshot { name: String },
+    Snapshot { name: String, force: bool },
     Plan { target: String },
     Switch { target: String },
     List,
@@ -46,7 +46,7 @@ impl Invocation {
     /// The profile this operation acts on, when it acts on one.
     pub fn target(&self) -> Option<String> {
         match self {
-            Invocation::Snapshot { name } | Invocation::Info { name } => Some(name.clone()),
+            Invocation::Snapshot { name, .. } | Invocation::Info { name } => Some(name.clone()),
             Invocation::Plan { target } | Invocation::Switch { target } => Some(target.clone()),
             Invocation::Delete { name, .. } => Some(name.clone()),
             Invocation::Diff { a, .. } => Some(a.clone()),
@@ -75,9 +75,11 @@ pub fn parse(args: &[String]) -> Result<Invocation, ArgumentError> {
         "detect" => no_args(operation, rest, Invocation::Detect),
         "list" => no_args(operation, rest, Invocation::List),
         "init" => no_args(operation, rest, Invocation::Init),
-        "snapshot" => Ok(Invocation::Snapshot {
-            name: one_positional(operation, "<name>", rest)?,
-        }),
+        "snapshot" => {
+            let (force, positional) = split_force(operation, rest)?;
+            let name = exactly_one(operation, "<name>", positional)?;
+            Ok(Invocation::Snapshot { name, force })
+        }
         "plan" => Ok(Invocation::Plan {
             target: one_positional(operation, "<target>", rest)?,
         }),

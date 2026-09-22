@@ -202,17 +202,46 @@ impl Store {
         parse(&path, &raw)
     }
 
+    /// Writes one profile's manifest as `profile.toml` at the root of its
+    /// directory, creating the directory when missing. The rendered TOML is
+    /// the same document `load` parses back: serializing the struct is what
+    /// keeps the file and the envelope in agreement.
+    pub fn save(&self, name: &str, manifest: &Manifest) -> Result<(), String> {
+        self.validate_name(name)?;
+        let directory = self.profile_dir(name);
+        std::fs::create_dir_all(&directory).map_err(|error| {
+            format!(
+                "cannot create the profile directory {}: {error}",
+                directory.display()
+            )
+        })?;
+        let path = directory.join(MANIFEST_FILE);
+        let rendered = toml::to_string_pretty(manifest)
+            .map_err(|error| format!("cannot render {} for `{name}`: {error}", path.display()))?;
+        std::fs::write(&path, rendered)
+            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+        Ok(())
+    }
+
+    /// Whether `name` could name a profile in this store — the check every
+    /// operation that writes under the name runs first, so nothing is ever
+    /// created outside the store.
+    pub fn validate_name(&self, name: &str) -> Result<(), String> {
+        if valid_name(name) {
+            return Ok(());
+        }
+        Err(format!(
+            "`{name}` is not a valid profile name; profile names are directory \
+             names under {}, so they cannot be empty, contain `/`, or start with `.`",
+            self.profiles_dir().display()
+        ))
+    }
+
     /// Resolves `name` to a profile directory in the store, or explains why not:
     /// a name that could escape the store, or a profile that is not there (with
     /// what is).
     fn ensure_profile(&self, name: &str) -> Result<PathBuf, String> {
-        if !valid_name(name) {
-            return Err(format!(
-                "`{name}` is not a valid profile name; profile names are directory \
-                 names under {}, so they cannot be empty, contain `/`, or start with `.`",
-                self.profiles_dir().display()
-            ));
-        }
+        self.validate_name(name)?;
         if !self.profile_dir(name).is_dir() {
             return Err(self.missing(name));
         }
@@ -434,6 +463,15 @@ pub struct RiceInfo(Map<String, Value>);
 impl Serialize for RiceInfo {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.0.serialize(serializer)
+    }
+}
+
+impl RiceInfo {
+    /// Adds one auto-filled entry: whatever `snapshot` detected (bar,
+    /// terminal, colors) goes in as-is, and the GUI renders the table
+    /// whatever keys it holds.
+    pub fn insert(&mut self, key: impl Into<String>, value: impl Into<Value>) {
+        self.0.insert(key.into(), value.into());
     }
 }
 

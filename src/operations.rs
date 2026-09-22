@@ -7,24 +7,37 @@
 //! four bundled wallpapers, lifts the hardware configuration out of the live
 //! Hyprland config into the shared hardware file, and copies the packaged GUI
 //! config when there is one. `wallpaper-import` moves an image into the shared
-//! wallpapers layer. The remaining operations are honest stubs: they stream
-//! their real progress lines, probe the external tools their real
-//! implementation will need, and return the real envelope with placeholder data
-//! marked `"stub": true`. Snapshot pipelines, switch sequences, and package
-//! operations arrive in later tickets.
+//! wallpapers layer. `detect` and `snapshot` are the snapshot pipeline:
+//! detection proposes the candidates, and a snapshot mirrors the confirmed
+//! ones into a profile — manifest, screenshot, and the shared-hardware
+//! `source =` line included. `plan`, `delete`, and `diff` remain honest stubs:
+//! they stream their real progress lines, probe the external tools their real
+//! implementation will need, and return the real envelope with placeholder
+//! data marked `"stub": true`. Switch sequences and package operations arrive
+//! in later tickets.
 
 use crate::cli::Invocation;
+use crate::detection::{self, IMAGE_EXTENSIONS, PackageScan};
 use crate::envelope::{Emitter, Envelope};
-use crate::profile::Store;
+use crate::profile::{
+    CURRENT_MANIFEST_VERSION, FileEntry, Manifest, Packages, ProfileInfo, RiceInfo, Service, Store,
+};
 use crate::state::StateStore;
 use crate::tools::{self, Tool};
 use serde_json::{Value, json};
 use std::ffi::OsStr;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The tools a package-touching operation depends on.
 const PACKAGE_MANAGERS: &[Tool] = &[Tool::Pacman, Tool::Yay, Tool::Paru];
+
+/// The tools a snapshot reports on: the package managers behind the
+/// binary-reference scan and the package split, and `grim` behind the
+/// profile screenshot.
+const SNAPSHOT_TOOLS: &[Tool] = &[Tool::Pacman, Tool::Yay, Tool::Paru, Tool::Grim];
 
 /// Where the package installs the bundled wallpapers. `init` prefers these and
 /// falls back to the embedded copies below, so a standalone binary — or a test
@@ -56,13 +69,6 @@ const BUNDLED_WALLPAPERS: &[(&str, &[u8])] = &[
         "default-night.png",
         include_bytes!("../assets/wallpapers/default-night.png"),
     ),
-];
-
-/// The file extensions `wallpaper-import` accepts. The extension is the
-/// contract: an image the user downloaded is recognized by its name, and a
-/// non-image never reaches the wallpaper layer.
-const IMAGE_EXTENSIONS: &[&str] = &[
-    "avif", "bmp", "gif", "jpe", "jpeg", "jpg", "jxl", "png", "tif", "tiff", "webp",
 ];
 
 /// The environment variables that configure GPU/hardware behaviour — the only
@@ -187,7 +193,7 @@ pub fn run(invocation: Invocation) {
 fn dispatch(invocation: &Invocation, context: &mut Context) -> Envelope {
     match invocation {
         Invocation::Detect => detect(context),
-        Invocation::Snapshot { name } => snapshot(context, name),
+        Invocation::Snapshot { name, force } => snapshot(context, name, *force),
         Invocation::Plan { target } => plan(context, target),
         Invocation::Switch { target } => switch(context, target),
         Invocation::List => list(context),
@@ -216,17 +222,28 @@ fn with_tools(envelope: &mut Envelope, needed: &[Tool]) {
 
 /// The pre-flight scan behind `snapshot`: which config dirs, packages, and
 /// assets are candidates, and which external tools are even present.
+///
+/// The proposal itself is [`detection`]'s — the same scan `snapshot` re-runs
+/// to capture what the user confirmed — so `detect` on screen and `snapshot`
+/// on disk can never disagree about what the desktop is made of.
 fn detect(context: &mut Context) -> Envelope {
     let mut emitter = Emitter::new("detect");
     context.progress(&mut emitter, "scanning candidate config directories");
+    let config = detection::scan_config(&context.home);
     context.progress(&mut emitter, "scanning installed packages");
-    context.progress(&mut emitter, "scanning wallpaper assets");
+    let packages = detection::scan_packages(&context.home, &config.dirs);
+    context.progress(&mut emitter, "scanning assets and wallpaper candidates");
+    let assets = detection::scan_assets(&context.home);
+    let wallpapers = detection::scan_wallpapers(&context.home);
 
     let mut envelope = Envelope::ok(json!({
-        "stub": true,
-        "config_dirs": [],
-        "packages": [],
-        "assets": [],
+        "config_dirs": config.dirs,
+        "packages": {
+            "official": packages.official,
+            "aur": packages.aur,
+        },
+        "assets": assets,
+        "wallpapers": wallpapers,
     }));
     with_tools(&mut envelope, Tool::ALL);
     envelope
@@ -250,25 +267,412 @@ fn plan(context: &mut Context, target: &str) -> Envelope {
     envelope
 }
 
-/// Writes a profile from confirmed selections.
-fn snapshot(context: &mut Context, name: &str) -> Envelope {
+/// Writes a profile from the desktop as it stands: the same candidates
+/// `detect` proposes are captured — mirrored files, the manifest (official/AUR
+/// package split, `exec-once` services with their `pkill` default stop,
+/// auto-filled `rice_info`), the `grim` screenshot, and the shared-hardware
+/// `source =` line injected exactly once into the captured Hyprland config.
+///
+/// A taken name refuses unless `force` clears it — the name and directory
+/// stay, everything under them becomes the new capture's. The active profile
+/// is never overwritten in place, force included: snapshotting over an active
+/// profile forks the live desktop into the new profile instead, symlinks
+/// dereferenced, and the `current` symlink untouched.
+fn snapshot(context: &mut Context, name: &str, force: bool) -> Envelope {
     let mut emitter = Emitter::new("snapshot");
+    context.progress(&mut emitter, &format!("checking the name `{name}`"));
+    if let Err(error) = context.store.validate_name(name) {
+        return Envelope::failed(error);
+    }
+    let active = context.store.active();
+    if active.name.as_deref() == Some(name) {
+        return Envelope::failed(format!(
+            "`{name}` is the active profile; RiceSwap never overwrites the active \
+             profile in place — snapshot a new name to fork the desktop as it stands"
+        ));
+    }
+    let profile = context.store.profile_dir(name);
+    if let Err(error) = clear_for_overwrite(&profile, force) {
+        return Envelope::failed(error);
+    }
+    let forked = active.name.is_some();
+    if forked {
+        context.progress(
+            &mut emitter,
+            &format!("forking the active desktop into `{name}`"),
+        );
+    }
     context.progress(
         &mut emitter,
         &format!("creating profile directory for `{name}`"),
     );
+    if let Err(error) = std::fs::create_dir_all(&profile) {
+        return Envelope::failed(format!(
+            "cannot create the profile directory {}: {error}",
+            profile.display()
+        ));
+    }
+
     context.progress(&mut emitter, "collecting checked config paths");
+    let config = detection::scan_config(&context.home);
     context.progress(&mut emitter, "collecting checked packages");
+    let packages = detection::scan_packages(&context.home, &config.dirs);
+    context.progress(&mut emitter, "collecting fonts, icons, and themes");
+    let mut selected = config.dirs.clone();
+    selected.extend(detection::scan_assets(&context.home));
+    selected.sort();
+    selected.dedup();
+
+    context.progress(&mut emitter, "copying the selected files into the profile");
+    let mut warnings: Vec<String> = Vec::new();
+    if let Some(warning) = active.warning {
+        warnings.push(warning);
+    }
+    let mut stack = Vec::new();
+    let mut mirrored = Vec::new();
+    for relative in &selected {
+        match mirror_into(&context.home, relative, &profile, &mut stack) {
+            Ok(true) => mirrored.push(relative.clone()),
+            // The selection vanished between scan and copy: nothing to mirror.
+            Ok(false) => {}
+            // One unreadable path must not take the capture down with it; the
+            // envelope says what did not make it in.
+            Err(error) => warnings.push(error),
+        }
+    }
+
+    let captured = profile.join(".config").join("hypr").join("hyprland.conf");
+    if captured.is_file() {
+        context.progress(
+            &mut emitter,
+            "connecting the captured hyprland.conf to the hardware layer",
+        );
+        if let Err(error) = inject_hardware_source(&captured) {
+            return Envelope::failed(error);
+        }
+    }
+
+    context.progress(&mut emitter, "capturing the profile screenshot with grim");
+    let screenshot = match capture_screenshot(&profile) {
+        Ok(path) => Some(path),
+        Err(error) => {
+            warnings.push(format!("the profile screenshot was not captured: {error}"));
+            None
+        }
+    };
+
+    context.progress(&mut emitter, "writing profile.toml");
+    let manifest = build_manifest(
+        name,
+        screenshot.is_some(),
+        &mirrored,
+        &packages,
+        config.services,
+    );
+    if let Err(error) = context.store.save(name, &manifest) {
+        return Envelope::failed(error);
+    }
+    context.progress(&mut emitter, &format!("profile `{name}` is ready"));
 
     let mut envelope = Envelope::ok(json!({
-        "stub": true,
         "profile": name,
-        "manifest_written": false,
-        "checked_paths": [],
-        "checked_packages": [],
+        "forked": forked,
+        "manifest_written": true,
+        "checked_paths": mirrored,
+        "checked_packages": {
+            "official": packages.official,
+            "aur": packages.aur,
+        },
+        "screenshot": screenshot.map(|path| path.display().to_string()),
     }));
-    with_tools(&mut envelope, PACKAGE_MANAGERS);
+    envelope.warnings.extend(warnings);
+    with_tools(&mut envelope, SNAPSHOT_TOOLS);
     envelope
+}
+
+/// The collision rule: an existing profile directory refuses unless `force`
+/// clears it first — the name and the directory stay, everything under them
+/// is the new capture's to write. A missing profile is simply `Ok`.
+fn clear_for_overwrite(profile: &Path, force: bool) -> Result<(), String> {
+    match std::fs::symlink_metadata(profile) {
+        Ok(_) if !force => Err(format!(
+            "a profile already exists at {}; snapshot with --force to overwrite it",
+            profile.display()
+        )),
+        Ok(metadata) => {
+            let removed = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                std::fs::remove_dir_all(profile)
+            } else {
+                std::fs::remove_file(profile)
+            };
+            removed.map_err(|error| {
+                format!(
+                    "cannot clear the existing profile at {}: {error}",
+                    profile.display()
+                )
+            })
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "cannot inspect the profile directory {}: {error}",
+            profile.display()
+        )),
+    }
+}
+
+/// Copies one `$HOME`-relative selection into the profile, preserving the
+/// `$HOME`-relative structure. Symlinks are dereferenced along the way: the
+/// profile holds real files whether the live path is one or points into the
+/// active profile — which is what makes snapshotting over an active profile
+/// a fork rather than a self-copy. `Ok(false)` means the source was not
+/// there to mirror.
+///
+/// `stack` holds the directories currently being copied, by canonical path,
+/// so a symlink back up the tree ends the recursion instead of chasing it.
+fn mirror_into(
+    home: &Path,
+    relative: &str,
+    profile: &Path,
+    stack: &mut Vec<PathBuf>,
+) -> Result<bool, String> {
+    let source = home.join(relative);
+    let metadata = match std::fs::metadata(&source) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("cannot inspect {}: {error}", source.display())),
+    };
+    let destination = profile.join(relative);
+    if metadata.is_dir() {
+        mirror_dir(&source, &destination, stack)?;
+        return Ok(true);
+    }
+    if !metadata.is_file() {
+        // A fifo or socket has no bytes a profile could hold.
+        return Ok(false);
+    }
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    }
+    std::fs::copy(&source, &destination)
+        .map(|_| true)
+        .map_err(|error| {
+            format!(
+                "cannot copy {} to {}: {error}",
+                source.display(),
+                destination.display()
+            )
+        })
+}
+
+/// Mirrors one directory tree, guarding the recursion against symlinks that
+/// lead back into a directory already being copied.
+fn mirror_dir(source: &Path, destination: &Path, stack: &mut Vec<PathBuf>) -> Result<(), String> {
+    let canonical = std::fs::canonicalize(source)
+        .map_err(|error| format!("cannot resolve {}: {error}", source.display()))?;
+    if stack.contains(&canonical) {
+        return Ok(());
+    }
+    stack.push(canonical);
+    let copied = copy_entries(source, destination, stack);
+    stack.pop();
+    copied
+}
+
+/// Creates the destination directory and copies every file under `source`
+/// into it, recursing into subdirectories. Entries that cannot be inspected —
+/// a broken symlink, a socket — are skipped: they hold nothing to mirror.
+fn copy_entries(source: &Path, destination: &Path, stack: &mut Vec<PathBuf>) -> Result<(), String> {
+    std::fs::create_dir_all(destination)
+        .map_err(|error| format!("cannot create {}: {error}", destination.display()))?;
+    let entries = std::fs::read_dir(source)
+        .map_err(|error| format!("cannot read {}: {error}", source.display()))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| format!("cannot read an entry of {}: {error}", source.display()))?;
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        let Ok(metadata) = std::fs::metadata(&from) else {
+            continue;
+        };
+        if metadata.is_dir() {
+            mirror_dir(&from, &to, stack)?;
+        } else if metadata.is_file() {
+            std::fs::copy(&from, &to).map_err(|error| {
+                format!(
+                    "cannot copy {} to {}: {error}",
+                    from.display(),
+                    to.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Appends the shared-hardware `source =` line to the captured Hyprland
+/// config, exactly once: a config that already sources the hardware file —
+/// the live one after `init`, or one a previous capture already injected
+/// into — is left verbatim, so a forced re-snapshot can never duplicate the
+/// line. Switch time never comes back here: profiles are written once, at
+/// snapshot time.
+fn inject_hardware_source(captured: &Path) -> Result<(), String> {
+    let content = std::fs::read_to_string(captured)
+        .map_err(|error| format!("cannot read {}: {error}", captured.display()))?;
+    if content.lines().any(sources_hardware) {
+        return Ok(());
+    }
+    let mut rewritten = content;
+    if !rewritten.is_empty() && !rewritten.ends_with('\n') {
+        rewritten.push('\n');
+    }
+    if !rewritten.is_empty() {
+        rewritten.push('\n');
+    }
+    rewritten.push_str(HARDWARE_SOURCE);
+    rewritten.push('\n');
+    std::fs::write(captured, rewritten).map_err(|error| {
+        format!(
+            "cannot connect {} to the shared hardware file: {error}",
+            captured.display()
+        )
+    })
+}
+
+/// The profile preview: `grim <profile>/screenshot.png`. A machine without a
+/// working grim still gets its profile — the caller turns the failure into a
+/// warning instead of losing the capture over a preview image.
+fn capture_screenshot(profile: &Path) -> Result<PathBuf, String> {
+    let target = profile.join("screenshot.png");
+    let output = Command::new("grim")
+        .arg(&target)
+        .output()
+        .map_err(|error| format!("cannot run grim: {error}"))?;
+    if output.status.success() {
+        return Ok(target);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| match output.status.code() {
+            Some(code) => format!("grim exited with code {code}"),
+            None => "grim was killed by a signal".to_string(),
+        }))
+}
+
+/// The `profile.toml` a snapshot writes: the locked schema at the current
+/// version, the mirrored `$HOME`-relative paths as `files` entries (never
+/// `optional` — that flag is the user's to hand-add), the official/AUR
+/// package split, the `exec-once` services with their `pkill` default stop,
+/// and the `rice_info` the desktop revealed.
+fn build_manifest(
+    name: &str,
+    has_screenshot: bool,
+    files: &[String],
+    packages: &PackageScan,
+    services: Vec<Service>,
+) -> Manifest {
+    let now = now_rfc3339();
+    Manifest {
+        manifest_version: CURRENT_MANIFEST_VERSION,
+        profile: ProfileInfo {
+            name: name.to_string(),
+            description: String::new(),
+            created_at: now.clone(),
+            updated_at: now,
+            screenshot: if has_screenshot {
+                "screenshot.png".to_string()
+            } else {
+                String::new()
+            },
+            source_url: None,
+            source_commit: None,
+        },
+        packages: Packages {
+            official: packages.official.clone(),
+            aur: packages.aur.clone(),
+        },
+        services,
+        files: files
+            .iter()
+            .map(|path| FileEntry {
+                path: path.clone(),
+                optional: false,
+            })
+            .collect(),
+        rice_info: auto_rice_info(files, packages),
+    }
+}
+
+/// The `rice_info` entries the desktop reveals at snapshot time: the bar,
+/// terminal, and color scheme that showed up among the captured paths and
+/// packages. Nothing detected means no key — the GUI renders the table as it
+/// finds it.
+fn auto_rice_info(files: &[String], packages: &PackageScan) -> RiceInfo {
+    const BARS: &[&str] = &["waybar", "ags", "quickshell"];
+    const TERMINALS: &[&str] = &["kitty", "foot"];
+    const COLOR_SCHEMES: &[&str] = &["matugen", "pywal"];
+
+    let present = |candidate: &str| {
+        files
+            .iter()
+            .any(|path| path.as_str() == format!(".config/{candidate}"))
+            || packages
+                .official
+                .iter()
+                .chain(&packages.aur)
+                .any(|package| package == candidate || package.ends_with(&format!("-{candidate}")))
+    };
+    let mut info = RiceInfo::default();
+    for (key, candidates) in [
+        ("bar", BARS),
+        ("terminal", TERMINALS),
+        ("colors", COLOR_SCHEMES),
+    ] {
+        if let Some(found) = candidates.iter().find(|candidate| present(candidate)) {
+            info.insert(key, *found);
+        }
+    }
+    info
+}
+
+/// The current instant as an RFC 3339 UTC timestamp — the manifest's
+/// `created_at`/`updated_at` format, with no date crate to get there.
+fn now_rfc3339() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let (hours, minutes, secs) = (seconds % 86_400 / 3600, seconds % 3600 / 60, seconds % 60);
+    let (year, month, day) = civil_from_days((seconds / 86_400) as i64);
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{secs:02}Z")
+}
+
+/// Days since the Unix epoch as a civil (year, month, day): Howard Hinnant's
+/// `civil_from_days`, exact for every date the timestamp range can hold.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let shifted = days + 719_468;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    } / 146_097;
+    let day_of_era = (shifted - era * 146_097) as u64;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era as i64 + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_prime + 2) / 5 + 1) as u32;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 /// The switch sequence's first real step: verify the target exists, then flip
