@@ -192,14 +192,34 @@ fn diff_takes_two_profiles_and_reports_the_delta_shape() {
 #[test]
 fn wallpaper_import_takes_a_path_and_reports_the_shared_layer_target() {
     let sandbox = Sandbox::new();
-    let run = sandbox.run(&["wallpaper-import", "/tmp/forest.png"]);
+    let source = sandbox.write_home("forest.png", common::image_fixture());
+    let run = sandbox.run(&["wallpaper-import", source.to_str().expect("utf-8 path")]);
     let data = run.assert_ok();
 
-    assert_eq!(data["source"], json!("/tmp/forest.png"));
-    assert_eq!(data["imported_to"], json!(null));
+    assert_eq!(data["source"], json!(source.display().to_string()));
+    assert_eq!(
+        data["imported_to"],
+        json!(
+            sandbox
+                .wallpapers_dir()
+                .join("forest.png")
+                .display()
+                .to_string()
+        ),
+        "the image lands in the shared wallpapers layer"
+    );
     assert!(
-        sandbox.log_contains("hyprctl --version"),
-        "wallpaper import consults Hyprland"
+        sandbox.wallpapers_dir().join("forest.png").is_file(),
+        "the layer holds the imported image"
+    );
+    assert!(
+        sandbox.log().is_empty(),
+        "importing an image only moves a file; it must not shell out: {:?}",
+        sandbox.log()
+    );
+    assert!(
+        data.get("tools").is_none(),
+        "an import reports the move, not a tool probe: {data:?}"
     );
 }
 
@@ -210,10 +230,20 @@ fn init_bootstraps_and_flips_the_initialized_flag() {
     let data = sandbox.run(&["init"]).assert_ok();
 
     assert_eq!(data["initialized"], json!(true));
-    assert_eq!(data["created"], json!([]));
     assert!(
-        sandbox.log_contains("hyprctl --version"),
-        "bootstrap extracts hardware info"
+        data["created"]
+            .as_array()
+            .is_some_and(|created| !created.is_empty()),
+        "a first run reports the layers it created: {data:?}"
+    );
+    assert!(
+        sandbox.log().is_empty(),
+        "bootstrapping shared layers is filesystem work; it must not shell out: {:?}",
+        sandbox.log()
+    );
+    assert!(
+        data.get("tools").is_none(),
+        "a clean bootstrap reports its layers, not a tool probe: {data:?}"
     );
 
     assert_eq!(

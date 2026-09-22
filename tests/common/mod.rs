@@ -142,6 +142,51 @@ impl Sandbox {
             .join("state.json")
     }
 
+    /// Writes a file inside the fake `$HOME` (creating its directories) and
+    /// returns its path — fixtures for `hyprland.conf`, images, anything.
+    pub fn write_home(&self, relative: &str, contents: impl AsRef<[u8]>) -> PathBuf {
+        let path = self.home.join(relative);
+        fs::create_dir_all(path.parent().expect("fixture has a parent"))
+            .expect("create fixture dir");
+        fs::write(&path, contents.as_ref()).expect("write fixture");
+        path
+    }
+
+    /// Every path under the fake `$HOME` with its content, in a stable order:
+    /// files as their bytes, directories as a marker, symlinks as their target.
+    /// `state.json` is excluded — it records progress and legitimately changes
+    /// on every run.
+    pub fn home_tree(&self) -> Vec<(String, Vec<u8>)> {
+        let mut entries = Vec::new();
+        collect_tree(&self.home, &self.home, &mut entries);
+        entries.sort();
+        entries
+    }
+
+    /// `~/.local/share/riceswap/wallpapers`.
+    pub fn wallpapers_dir(&self) -> PathBuf {
+        self.data_dir().join("wallpapers")
+    }
+
+    /// `~/.local/share/riceswap/hardware.conf`, the shared hardware file.
+    pub fn hardware_file(&self) -> PathBuf {
+        self.data_dir().join("hardware.conf")
+    }
+
+    /// `~/.config/hypr/hyprland.conf`, the live Hyprland config.
+    pub fn hyprland_config(&self) -> PathBuf {
+        self.home.join(".config").join("hypr").join("hyprland.conf")
+    }
+
+    /// `~/.config/hypr/riceswap/hardware.conf`, the permanent symlink.
+    pub fn hardware_link(&self) -> PathBuf {
+        self.home
+            .join(".config")
+            .join("hypr")
+            .join("riceswap")
+            .join("hardware.conf")
+    }
+
     /// The `state.json` a stub captured mid-invocation, if it captured one.
     pub fn state_seen_by(&self, tool: &str) -> Value {
         let path = self.states.join(format!("{tool}.json"));
@@ -211,6 +256,12 @@ impl Sandbox {
     pub fn current_target(&self) -> Option<PathBuf> {
         fs::read_link(self.current_link()).ok()
     }
+}
+
+/// A real image fixture: one of the bundled default wallpapers, so an import
+/// test moves actual PNG bytes around.
+pub fn image_fixture() -> &'static [u8] {
+    include_bytes!("../../assets/wallpapers/default-dawn.png")
 }
 
 /// A complete, valid manifest for `name`: every locked field filled in, so a
@@ -365,4 +416,35 @@ fn write_stub(bin: &Path, tool: &str) {
     let path = bin.join(tool);
     fs::write(&path, STUB).expect("write stub");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+}
+
+/// Recursively collects `directory`'s entries relative to `root`: files as
+/// their bytes, directories as a marker, symlinks as their target. Unreadable
+/// entries are skipped — [`Sandbox::state`] reports state problems on its own.
+fn collect_tree(root: &Path, directory: &Path, entries: &mut Vec<(String, Vec<u8>)>) {
+    let Ok(read) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in read.flatten() {
+        let path = entry.path();
+        let name = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.is_symlink() {
+            let target = fs::read_link(&path)
+                .map(|target| format!("-> {}", target.display()))
+                .unwrap_or_else(|error| format!("-> unreadable: {error}"));
+            entries.push((name, target.into_bytes()));
+        } else if metadata.is_dir() {
+            entries.push((format!("{name}/"), b"<dir>".to_vec()));
+            collect_tree(root, &path, entries);
+        } else if name != ".local/share/riceswap/state.json" {
+            entries.push((name, fs::read(&path).unwrap_or_default()));
+        }
+    }
 }

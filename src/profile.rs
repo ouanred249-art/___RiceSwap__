@@ -75,6 +75,18 @@ impl Store {
         self.data_dir().join("profiles")
     }
 
+    /// `~/.local/share/riceswap/wallpapers`, the shared wallpaper layer every
+    /// profile draws on.
+    pub fn wallpapers_dir(&self) -> PathBuf {
+        self.data_dir().join("wallpapers")
+    }
+
+    /// `~/.local/share/riceswap/hardware.conf`, the shared hardware file the
+    /// permanent symlink under the Hyprland config dir points at.
+    pub fn hardware_file(&self) -> PathBuf {
+        self.data_dir().join("hardware.conf")
+    }
+
     /// `~/.local/share/riceswap/profiles/<name>`.
     pub fn profile_dir(&self, name: &str) -> PathBuf {
         self.profiles_dir().join(name)

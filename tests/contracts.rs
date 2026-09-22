@@ -20,7 +20,7 @@ fn every_operation_ends_in_exactly_one_envelope() {
         vec!["info", "demo"],
         vec!["delete", "demo"],
         vec!["diff", "a", "b"],
-        vec!["wallpaper-import", "/tmp/x.png"],
+        vec!["wallpaper-import", "/nonexistent/riceswap-contract.png"],
         vec!["init"],
         vec!["nonsense"],
     ];
@@ -138,6 +138,8 @@ fn state_json_records_warnings_from_a_degraded_environment() {
 }
 
 /// The document is rewritten atomically: no reader ever sees a partial file.
+/// The state directory also hosts the shared layers `init` creates, so only
+/// temp-file leftovers count as a violation.
 #[test]
 fn state_json_is_rewritten_without_leaving_temp_files() {
     let sandbox = Sandbox::new();
@@ -157,7 +159,7 @@ fn state_json_is_rewritten_without_leaving_temp_files() {
                 .to_string_lossy()
                 .into_owned()
         })
-        .filter(|name| name != "state.json")
+        .filter(|name| name.ends_with(".tmp"))
         .collect();
     assert!(
         leftovers.is_empty(),

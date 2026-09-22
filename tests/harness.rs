@@ -158,21 +158,15 @@ fn the_backend_runs_with_a_controlled_environment() {
 #[test]
 fn stubs_answer_every_operation_that_shells_out() {
     let sandbox = Sandbox::new();
-    sandbox.script("hyprctl", Mode::Fail);
+    sandbox.script("yay", Mode::Fail);
 
-    let run = sandbox.run(&["wallpaper-import", "/tmp/forest.png"]);
+    let run = sandbox.run(&["plan", "demo"]);
     run.assert_ok();
 
+    assert!(sandbox.log_contains("yay --version"), "{:?}", sandbox.log());
     assert!(
-        sandbox.log_contains("hyprctl --version"),
-        "{:?}",
-        sandbox.log()
-    );
-    assert!(
-        run.warnings()
-            .iter()
-            .any(|warning| warning.contains("hyprctl")),
-        "a broken Hyprland is reported: {:?}",
+        run.warnings().iter().any(|warning| warning.contains("yay")),
+        "a broken AUR helper is reported: {:?}",
         run.warnings()
     );
 }
