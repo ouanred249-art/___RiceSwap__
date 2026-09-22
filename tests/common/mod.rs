@@ -14,11 +14,16 @@ use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Child, Output, Stdio};
 use tempfile::TempDir;
 
 /// Executables the backend shells out to, stubbed on `PATH` for every test.
 pub const STUB_TOOLS: &[&str] = &["pacman", "yay", "paru", "hyprctl", "grim"];
+
+/// Service commands the fixture manifests run (`start`/`stop`), stubbed on
+/// `PATH` beside [`STUB_TOOLS`] so a switch can stop and start services
+/// end-to-end. Not probed by `detect`: they are fixtures, not tools.
+pub const SERVICE_STUBS: &[&str] = &["pkill", "ags", "waybar"];
 
 /// How a stub executable answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,19 +47,35 @@ impl Mode {
 }
 
 /// The stub every tool name is given. It logs its invocation, snapshots the
-/// watched `state.json` if it exists, then answers per its scripted mode.
+/// watched `state.json` if it exists, honours a scripted delay, then answers
+/// per its scripted mode.
 ///
-/// Scripted behaviour beyond versioning, so the snapshot pipeline can run
-/// end-to-end: `pacman -Qo` reports the owning package for any query the
-/// `RICESWAP_STUB_OWNERS` fixture maps (by exact name or by basename, so a
-/// PATH-resolved path answers too) and exits 1 for anything unowned;
-/// `pacman -Qm` lists the fixture entries marked `aur`; `grim <path>` writes
-/// the screenshot file it was pointed at.
-const STUB: &str = r#"#!/bin/sh
+/// Scripted behaviour beyond versioning, so the snapshot pipeline and the
+/// switch sequence can both run end-to-end:
+/// - `pacman -Qo` reports the owning package for any query the
+///   `RICESWAP_STUB_OWNERS` fixture maps (by exact name or by basename, so a
+///   PATH-resolved path answers too) and exits 1 for anything unowned;
+/// - `pacman -Qm` lists the fixture entries marked `aur`;
+/// - `grim <path>` writes the screenshot file it was pointed at;
+/// - `-S` installs: a rule in `RICESWAP_STUB_CONFLICTS`
+///   (`<installed> <installer>`) makes the install conflict — exit 2, message
+///   naming both packages — while `<installed>` is still in the
+///   `RICESWAP_STUB_PACKAGES` state; installed packages accumulate there;
+/// - `-R` removes: a package listed in `RICESWAP_STUB_NEEDED` is refused with
+///   a dependency error (exit 1, "breaks dependency ... required by ..."),
+///   anything else leaves the state file.
+const STUB: &str = r##"#!/bin/sh
 name=${0##*/}
 printf '%s %s\n' "$name" "$*" >> "$RICESWAP_STUB_LOG"
 if [ -n "$RICESWAP_STUB_STATE_DIR" ] && [ -f "$HOME/.local/share/riceswap/state.json" ]; then
   cp "$HOME/.local/share/riceswap/state.json" "$RICESWAP_STUB_STATE_DIR/$name.json"
+fi
+if [ -n "$RICESWAP_STUB_DELAY_DIR" ] && [ -f "$RICESWAP_STUB_DELAY_DIR/$name" ]; then
+  while read -r pattern seconds; do
+    case " $* " in
+      *"$pattern"*) sleep "$seconds"; break ;;
+    esac
+  done < "$RICESWAP_STUB_DELAY_DIR/$name"
 fi
 mode=ok
 if [ -r "$RICESWAP_STUB_MODE_DIR/$name" ]; then read -r mode < "$RICESWAP_STUB_MODE_DIR/$name"; fi
@@ -86,13 +107,59 @@ if [ "$mode" = "ok" ]; then
     printf 'stub screenshot' > "$destination"
     exit 0
   fi
+  case "$1" in
+    -S*|-R*)
+      packages=""
+      for argument in "$@"; do
+        case "$argument" in -*) ;; *) packages="$packages $argument" ;; esac
+      done
+      if [ "${1#-R}" != "$1" ]; then
+        for package in $packages; do
+          if [ -n "$RICESWAP_STUB_NEEDED" ] && [ -f "$RICESWAP_STUB_NEEDED" ] \
+            && grep -Fxq "$package" "$RICESWAP_STUB_NEEDED"; then
+            printf 'error: failed to prepare transaction (could not satisfy dependencies)\n' >&2
+            printf "removing %s breaks dependency '%s' required by dependent\n" "$package" "$package" >&2
+            exit 1
+          fi
+        done
+        if [ -n "$RICESWAP_STUB_PACKAGES" ] && [ -f "$RICESWAP_STUB_PACKAGES" ]; then
+          for package in $packages; do
+            grep -Fxv "$package" "$RICESWAP_STUB_PACKAGES" > "$RICESWAP_STUB_PACKAGES.tmp" || true
+            mv "$RICESWAP_STUB_PACKAGES.tmp" "$RICESWAP_STUB_PACKAGES"
+          done
+        fi
+        exit 0
+      fi
+      if [ -n "$RICESWAP_STUB_CONFLICTS" ] && [ -f "$RICESWAP_STUB_CONFLICTS" ]; then
+        for package in $packages; do
+          while read -r blocked installer; do
+            if [ -n "$installer" ] && [ "$installer" = "$package" ] \
+              && [ -n "$RICESWAP_STUB_PACKAGES" ] && [ -f "$RICESWAP_STUB_PACKAGES" ] \
+              && grep -Fxq "$blocked" "$RICESWAP_STUB_PACKAGES"; then
+              printf 'error: failed to prepare transaction (conflicting dependencies)\n' >&2
+              printf ':: %s and %s are in conflict\n' "$blocked" "$installer" >&2
+              exit 2
+            fi
+          done < "$RICESWAP_STUB_CONFLICTS"
+        done
+      fi
+      if [ -n "$RICESWAP_STUB_PACKAGES" ]; then
+        for package in $packages; do
+          if [ ! -f "$RICESWAP_STUB_PACKAGES" ] || ! grep -Fxq "$package" "$RICESWAP_STUB_PACKAGES"; then
+            printf '%s\n' "$package" >> "$RICESWAP_STUB_PACKAGES"
+          fi
+        done
+      fi
+      exit 0
+      ;;
+  esac
 fi
 case "$mode" in
   ok) printf '%s 1.0.0-stub\n' "$name"; exit 0 ;;
   conflict) printf '%s: stub conflict: conflicting package stub-conflict\n' "$name" >&2; exit 2 ;;
   *) printf '%s: stub failure (%s)\n' "$name" "$mode" >&2; exit 1 ;;
 esac
-"#;
+"##;
 
 /// A fake `$HOME`, a stub `PATH`, and the record of what the stubs saw.
 pub struct Sandbox {
@@ -103,6 +170,10 @@ pub struct Sandbox {
     states: PathBuf,
     stub_log: PathBuf,
     owners: PathBuf,
+    conflicts: PathBuf,
+    needed: PathBuf,
+    packages: PathBuf,
+    delays: PathBuf,
 }
 
 impl Sandbox {
@@ -114,14 +185,21 @@ impl Sandbox {
         let states = root.path().join("state-snapshots");
         let stub_log = root.path().join("stub-invocations.log");
         let owners = root.path().join("package-owners.txt");
-        for dir in [&home, &bin, &modes, &states] {
+        let conflicts = root.path().join("package-conflicts.txt");
+        let needed = root.path().join("still-needed.txt");
+        let packages = root.path().join("installed-packages.txt");
+        let delays = root.path().join("delays");
+        for dir in [&home, &bin, &modes, &states, &delays] {
             fs::create_dir_all(dir).expect("create sandbox directory");
         }
-        for tool in STUB_TOOLS {
+        for tool in STUB_TOOLS.iter().chain(SERVICE_STUBS) {
             write_stub(&bin, tool);
         }
         fs::write(&stub_log, "").expect("create stub log");
         fs::write(&owners, "").expect("create package owner fixture");
+        fs::write(&conflicts, "").expect("create package conflict fixture");
+        fs::write(&needed, "").expect("create still-needed fixture");
+        fs::write(&packages, "").expect("create installed-package state");
         Sandbox {
             _root: root,
             home,
@@ -130,13 +208,76 @@ impl Sandbox {
             states,
             stub_log,
             owners,
+            conflicts,
+            needed,
+            packages,
+            delays,
         }
     }
 
     /// Scripts a stub's next answer. Sticky until scripted again.
     pub fn script(&self, tool: &str, mode: Mode) {
-        assert!(STUB_TOOLS.contains(&tool), "unknown stub tool {tool}");
+        assert!(
+            STUB_TOOLS.contains(&tool) || SERVICE_STUBS.contains(&tool),
+            "unknown stub tool {tool}"
+        );
         fs::write(self.modes.join(tool), format!("{}\n", mode.as_str())).expect("script stub mode");
+    }
+
+    /// Declares a pacman conflict: installing `installer` fails while
+    /// `installed` is still installed — the install-first fallback fixture.
+    /// `installed` enters the stub's installed-package state with the rule.
+    pub fn declare_conflict(&self, installed: &str, installer: &str) {
+        let mut conflicts = fs::read_to_string(&self.conflicts).expect("read conflict fixture");
+        conflicts.push_str(&format!("{installed} {installer}\n"));
+        fs::write(&self.conflicts, conflicts).expect("write conflict fixture");
+        self.mark_installed(installed);
+    }
+
+    /// Declares a package pacman must refuse to remove: a plain `-R` answers
+    /// with the "still needed" dependency error instead of removing it.
+    pub fn declare_still_needed(&self, package: &str) {
+        let mut needed = fs::read_to_string(&self.needed).expect("read still-needed fixture");
+        needed.push_str(&format!("{package}\n"));
+        fs::write(&self.needed, needed).expect("write still-needed fixture");
+    }
+
+    /// Records `package` as installed in the stub's state, so a conflict rule
+    /// that names it actually fires.
+    pub fn mark_installed(&self, package: &str) {
+        if !self.installed_packages().iter().any(|p| p == package) {
+            let mut state = fs::read_to_string(&self.packages).expect("read package state");
+            state.push_str(&format!("{package}\n"));
+            fs::write(&self.packages, state).expect("write package state");
+        }
+    }
+
+    /// Every package the stub state holds as installed, in file order.
+    pub fn installed_packages(&self) -> Vec<String> {
+        fs::read_to_string(&self.packages)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Makes `tool` sleep `seconds` whenever its arguments contain `pattern`
+    /// — the window a test sends SIGTERM into mid-step.
+    pub fn delay_on(&self, tool: &str, pattern: &str, seconds: u64) {
+        assert!(
+            STUB_TOOLS.contains(&tool) || SERVICE_STUBS.contains(&tool),
+            "unknown stub tool {tool}"
+        );
+        let path = self.delays.join(tool);
+        let mut delays = fs::read_to_string(&path).unwrap_or_default();
+        delays.push_str(&format!("{pattern} {seconds}\n"));
+        fs::write(&path, delays).expect("write delay fixture");
+    }
+
+    /// Truncates the invocation log, so a test can assert on one operation's
+    /// stub traffic alone.
+    pub fn clear_log(&self) {
+        fs::write(&self.stub_log, "").expect("clear stub log");
     }
 
     /// Records that `pacman -Qo` resolves `binary` to `package`, and (when
@@ -149,10 +290,12 @@ impl Sandbox {
         fs::write(&self.owners, owners).expect("write owner fixture");
     }
 
-    /// Runs the binary with `args` under the sandbox.
-    pub fn run<S: AsRef<OsStr>>(&self, args: &[S]) -> Run {
+    /// The configured subprocess: clean environment, sandboxed `$HOME` and
+    /// `PATH`, stub fixtures wired in. `run` and `spawn` both start here, so
+    /// a spawned operation sees exactly what a blocking one sees.
+    fn command(&self) -> Command {
         let mut command = Command::cargo_bin("riceswap").expect("riceswap binary is built");
-        let output = command
+        command
             .env_clear()
             .env("HOME", &self.home)
             .env("PATH", self.path_env())
@@ -160,10 +303,48 @@ impl Sandbox {
             .env("RICESWAP_STUB_MODE_DIR", &self.modes)
             .env("RICESWAP_STUB_STATE_DIR", &self.states)
             .env("RICESWAP_STUB_OWNERS", &self.owners)
+            .env("RICESWAP_STUB_CONFLICTS", &self.conflicts)
+            .env("RICESWAP_STUB_NEEDED", &self.needed)
+            .env("RICESWAP_STUB_PACKAGES", &self.packages)
+            .env("RICESWAP_STUB_DELAY_DIR", &self.delays);
+        command
+    }
+
+    /// Runs the binary with `args` under the sandbox, to completion.
+    pub fn run<S: AsRef<OsStr>>(&self, args: &[S]) -> Run {
+        let output = self
+            .command()
             .args(args)
             .output()
             .expect("run riceswap");
         Run::new(output)
+    }
+
+    /// Spawns the binary with `args` under the sandbox, stdout and stderr
+    /// piped — for tests that must signal the operation mid-switch and keep
+    /// reading its NDJSON stream.
+    ///
+    /// Uses `std::process::Command` directly (not `assert_cmd::Command`)
+    /// because `assert_cmd` doesn't expose `.stdout()` / `.spawn()`.
+    pub fn spawn<S: AsRef<OsStr>>(&self, args: &[S]) -> Child {
+        let bin = assert_cmd::cargo::cargo_bin("riceswap");
+        std::process::Command::new(bin)
+            .env_clear()
+            .env("HOME", &self.home)
+            .env("PATH", self.path_env())
+            .env("RICESWAP_STUB_LOG", &self.stub_log)
+            .env("RICESWAP_STUB_MODE_DIR", &self.modes)
+            .env("RICESWAP_STUB_STATE_DIR", &self.states)
+            .env("RICESWAP_STUB_OWNERS", &self.owners)
+            .env("RICESWAP_STUB_CONFLICTS", &self.conflicts)
+            .env("RICESWAP_STUB_NEEDED", &self.needed)
+            .env("RICESWAP_STUB_PACKAGES", &self.packages)
+            .env("RICESWAP_STUB_DELAY_DIR", &self.delays)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn riceswap")
     }
 
     /// Every invocation the stubs recorded, in order.
@@ -289,6 +470,21 @@ impl Sandbox {
         path
     }
 
+    /// Writes a file inside a profile's mirrored `$HOME` layout, so switch
+    /// tests have real content for the managed symlinks to point at.
+    pub fn write_profile_file(
+        &self,
+        profile: &str,
+        relative: &str,
+        contents: impl AsRef<[u8]>,
+    ) -> PathBuf {
+        let path = self.profile_dir(profile).join(relative);
+        fs::create_dir_all(path.parent().expect("profile file has a parent"))
+            .expect("create profile subdirectory");
+        fs::write(&path, contents.as_ref()).expect("write profile file");
+        path
+    }
+
     /// The raw `profile.toml` text a profile holds on disk, for asserting on
     /// exactly what `snapshot` wrote — before the loader normalizes anything.
     pub fn profile_manifest(&self, name: &str) -> String {
@@ -362,6 +558,48 @@ colors = "matugen"
     )
 }
 
+/// A manifest with the packages, services, and managed files a test's
+/// profiles declare — the switch/plan fixture builder: two calls with
+/// different arguments are two profiles with a computable diff.
+pub fn profile_toml(
+    name: &str,
+    official: &[&str],
+    aur: &[&str],
+    services: &[(&str, &str, &str)],
+    files: &[&str],
+) -> String {
+    fn list(items: &[&str]) -> String {
+        let quoted: Vec<String> = items.iter().map(|item| format!("\"{item}\"")).collect();
+        format!("[{}]", quoted.join(", "))
+    }
+
+    let mut manifest = format!(
+        "manifest_version = 1\n\
+         \n\
+         [profile]\n\
+         name = \"{name}\"\n\
+         description = \"fixture rice for {name}\"\n\
+         created_at = \"2026-09-21T10:30:00Z\"\n\
+         updated_at = \"2026-09-22T08:00:00Z\"\n\
+         screenshot = \"\"\n\
+         \n\
+         [packages]\n\
+         official = {official}\n\
+         aur = {aur}\n",
+        official = list(official),
+        aur = list(aur),
+    );
+    for (service, start, stop) in services {
+        manifest.push_str(&format!(
+            "\n[[services]]\nname = \"{service}\"\nstart = \"{start}\"\nstop = \"{stop}\"\n"
+        ));
+    }
+    for file in files {
+        manifest.push_str(&format!("\n[[files]]\npath = \"{file}\"\n"));
+    }
+    manifest
+}
+
 /// One finished invocation.
 pub struct Run {
     pub stdout: String,
@@ -380,6 +618,18 @@ impl Run {
         );
         Run {
             lines: stdout.lines().map(str::to_string).collect(),
+            stdout,
+            stderr,
+        }
+    }
+
+    /// A run assembled from a stream read line-by-line while the subprocess
+    /// was alive — the shape a signalled, mid-switch operation comes back in.
+    /// The caller has already asserted the exit status.
+    pub fn from_parts(lines: Vec<String>, stderr: String) -> Run {
+        let stdout = lines.join("\n");
+        Run {
+            lines,
             stdout,
             stderr,
         }
