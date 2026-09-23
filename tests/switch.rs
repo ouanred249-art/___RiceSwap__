@@ -57,7 +57,11 @@ fn fixture_with(sandbox: &Sandbox, alpha: &str) {
         ".config/waybar/config.jsonc",
         "{ \"rice\": \"alpha\" }\n",
     );
-    sandbox.write_profile_file("alpha", ".config/hypr/hyprland.conf", "exec-once = waybar\n");
+    sandbox.write_profile_file(
+        "alpha",
+        ".config/hypr/hyprland.conf",
+        "exec-once = waybar\n",
+    );
     sandbox.write_profile_file(
         "beta",
         ".config/waybar/config.jsonc",
@@ -271,7 +275,11 @@ fn a_declared_package_conflict_removes_the_conflicting_package_and_retries() {
         .filter(|(_, line)| line.contains("-S") && line.contains("newbar"))
         .map(|(index, _)| index)
         .collect();
-    assert_eq!(installs.len(), 2, "install attempted, then retried: {log:?}");
+    assert_eq!(
+        installs.len(),
+        2,
+        "install attempted, then retried: {log:?}"
+    );
     let removal = log
         .iter()
         .position(|line| line.contains("-R") && line.contains("oldbar"))
@@ -297,7 +305,7 @@ fn a_declared_package_conflict_removes_the_conflicting_package_and_retries() {
 /// Class: kept packages. A "still needed" refusal is logged as kept, the
 /// switch continues, and removals never use `-Rs`/`-Rdd`.
 #[test]
-fn a_still_needed_refusal_is_kept_and_removals_are_plain_R() {
+fn a_still_needed_refusal_is_kept_and_removals_are_plain_r() {
     let sandbox = Sandbox::new();
     let alpha = profile_toml(
         "alpha",
@@ -329,12 +337,13 @@ fn a_still_needed_refusal_is_kept_and_removals_are_plain_R() {
     );
 
     // The refusal did not stop the switch.
-    assert!(sandbox.log_contains("hyprctl reload"), "{:?}", sandbox.log());
     assert!(
-        sandbox
-            .log()
-            .iter()
-            .any(|line| line.trim_end() == "ags"),
+        sandbox.log_contains("hyprctl reload"),
+        "{:?}",
+        sandbox.log()
+    );
+    assert!(
+        sandbox.log().iter().any(|line| line.trim_end() == "ags"),
         "B's service still started: {:?}",
         sandbox.log()
     );
@@ -381,7 +390,11 @@ fn a_failing_service_start_warns_without_failing_the_switch() {
     );
     assert_eq!(data["completed_steps"], json!(10));
     assert_eq!(data["report"]["services_stopped"], json!(["waybar"]));
-    assert!(sandbox.log_contains("hyprctl reload"), "{:?}", sandbox.log());
+    assert!(
+        sandbox.log_contains("hyprctl reload"),
+        "{:?}",
+        sandbox.log()
+    );
     assert_eq!(sandbox.current_target(), Some(sandbox.profile_dir("beta")));
     assert_eq!(sandbox.state()["active_profile"], json!("beta"));
 }

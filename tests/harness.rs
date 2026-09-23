@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{Mode, STUB_TOOLS, Sandbox};
+use common::{Mode, STUB_TOOLS, Sandbox, manifest_toml};
 use serde_json::json;
 use std::fs;
 
@@ -80,6 +80,7 @@ fn a_stub_scripted_to_fail_is_reported_as_unusable() {
 #[test]
 fn a_stub_scripted_to_conflict_exits_distinctly() {
     let sandbox = Sandbox::new();
+    sandbox.write_profile("demo", &manifest_toml("demo"));
     sandbox.script("pacman", Mode::Conflict);
     let run = sandbox.run(&["plan", "demo"]);
     let data = run.assert_ok();
@@ -158,6 +159,7 @@ fn the_backend_runs_with_a_controlled_environment() {
 #[test]
 fn stubs_answer_every_operation_that_shells_out() {
     let sandbox = Sandbox::new();
+    sandbox.write_profile("demo", &manifest_toml("demo"));
     sandbox.script("yay", Mode::Fail);
 
     let run = sandbox.run(&["plan", "demo"]);

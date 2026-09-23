@@ -7,7 +7,6 @@ mod common;
 
 use common::{Sandbox, manifest_toml};
 use serde_json::json;
-use std::path::Path;
 
 /// Class: profile store reads. A fixture profile with the locked manifest
 /// schema parses, and `info` reports exactly what the manifest says.
@@ -273,7 +272,7 @@ fn a_hand_flipped_current_symlink_lands_in_state_json() {
     );
     assert_eq!(
         sandbox.current_target(),
-        Some(Path::new("profiles/demo").to_path_buf()),
+        Some(sandbox.profile_dir("demo")),
         "reading the symlink needs no backend at all"
     );
 }

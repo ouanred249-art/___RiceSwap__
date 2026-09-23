@@ -312,11 +312,7 @@ impl Sandbox {
 
     /// Runs the binary with `args` under the sandbox, to completion.
     pub fn run<S: AsRef<OsStr>>(&self, args: &[S]) -> Run {
-        let output = self
-            .command()
-            .args(args)
-            .output()
-            .expect("run riceswap");
+        let output = self.command().args(args).output().expect("run riceswap");
         Run::new(output)
     }
 
@@ -494,7 +490,7 @@ impl Sandbox {
 
     /// Points `current` at `profiles/<name>`, the way a flip does.
     pub fn activate(&self, name: &str) -> PathBuf {
-        self.point_current_at(Path::new("profiles").join(name))
+        self.point_current_at(self.profile_dir(name))
     }
 
     /// Points `current` at an arbitrary target, for dangling and outside cases.

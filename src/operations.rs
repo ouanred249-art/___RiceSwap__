@@ -29,6 +29,8 @@ use std::ffi::OsStr;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The tools a package-touching operation depends on.
@@ -253,15 +255,72 @@ fn detect(context: &mut Context) -> Envelope {
 fn plan(context: &mut Context, target: &str) -> Envelope {
     let mut emitter = Emitter::new("plan");
     context.progress(&mut emitter, &format!("reading profile `{target}`"));
+
+    let target_manifest = match context.store.load(target) {
+        Ok(manifest) => manifest,
+        Err(error) => return Envelope::failed(error),
+    };
+
     context.progress(&mut emitter, "computing package diff");
+
+    let active = context.store.active();
+    let active_manifest = active
+        .name
+        .as_ref()
+        .and_then(|name| context.store.load(name).ok());
+
+    let (install_official, install_aur, remove_official, remove_aur) =
+        if let Some(ref current) = active_manifest {
+            compute_package_diff(&current.packages, &target_manifest.packages)
+        } else {
+            // No active profile: install everything from target, remove nothing
+            (
+                target_manifest.packages.official.clone(),
+                target_manifest.packages.aur.clone(),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+
+    let (services_stop, services_start) = if let Some(ref current) = active_manifest {
+        compute_service_changes(&current.services, &target_manifest.services)
+    } else {
+        (
+            Vec::new(),
+            target_manifest
+                .services
+                .iter()
+                .map(|s| s.name.clone())
+                .collect(),
+        )
+    };
+
     context.progress(&mut emitter, "checking managed paths for conflicts");
 
+    let (symlink_link, symlink_unlink) = if let Some(ref current) = active_manifest {
+        compute_symlink_changes(&current.files, &target_manifest.files)
+    } else {
+        (
+            target_manifest
+                .files
+                .iter()
+                .map(|f| f.path.clone())
+                .collect(),
+            Vec::new(),
+        )
+    };
+
+    let blocked_paths = check_blocked_paths(&context.home, &symlink_link);
+
     let mut envelope = Envelope::ok(json!({
-        "stub": true,
         "target": target,
-        "package_diff": [],
-        "service_changes": [],
-        "blocked_paths": [],
+        "package_diff": {
+            "install": { "official": install_official, "aur": install_aur },
+            "remove": { "official": remove_official, "aur": remove_aur },
+        },
+        "service_changes": { "stop": services_stop, "start": services_start },
+        "symlink_changes": { "link": symlink_link, "unlink": symlink_unlink },
+        "blocked_paths": blocked_paths,
     }));
     with_tools(&mut envelope, PACKAGE_MANAGERS);
     envelope
@@ -675,31 +734,361 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
-/// The switch sequence's first real step: verify the target exists, then flip
-/// the `current` symlink. The package, config, and service steps between them
-/// remain stubs until their tickets land.
+/// The switch sequence's heart: verify the target, compute the plan, check for
+/// blocked paths, then run the fixed idempotent sequence: flip `current` → stop
+/// A's services → flip symlinks → install-first package ops (install B's missing;
+/// on conflict remove the conflicting A-package and retry; then remove A-unique
+/// with plain `pacman -R`, logging "kept" when refused) → `hyprctl reload` →
+/// start B's services (failure = warning). Failures produce `ok: false` with
+/// `completed_steps` + `resume_hint`. SIGTERM cancels at the next step boundary.
 fn switch(context: &mut Context, target: &str) -> Envelope {
     let mut emitter = Emitter::new("switch");
+
+    // Set up SIGTERM handler
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_flag = Arc::clone(&cancelled);
+    let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, cancelled_flag);
+
     context.progress(&mut emitter, &format!("verifying profile `{target}`"));
-    if let Err(error) = context.store.load(target) {
-        return Envelope::failed(error);
-    }
-    context.progress(&mut emitter, "installing missing packages");
-    context.progress(&mut emitter, "linking managed config paths");
-    context.progress(&mut emitter, "applying services and wallpaper");
-    context.progress(&mut emitter, &format!("activating profile `{target}`"));
-    if let Err(error) = context.store.flip(target) {
-        return Envelope::failed(error);
+
+    let target_manifest = match context.store.load(target) {
+        Ok(manifest) => manifest,
+        Err(error) => return Envelope::failed(error),
+    };
+
+    context.progress(&mut emitter, "computing the switch plan");
+
+    let active = context.store.active();
+    let active_manifest = active
+        .name
+        .as_ref()
+        .and_then(|name| context.store.load(name).ok());
+
+    let (install_official, install_aur, remove_official, remove_aur) =
+        if let Some(ref current) = active_manifest {
+            compute_package_diff(&current.packages, &target_manifest.packages)
+        } else {
+            (
+                target_manifest.packages.official.clone(),
+                target_manifest.packages.aur.clone(),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+
+    let (services_stop, services_start) = if let Some(ref current) = active_manifest {
+        compute_service_changes(&current.services, &target_manifest.services)
+    } else {
+        (
+            Vec::new(),
+            target_manifest
+                .services
+                .iter()
+                .map(|s| s.name.clone())
+                .collect(),
+        )
+    };
+
+    let (symlink_link, symlink_unlink) = if let Some(ref current) = active_manifest {
+        compute_symlink_changes(&current.files, &target_manifest.files)
+    } else {
+        (
+            target_manifest
+                .files
+                .iter()
+                .map(|f| f.path.clone())
+                .collect(),
+            Vec::new(),
+        )
+    };
+
+    let blocked_paths = check_blocked_paths(&context.home, &symlink_link);
+    if !blocked_paths.is_empty() {
+        let paths_list = blocked_paths.join(", ");
+        return Envelope {
+            ok: false,
+            data: json!({
+                "error": format!("cannot switch: real files block these target paths: {}. Use `snapshot` to adopt them into a profile first.", paths_list),
+                "completed_steps": 2,
+                "resume_hint": format!("switch to `{target}` to restore"),
+            }),
+            warnings: Vec::new(),
+        };
     }
 
+    let mut completed_steps = 2;
+    let mut warnings = Vec::new();
+    let mut installed = Vec::new();
+    let mut removed = Vec::new();
+    let mut kept = Vec::new();
+    let mut conflict_removed = Vec::new();
+    let mut linked = Vec::new();
+    let mut unlinked = Vec::new();
+    let mut services_stopped = Vec::new();
+    let mut services_started = Vec::new();
+    let mut reloaded = false;
+
+    // Step 3: flip `current` symlink
+    context.progress(&mut emitter, &format!("activating profile `{target}`"));
+    if let Err(error) = context.store.flip(target) {
+        return Envelope {
+            ok: false,
+            data: json!({
+                "error": error,
+                "completed_steps": completed_steps,
+                "resume_hint": format!("switch to `{target}` to restore"),
+            }),
+            warnings,
+        };
+    }
+    completed_steps += 1;
+
+    if cancelled.load(Ordering::Relaxed) {
+        return Envelope {
+            ok: false,
+            data: json!({
+                "error": "operation cancelled",
+                "completed_steps": completed_steps,
+                "resume_hint": format!("switch to `{target}` to restore"),
+            }),
+            warnings,
+        };
+    }
+
+    // Step 4: stop A's services
+    context.progress(&mut emitter, "stopping old services");
+    if let Some(ref current) = active_manifest {
+        for service in &current.services {
+            if services_stop.contains(&service.name) {
+                let _ = Command::new("sh").arg("-c").arg(&service.stop).output();
+                services_stopped.push(service.name.clone());
+            }
+        }
+    }
+    completed_steps += 1;
+
+    if cancelled.load(Ordering::Relaxed) {
+        return Envelope {
+            ok: false,
+            data: json!({
+                "error": "operation cancelled",
+                "completed_steps": completed_steps,
+                "resume_hint": format!("switch to `{target}` to restore"),
+            }),
+            warnings,
+        };
+    }
+
+    // Step 5: flip symlinks
+    context.progress(&mut emitter, "linking managed config paths");
+    for relative in &symlink_unlink {
+        let path = context.home.join(relative);
+        let _ = std::fs::remove_file(&path);
+        unlinked.push(relative.clone());
+    }
+    let profile_dir = context.store.profile_dir(target);
+    for relative in &symlink_link {
+        let link = context.home.join(relative);
+        let target_path = profile_dir.join(relative);
+        if let Some(parent) = link.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::remove_file(&link);
+        let _ = std::os::unix::fs::symlink(&target_path, &link);
+        linked.push(relative.clone());
+    }
+    completed_steps += 1;
+
+    if cancelled.load(Ordering::Relaxed) {
+        return Envelope {
+            ok: false,
+            data: json!({
+                "error": "operation cancelled",
+                "completed_steps": completed_steps,
+                "resume_hint": format!("switch to `{target}` to restore"),
+            }),
+            warnings,
+        };
+    }
+
+    // Step 6-7: install-first package ops
+    context.progress(&mut emitter, "applying package changes");
+
+    // Install official packages
+    install_packages(
+        &["pacman"],
+        &install_official,
+        &mut installed,
+        &mut removed,
+        &mut conflict_removed,
+    );
+
+    // Install AUR packages
+    let helper = if Command::new("yay")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        "yay"
+    } else {
+        "paru"
+    };
+    install_packages(
+        &[helper],
+        &install_aur,
+        &mut installed,
+        &mut removed,
+        &mut conflict_removed,
+    );
+
+    // Remove A-unique packages (plain -R, never -Rs/-Rdd)
+    for package in remove_official.iter().chain(&remove_aur) {
+        if conflict_removed.contains(package) {
+            continue; // Already removed during conflict resolution
+        }
+        let output = Command::new("pacman")
+            .args(["-R", "--noconfirm", package])
+            .output();
+        if let Ok(out) = output {
+            if out.status.success() {
+                removed.push(package.clone());
+            } else {
+                // "still needed" refusal
+                kept.push(package.clone());
+                warnings.push(format!("kept: {package} (still needed)"));
+            }
+        }
+    }
+    completed_steps += 2;
+
+    if cancelled.load(Ordering::Relaxed) {
+        return Envelope {
+            ok: false,
+            data: json!({
+                "error": "operation cancelled",
+                "completed_steps": completed_steps,
+                "resume_hint": format!("switch to `{target}` to restore"),
+            }),
+            warnings,
+        };
+    }
+
+    // Step 8: hyprctl reload
+    context.progress(&mut emitter, "reloading Hyprland");
+    let reload_output = Command::new("hyprctl").arg("reload").output();
+    if reload_output.map(|o| o.status.success()).unwrap_or(false) {
+        reloaded = true;
+    }
+    completed_steps += 1;
+
+    if cancelled.load(Ordering::Relaxed) {
+        return Envelope {
+            ok: false,
+            data: json!({
+                "error": "operation cancelled",
+                "completed_steps": completed_steps,
+                "resume_hint": format!("switch to `{target}` to restore"),
+            }),
+            warnings,
+        };
+    }
+
+    // Step 9-10: start B's services
+    context.progress(&mut emitter, "starting new services");
+    for service in &target_manifest.services {
+        if services_start.contains(&service.name) {
+            let output = Command::new("sh").arg("-c").arg(&service.start).output();
+            if let Ok(out) = output {
+                if out.status.success() {
+                    services_started.push(service.name.clone());
+                } else {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    warnings.push(format!(
+                        "service `{}` failed to start: {}",
+                        service.name,
+                        stderr.trim()
+                    ));
+                }
+            }
+        }
+    }
+    completed_steps += 2;
+
     let mut envelope = Envelope::ok(json!({
-        "stub": true,
         "target": target,
-        "completed_steps": 0,
+        "completed_steps": completed_steps,
         "resume_hint": format!("switch to `{target}` to restore"),
+        "report": {
+            "installed": installed,
+            "removed": removed,
+            "kept": kept,
+            "conflict_removed": conflict_removed,
+            "linked": linked,
+            "unlinked": unlinked,
+            "services_stopped": services_stopped,
+            "services_started": services_started,
+            "reloaded": reloaded,
+        },
     }));
+    envelope.warnings = warnings;
     with_tools(&mut envelope, Tool::ALL);
     envelope
+}
+
+/// Installs a batch of packages with `helper -S --noconfirm <pkg>`, handling
+/// the install-first conflict fallback: when the helper reports a conflict
+/// against a package still in the A-set, that conflicting A-package is removed
+/// first and the install retried — exactly the spec's locked sequence.
+fn install_packages(
+    helper: &[&str],
+    packages: &[String],
+    installed: &mut Vec<String>,
+    removed: &mut Vec<String>,
+    conflict_removed: &mut Vec<String>,
+) {
+    let bin = helper[0];
+    for package in packages {
+        let output = Command::new(bin)
+            .args(["-S", "--noconfirm", package])
+            .output();
+        if let Ok(out) = output {
+            if out.status.code() == Some(2) {
+                // Conflict detected: remove conflicting package and retry
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if let Some(conflicting) = extract_conflicting_package(&stderr) {
+                    let _ = Command::new("pacman")
+                        .args(["-R", "--noconfirm", &conflicting])
+                        .output();
+                    conflict_removed.push(conflicting.clone());
+                    removed.push(conflicting);
+                    let retry = Command::new(bin)
+                        .args(["-S", "--noconfirm", package])
+                        .output();
+                    if retry.map(|r| r.status.success()).unwrap_or(false) {
+                        installed.push(package.clone());
+                    }
+                }
+            } else if out.status.success() {
+                installed.push(package.clone());
+            }
+        }
+    }
+}
+
+/// Extracts the conflicting package name from pacman conflict stderr
+fn extract_conflicting_package(stderr: &str) -> Option<String> {
+    for line in stderr.lines() {
+        if !line.contains("are in conflict") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        let position = parts.iter().position(|&p| p == "::")?;
+        if position + 1 < parts.len() {
+            return Some(parts[position + 1].to_string());
+        }
+    }
+    None
 }
 
 /// Every profile in the store, with manifest data, plus whichever profile the
@@ -1331,7 +1720,89 @@ fn copy_missing(
     Ok(())
 }
 
-/// One line describing why a tool is unusable.
+/// Computes package diff: (install_official, install_aur, remove_official, remove_aur)
+fn compute_package_diff(
+    current: &Packages,
+    target: &Packages,
+) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    let install_official: Vec<String> = target
+        .official
+        .iter()
+        .filter(|p| !current.official.contains(p))
+        .cloned()
+        .collect();
+    let install_aur: Vec<String> = target
+        .aur
+        .iter()
+        .filter(|p| !current.aur.contains(p))
+        .cloned()
+        .collect();
+    let remove_official: Vec<String> = current
+        .official
+        .iter()
+        .filter(|p| !target.official.contains(p))
+        .cloned()
+        .collect();
+    let remove_aur: Vec<String> = current
+        .aur
+        .iter()
+        .filter(|p| !target.aur.contains(p))
+        .cloned()
+        .collect();
+    (install_official, install_aur, remove_official, remove_aur)
+}
+
+/// Computes service changes: (stop, start)
+fn compute_service_changes(current: &[Service], target: &[Service]) -> (Vec<String>, Vec<String>) {
+    let current_names: std::collections::HashSet<&str> =
+        current.iter().map(|s| s.name.as_str()).collect();
+    let target_names: std::collections::HashSet<&str> =
+        target.iter().map(|s| s.name.as_str()).collect();
+
+    let stop: Vec<String> = current
+        .iter()
+        .filter(|s| !target_names.contains(s.name.as_str()))
+        .map(|s| s.name.clone())
+        .collect();
+    let start: Vec<String> = target
+        .iter()
+        .filter(|s| !current_names.contains(s.name.as_str()))
+        .map(|s| s.name.clone())
+        .collect();
+    (stop, start)
+}
+
+/// Computes symlink changes: (link, unlink). `link` is B's managed paths (the
+/// full set, so a re-run re-pointing an existing link is idempotent); `unlink`
+/// is A's paths B no longer manages.
+fn compute_symlink_changes(
+    current: &[FileEntry],
+    target: &[FileEntry],
+) -> (Vec<String>, Vec<String>) {
+    let target_paths: std::collections::HashSet<&str> =
+        target.iter().map(|f| f.path.as_str()).collect();
+
+    let mut link: Vec<String> = target.iter().map(|f| f.path.clone()).collect();
+    link.sort();
+
+    let unlink: Vec<String> = current
+        .iter()
+        .filter(|f| !target_paths.contains(f.path.as_str()))
+        .map(|f| f.path.clone())
+        .collect();
+    (link, unlink)
+}
+
+/// Checks for real files at target symlink paths (blocked paths)
+fn check_blocked_paths(home: &Path, paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .filter_map(|relative| {
+            let metadata = std::fs::symlink_metadata(home.join(relative)).ok()?;
+            (!metadata.file_type().is_symlink() && metadata.is_file()).then(|| relative.clone())
+        })
+        .collect()
+}
 fn describe(status: &tools::ToolStatus) -> String {
     match (&status.error, status.exit_code) {
         (Some(error), _) if !status.available => error.clone(),

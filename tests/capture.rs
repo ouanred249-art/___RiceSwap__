@@ -519,7 +519,7 @@ fn snapshot_while_a_profile_is_active_forks_and_leaves_the_active_profile_untouc
     );
     assert_eq!(
         sandbox.current_target(),
-        Some(std::path::Path::new("profiles/old").to_path_buf()),
+        Some(sandbox.profile_dir("old")),
         "the fork never re-activates anything"
     );
     assert_eq!(sandbox.state()["active_profile"], json!("old"));

@@ -49,12 +49,17 @@ fn detect_probes_every_tool_and_reports_the_candidate_environment() {
 #[test]
 fn plan_reports_the_switch_preflight_shape() {
     let sandbox = Sandbox::new();
+    sandbox.write_profile("demo", &manifest_toml("demo"));
     let run = sandbox.run(&["plan", "demo"]);
     let data = run.assert_ok();
 
     assert_eq!(data["target"], json!("demo"));
-    assert_eq!(data["package_diff"], json!([]));
-    assert_eq!(data["service_changes"], json!([]));
+    assert_eq!(data.get("stub"), None, "plan is a real diff now");
+    // With no active profile, plan shows installing everything from demo
+    assert!(data["package_diff"]["install"]["official"].is_array());
+    assert!(data["package_diff"]["install"]["aur"].is_array());
+    assert_eq!(data["package_diff"]["remove"]["official"], json!([]));
+    assert_eq!(data["package_diff"]["remove"]["aur"], json!([]));
     assert_eq!(data["blocked_paths"], json!([]));
     for tool in ["pacman", "yay", "paru"] {
         assert!(
@@ -110,7 +115,11 @@ fn switch_streams_step_progress_before_the_envelope() {
     let data = run.assert_ok();
 
     assert_eq!(data["target"], json!("demo"));
-    assert_eq!(data["completed_steps"], json!(0));
+    assert_eq!(
+        data["completed_steps"],
+        json!(10),
+        "switch completes all steps"
+    );
 
     let progress = run.progress();
     assert!(
