@@ -241,6 +241,13 @@ impl Store {
     /// a name that could escape the store, or a profile that is not there (with
     /// what is).
     fn ensure_profile(&self, name: &str) -> Result<PathBuf, String> {
+        self.ensure_profile_dir(name)
+    }
+
+    /// The public form of [`ensure_profile`]: what an operation that removes or
+    /// rewrites an existing profile calls first, so a delete of a name that is
+    /// not in the store fails before touching anything.
+    pub fn ensure_profile_dir(&self, name: &str) -> Result<PathBuf, String> {
         self.validate_name(name)?;
         if !self.profile_dir(name).is_dir() {
             return Err(self.missing(name));

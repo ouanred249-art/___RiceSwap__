@@ -184,35 +184,72 @@ fn info_returns_one_profile_manifest() {
     );
 }
 
-/// Class: profile removal.
+/// Class: profile removal. A missing profile is a clean failure naming it;
+/// the force flag still parses on that path and delete never shelled out.
 #[test]
 fn delete_takes_a_name_and_a_force_flag() {
     let sandbox = Sandbox::new();
 
-    let data = sandbox.run(&["delete", "demo"]).assert_ok();
-    assert_eq!(data["name"], json!("demo"));
-    assert_eq!(data["force"], json!(false));
-    assert_eq!(data["deleted"], json!(false));
+    let message = sandbox.run(&["delete", "demo"]).assert_failed();
+    assert!(
+        message.contains("demo"),
+        "the missing profile is named: {message}"
+    );
 
-    let data = sandbox.run(&["delete", "demo", "--force"]).assert_ok();
-    assert_eq!(data["force"], json!(true));
+    let message = sandbox.run(&["delete", "demo", "--force"]).assert_failed();
+    assert!(
+        message.contains("demo"),
+        "force does not guess a profile into existence: {message}"
+    );
     assert!(
         sandbox.log().is_empty(),
         "delete must not consult external tools"
     );
 }
 
-/// Class: profile comparison.
+/// Class: profile comparison. Two fixture profiles differ in packages and
+/// managed paths; `diff` reports the adds/removes split by source and the
+/// paths each side gains, as pure manifest arithmetic.
 #[test]
 fn diff_takes_two_profiles_and_reports_the_delta_shape() {
     let sandbox = Sandbox::new();
-    let run = sandbox.run(&["diff", "alpha", "beta"]);
-    let data = run.assert_ok();
+    let alpha = common::profile_toml(
+        "alpha",
+        &["oldbar", "shared"],
+        &["oldaur"],
+        &[],
+        &[".config/waybar", ".config/hypr"],
+    );
+    let beta = common::profile_toml(
+        "beta",
+        &["newbar", "shared"],
+        &["newaur"],
+        &[],
+        &[".config/kitty", ".config/waybar"],
+    );
+    sandbox.write_profile("alpha", &alpha);
+    sandbox.write_profile("beta", &beta);
 
+    let data = sandbox.run(&["diff", "alpha", "beta"]).assert_ok();
     assert_eq!(data["a"], json!("alpha"));
     assert_eq!(data["b"], json!("beta"));
-    assert_eq!(data["package_delta"], json!([]));
-    assert_eq!(data["config_delta"], json!([]));
+    assert_eq!(
+        data["package_delta"]["added"],
+        json!({ "official": ["newbar"], "aur": ["newaur"] })
+    );
+    assert_eq!(
+        data["package_delta"]["removed"],
+        json!({ "official": ["oldbar"], "aur": ["oldaur"] })
+    );
+    // Path-level diff: B's full managed set is `added` (the shared
+    // .config/waybar re-point is idempotent), A's dropped path is `removed`.
+    assert_eq!(
+        data["config_delta"],
+        json!({
+            "added": [".config/kitty", ".config/waybar"],
+            "removed": [".config/hypr"]
+        })
+    );
     assert!(
         sandbox.log().is_empty(),
         "diff must not consult external tools"

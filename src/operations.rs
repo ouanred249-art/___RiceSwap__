@@ -10,11 +10,11 @@
 //! wallpapers layer. `detect` and `snapshot` are the snapshot pipeline:
 //! detection proposes the candidates, and a snapshot mirrors the confirmed
 //! ones into a profile — manifest, screenshot, and the shared-hardware
-//! `source =` line included. `plan`, `delete`, and `diff` remain honest stubs:
-//! they stream their real progress lines, probe the external tools their real
-//! implementation will need, and return the real envelope with placeholder
-//! data marked `"stub": true`. Switch sequences and package operations arrive
-//! in later tickets.
+//! `source =` line included. `plan` and `switch` are the switch core: the
+//! plan computes the real diff, and the switch runs the locked 10-step
+//! sequence. `delete` removes a profile from the store — refusing the active
+//! one unless forced — and `diff` reports the package and config delta
+//! between two profiles, the same computation `plan` uses.
 
 use crate::cli::Invocation;
 use crate::detection::{self, IMAGE_EXTENSIONS, PackageScan};
@@ -1136,38 +1136,96 @@ fn info(context: &mut Context, name: &str) -> Envelope {
     }
 }
 
-/// Removes a profile, refusing the active one unless forced.
+/// Removes a profile directory from the store.
+///
+/// The active profile refuses without `--force`: deleting the profile the
+/// `current` symlink points at would strand the activation. The force flag
+/// completes it and clears the active record, so `state.json` stops naming a
+/// profile that no longer exists. A profile that is not in the store is a
+/// clean failure naming it — a deletion never guesses. Filesystem-only: no
+/// external tool is consulted.
 fn delete(context: &mut Context, name: &str, force: bool) -> Envelope {
     let mut emitter = Emitter::new("delete");
     context.progress(
         &mut emitter,
         &format!("checking `{name}` is not the active profile"),
     );
+
+    let directory = match context.store.ensure_profile_dir(name) {
+        Ok(directory) => directory,
+        Err(error) => return Envelope::failed(error),
+    };
+
+    let active = context.store.active();
+    let is_active = active.name.as_deref() == Some(name);
+    if is_active && !force {
+        return Envelope::failed(format!(
+            "`{name}` is the active profile; delete refuses the active profile \
+             unless forced — switch away first, or pass --force to delete it \
+             anyway and clear the activation"
+        ));
+    }
+
     context.progress(&mut emitter, &format!("removing profile `{name}`"));
+    if let Err(error) = std::fs::remove_dir_all(&directory) {
+        return Envelope::failed(format!("cannot remove {}: {error}", directory.display()));
+    }
+
+    // Deleting the active profile clears the activation record: state.json
+    // must stop naming a profile the store no longer holds.
+    if is_active {
+        context.state.set_active_profile(None);
+    }
 
     Envelope::ok(json!({
-        "stub": true,
         "name": name,
         "force": force,
-        "deleted": false,
+        "deleted": true,
     }))
 }
 
-/// The package and config delta between two profiles.
+/// The package and config delta between two profiles, for browsing.
+///
+/// The same computation `plan` runs for a switch, exposed with neither
+/// profile active: packages split official/AUR into adds and removes,
+/// managed paths into the paths `b` gains and the paths `a` gains back. No
+/// external tool is consulted — a delta is pure manifest arithmetic.
 fn diff(context: &mut Context, a: &str, b: &str) -> Envelope {
     let mut emitter = Emitter::new("diff");
     context.progress(
         &mut emitter,
         &format!("reading manifests for `{a}` and `{b}`"),
     );
-    context.progress(&mut emitter, "computing package and config delta");
 
+    let manifest_a = match context.store.load(a) {
+        Ok(manifest) => manifest,
+        Err(error) => return Envelope::failed(error),
+    };
+    let manifest_b = match context.store.load(b) {
+        Ok(manifest) => manifest,
+        Err(error) => return Envelope::failed(error),
+    };
+
+    context.progress(&mut emitter, "computing package and config delta");
+    // `a` is the current side, `b` the target: the adds are what moving from
+    // `a` to `b` gains, exactly as `plan` computes them for a switch.
+    let (added_official, added_aur, removed_official, removed_aur) =
+        compute_package_diff(&manifest_a.packages, &manifest_b.packages);
+    let (config_added, config_removed) =
+        compute_symlink_changes(&manifest_a.files, &manifest_b.files);
+
+    // Filesystem-only: a delta is pure manifest arithmetic, so no tool probe.
     Envelope::ok(json!({
-        "stub": true,
         "a": a,
         "b": b,
-        "package_delta": [],
-        "config_delta": [],
+        "package_delta": {
+            "added": { "official": added_official, "aur": added_aur },
+            "removed": { "official": removed_official, "aur": removed_aur },
+        },
+        "config_delta": {
+            "added": config_added,
+            "removed": config_removed,
+        },
     }))
 }
 
