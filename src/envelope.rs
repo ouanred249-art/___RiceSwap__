@@ -1,7 +1,10 @@
 //! The NDJSON stream every invocation writes to stdout.
 //!
-//! Frozen contract (the QML panel reads this): progress lines first, then
-//! exactly one final line carrying the `{ok, warnings, data}` envelope.
+//! Frozen contract (the QML panel reads this): progress lines and warning
+//! lines first — warnings the moment they happen, so a consumer renders
+//! them inline instead of waiting — then exactly one final line carrying
+//! the `{ok, warnings, data}` envelope. The envelope's own shape never
+//! changes: `data` still carries every warning when the operation ends.
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -59,6 +62,23 @@ impl Emitter {
         self.step += 1;
         let line = json!({
             "progress": {
+                "operation": self.operation,
+                "step": self.step,
+                "message": message,
+            }
+        });
+        write_line(&line.to_string());
+    }
+
+    /// Streams one warning line at the moment the warning happens — before
+    /// the final envelope — so the panel can render it inline while the
+    /// operation still runs. It carries the step in progress and does not
+    /// advance it: a warning belongs to the step that produced it. The
+    /// caller still folds the same text into `Envelope::warnings`, whose
+    /// shape is frozen.
+    pub fn warning(&self, message: &str) {
+        let line = json!({
+            "warning": {
                 "operation": self.operation,
                 "step": self.step,
                 "message": message,

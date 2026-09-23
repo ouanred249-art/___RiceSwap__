@@ -1000,7 +1000,9 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
             // "still needed" refusal: kept, warned, the switch goes on.
             Ok(false) => {
                 kept.push(package.clone());
-                warnings.push(format!("kept: {package} (still needed)"));
+                let note = format!("kept: {package} (still needed)");
+                emitter.warning(&note);
+                warnings.push(note);
             }
             // A polkit denial or dead wrapper on the removal: stop the
             // package ops and report, per the failure model.
@@ -1051,11 +1053,13 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
                     services_started.push(service.name.clone());
                 } else {
                     let stderr = String::from_utf8_lossy(&out.stderr);
-                    warnings.push(format!(
+                    let note = format!(
                         "service `{}` failed to start: {}",
                         service.name,
                         stderr.trim()
-                    ));
+                    );
+                    emitter.warning(&note);
+                    warnings.push(note);
                 }
             }
         }

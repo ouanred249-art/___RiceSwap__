@@ -8,7 +8,7 @@
 mod common;
 
 use common::{Mode, Run, Sandbox, profile_toml};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::os::unix::fs::symlink;
@@ -104,6 +104,16 @@ fn send_sigterm(pid: u32) {
         .status()
         .expect("run kill");
     assert!(status.success(), "SIGTERM must reach the operation");
+}
+
+/// The index of the first NDJSON line before the final envelope satisfying
+/// `predicate` — for asserting where a warning landed in the live stream.
+fn stream_index(run: &Run, predicate: impl Fn(&Value) -> bool) -> Option<usize> {
+    run.lines[..run.lines.len() - 1].iter().position(|line| {
+        serde_json::from_str::<Value>(line)
+            .map(|value| predicate(&value))
+            .unwrap_or(false)
+    })
 }
 
 /// The stub log reduced to the commands underneath the privilege wrappers of
@@ -499,6 +509,19 @@ fn sigterm_stops_at_the_next_step_boundary_and_a_reshwitch_recovers() {
         "a cancelled switch is not a success: {}",
         run.stdout
     );
+    // The stopped state a reopened panel reads: no operation is running
+    // anymore, and the stop is recorded as the failure it was.
+    let stopped = sandbox.state();
+    assert_eq!(
+        stopped["operation"],
+        json!(null),
+        "the stopped switch clears the running operation"
+    );
+    assert_eq!(
+        stopped["last_result"]["ok"],
+        json!(false),
+        "state.json reports the stop honestly"
+    );
     let data = &envelope["data"];
     assert_eq!(
         data["completed_steps"],
@@ -653,4 +676,142 @@ fn a_real_file_at_a_target_path_blocks_plan_and_switch_refuses_before_touching()
         sandbox.log()
     );
     run.assert_no_panic();
+}
+
+/// Class: live warnings (ticket #19). Warnings reach the panel as they
+/// happen — streamed as their own NDJSON lines at the step that produced
+/// them, before the final envelope closes the stream — while the envelope
+/// keeps carrying the same warnings, its frozen shape unchanged.
+#[test]
+fn warnings_stream_inline_as_they_arrive_and_still_close_the_envelope() {
+    let sandbox = Sandbox::new();
+    let alpha = profile_toml(
+        "alpha",
+        &["legacydep", "oldbar", "shared"],
+        &["oldaur"],
+        &[("waybar", "waybar", "pkill waybar")],
+        &[".config/waybar", ".config/hypr"],
+    );
+    fixture_with(&sandbox, &alpha);
+    sandbox.declare_still_needed("legacydep");
+    sandbox.script("ags", Mode::Fail);
+    sandbox.clear_log();
+
+    let run = sandbox.run(&["switch", "beta"]);
+    run.assert_ok();
+
+    // The envelope's frozen warnings still carry both notes.
+    let envelope_warnings = run.warnings();
+    assert!(
+        envelope_warnings
+            .iter()
+            .any(|warning| warning.contains("kept: legacydep (still needed)")),
+        "the kept note reaches the envelope: {envelope_warnings:?}"
+    );
+    assert!(
+        envelope_warnings
+            .iter()
+            .any(|warning| warning.contains("`ags`") && warning.contains("stub failure")),
+        "the service note reaches the envelope: {envelope_warnings:?}"
+    );
+
+    // Both notes also streamed as warning lines, in arrival order, each
+    // naming the operation and the step it happened on.
+    let streamed = run.streamed_warnings();
+    assert_eq!(
+        streamed.len(),
+        2,
+        "one streamed line per warning: {streamed:?}"
+    );
+    assert_eq!(streamed[0]["operation"], json!("switch"));
+    assert_eq!(
+        streamed[0]["step"],
+        json!(6),
+        "the kept note arrives on the package step: {streamed:?}"
+    );
+    assert!(
+        streamed[0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("kept: legacydep (still needed)")),
+        "{streamed:?}"
+    );
+    assert_eq!(streamed[1]["operation"], json!("switch"));
+    assert_eq!(
+        streamed[1]["step"],
+        json!(8),
+        "the service note arrives on the start-services step: {streamed:?}"
+    );
+    assert!(
+        streamed[1]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("`ags`")),
+        "{streamed:?}"
+    );
+
+    // Inline, not batched at the end: the kept note sits between the
+    // package step and the reload, the service note after the start step
+    // but still before the envelope.
+    let between = |earlier: &str, later: usize, note: &str| {
+        let step = stream_index(&run, |value| {
+            value["progress"]["message"].as_str() == Some(earlier)
+        })
+        .unwrap_or_else(|| panic!("no progress line {earlier:?} in {}", run.stdout));
+        let index = stream_index(&run, |value| {
+            value["warning"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(note))
+        })
+        .unwrap_or_else(|| panic!("no streamed warning containing {note:?} in {}", run.stdout));
+        assert!(
+            step < index && index < later,
+            "{note:?} should sit between {earlier:?} (line {step}) and line {later}: {}",
+            run.lines.join("\n")
+        );
+    };
+    between(
+        "applying package changes",
+        stream_index(&run, |value| {
+            value["progress"]["message"].as_str() == Some("reloading Hyprland")
+        })
+        .expect("the reload step streamed"),
+        "kept: legacydep",
+    );
+    between("starting new services", run.lines.len() - 1, "`ags`");
+}
+
+/// Class: the confirmation is read-only (ticket #19). The plan behind the
+/// confirm view probes tools and computes a diff; it changes nothing under
+/// `$HOME` and never reaches a transaction — so Cancel, which only pops the
+/// view, aborts with the system untouched.
+#[test]
+fn the_confirmation_plan_is_read_only_so_cancel_aborts_before_anything_runs() {
+    let sandbox = Sandbox::new();
+    fixture(&sandbox);
+    sandbox.clear_log();
+    let before = sandbox.home_tree();
+
+    let run = sandbox.run(&["plan", "beta"]);
+    let data = run.assert_ok();
+
+    // Everything the confirm view renders comes from this payload: the
+    // summary counts and the expandable sections alike.
+    assert!(data["package_diff"]["install"].is_object());
+    assert!(data["package_diff"]["remove"].is_object());
+    assert!(data["service_changes"]["stop"].is_array());
+    assert!(data["service_changes"]["start"].is_array());
+    assert!(data["symlink_changes"]["link"].is_array());
+    assert!(data["symlink_changes"]["unlink"].is_array());
+    assert!(data["blocked_paths"].is_array());
+
+    assert_eq!(
+        sandbox.home_tree(),
+        before,
+        "the plan changed nothing under the fake $HOME"
+    );
+    for line in sandbox.log() {
+        assert!(
+            line.ends_with("--version"),
+            "plan only probes tools, never transacts: {line}"
+        );
+    }
 }

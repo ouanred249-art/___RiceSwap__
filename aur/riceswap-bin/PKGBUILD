@@ -1,0 +1,57 @@
+# Maintainer: the RiceSwap project
+#
+# Binary build of RiceSwap: pulls the CI tarball for the matching release tag
+# and installs its four artifacts to the locked locations. Never writes to
+# $HOME or hyprland.conf — the keybinds ship as a data file under /usr/share.
+
+pkgname=riceswap-bin
+# The release tag the tarball is built from. Bump on each tagged release.
+_pkgtag=v0.1.0
+pkgver=${_pkgtag#v}
+pkgrel=1
+pkgdesc="Profile-based rice switcher for Hyprland (Quickshell GUI + Rust backend)"
+arch=(x86_64)
+url="https://github.com/ouanred249-art/___RiceSwap__"
+license=(MIT)
+
+# The four hard dependencies from the spec's locked list. Everything else the
+# backend touches (polkit, AUR helpers) is opt-in.
+depends=(quickshell hyprland grim pacman)
+makedepends=()
+optdepends=(
+    "yay: AUR helper (auto-detected, preferred over paru)"
+    "paru: AUR helper (fallback when yay is absent)"
+    "polkit: polkit agent for the system password dialog on package ops"
+)
+# The CI tarball — x86_64 glibc, built by the release workflow:
+#   riceswap-<version>/riceswap                      → /usr/bin
+#   riceswap-<version>/etc/xdg/quickshell/riceswap  → /etc/xdg/quickshell/riceswap/
+#   .../usr/share/riceswap/wallpapers/               → /usr/share/riceswap/wallpapers/
+#   .../usr/share/riceswap/riceswap-keybinds.conf    → /usr/share/riceswap/
+# Its top-level dir and the release's artifact both name the un-bumped
+# version (the one without the v prefix), matching Cargo.toml.
+source=("https://github.com/ouanred249-art/___RiceSwap__/releases/download/${_pkgtag}/riceswap-${pkgver}-x86_64-linux-gnu.tar.gz")
+
+prepare() {
+    # Flatten the versioned top dir to `riceswap/` so package() is
+    # layout-stable across releases.
+    local root="riceswap-${pkgver}"
+    mv "$root" riceswap
+}
+
+package() {
+    # Backend binary → /usr/bin
+    install -Dm755 "riceswap/riceswap" "${pkgdir}/usr/bin/riceswap"
+
+    # GUI config → /etc/xdg/quickshell/riceswap/ (whole tree, byte-faithful)
+    install -Dm644 -r "riceswap/etc/xdg/quickshell/riceswap" "${pkgdir}/etc/xdg/quickshell/riceswap"
+
+    # Bundled wallpapers → /usr/share/riceswap/wallpapers/
+    install -Dm644 -r "riceswap/usr/share/riceswap/wallpapers" \
+        "${pkgdir}/usr/share/riceswap/wallpapers"
+
+    # Keybind snippet as a data file → /usr/share/riceswap/. The onboarding
+    # shows it; the package itself never touches $HOME or hyprland.conf.
+    install -Dm644 "riceswap/usr/share/riceswap/riceswap-keybinds.conf" \
+        "${pkgdir}/usr/share/riceswap/riceswap-keybinds.conf"
+}

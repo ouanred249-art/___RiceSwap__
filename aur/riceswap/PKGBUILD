@@ -1,0 +1,58 @@
+# Maintainer: the RiceSwap project
+#
+# Source build of RiceSwap: compiles the pinned release tarball with cargo and
+# installs the same four artifacts as riceswap-bin — same locked locations,
+# same keybind snippet as a data file. Never writes to $HOME or
+# hyprland.conf.
+
+pkgname=riceswap
+_pkgtag=v0.1.0
+pkgver=${_pkgtag#v}
+pkgrel=1
+pkgdesc="Profile-based rice switcher for Hyprland (Quickshell GUI + Rust backend)"
+arch=(x86_64)
+url="https://github.com/ouanred249-art/___RiceSwap__"
+license=(MIT)
+
+# Runtime deps: the four hard dependencies from the spec's locked list.
+depends=(quickshell hyprland grim pacman)
+# Source build needs rust + cargo.
+makedepends=(rust cargo)
+optdepends=(
+    "yay: AUR helper (auto-detected, preferred over paru)"
+    "paru: AUR helper (fallback when yay is absent)"
+    "polkit: polkit agent for the system password dialog on package ops"
+)
+# The same CI tarball as riceswap-bin — it carries the source tree's four
+# layout dirs, so the source build just adds a cargo build on top.
+source=("https://github.com/ouanred249-art/___RiceSwap__/releases/download/${_pkgtag}/riceswap-${pkgver}-x86_64-linux-gnu.tar.gz")
+
+prepare() {
+    local root="riceswap-${pkgver}"
+    mv "$root" riceswap
+}
+
+build() {
+    cd riceswap
+    # The tarball carries the prebuilt binary; the source build replaces it
+    # with one compiled from the tree that ships in the same tarball.
+    cargo build --release
+}
+
+package() {
+    cd riceswap
+
+    # Backend binary (freshly compiled) → /usr/bin
+    install -Dm755 "target/release/riceswap" "${pkgdir}/usr/bin/riceswap"
+
+    # GUI config → /etc/xdg/quickshell/riceswap/
+    install -Dm644 -r "etc/xdg/quickshell/riceswap" "${pkgdir}/etc/xdg/quickshell/riceswap"
+
+    # Bundled wallpapers → /usr/share/riceswap/wallpapers/
+    install -Dm644 -r "usr/share/riceswap/wallpapers" \
+        "${pkgdir}/usr/share/riceswap/wallpapers"
+
+    # Keybind snippet as a data file → /usr/share/riceswap/
+    install -Dm644 "usr/share/riceswap/riceswap-keybinds.conf" \
+        "${pkgdir}/usr/share/riceswap/riceswap-keybinds.conf"
+}
