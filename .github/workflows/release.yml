@@ -1,0 +1,56 @@
+# One tagged release, one x86_64 glibc tarball: the backend binary, the
+# Quickshell GUI config, the bundled wallpapers, and the keybind snippet —
+# the exact four artifacts the PKGBUILDs in `aur/` install.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Build the backend
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Stage the tarball layout
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p "riceswap-${VERSION}"
+          cp "target/x86_64-unknown-linux-gnu/release/riceswap" \
+             "riceswap-${VERSION}/riceswap"
+          # GUI config → /etc/xdg/quickshell/riceswap
+          mkdir -p "riceswap-${VERSION}/etc/xdg/quickshell"
+          cp -r gui "riceswap-${VERSION}/etc/xdg/quickshell/riceswap"
+          # Bundled wallpapers → /usr/share/riceswap/wallpapers
+          mkdir -p "riceswap-${VERSION}/usr/share/riceswap"
+          cp -r assets/wallpapers "riceswap-${VERSION}/usr/share/riceswap/wallpapers"
+          # Keybind snippet → /usr/share/riceswap
+          cp share/riceswap-keybinds.conf \
+             "riceswap-${VERSION}/usr/share/riceswap/"
+
+      - name: Pack
+        run: tar -czf "riceswap-${GITHUB_REF_NAME#v}-x86_64-linux-gnu.tar.gz" "riceswap-${GITHUB_REF_NAME#v}"
+
+      - name: Release
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          TARBALL="riceswap-${VERSION}-x86_64-linux-gnu.tar.gz"
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "RiceSwap ${VERSION}" \
+            --notes "RiceSwap ${VERSION} — x86_64 glibc. Install with the AUR trio under aur/ or manually per the PKGBUILD layout: /usr/bin/riceswap, /etc/xdg/quickshell/riceswap/, /usr/share/riceswap/wallpapers/, /usr/share/riceswap/riceswap-keybinds.conf." \
+            --target "${GITHUB_REF_NAME}" \
+            "$TARBALL"
+        env:
+          GH_TOKEN: ${{ github.token }}

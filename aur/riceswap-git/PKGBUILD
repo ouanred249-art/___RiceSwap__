@@ -1,0 +1,45 @@
+# Maintainer: the RiceSwap project
+#
+# Development build of RiceSwap: tracks the default branch HEAD with the AUR
+# git helper and installs the same four artifacts as the other two packages
+# in the trio. Never writes to $HOME or hyprland.conf.
+
+pkgname=riceswap-git
+pkgver=r999.master
+pkgrel=1
+pkgdesc="Profile-based rice switcher for Hyprland (Quickshell GUI + Rust backend, bleeding edge)"
+arch=(x86_64)
+url="https://github.com/ouanred249-art/___RiceSwap__"
+license=(MIT)
+
+depends=(quickshell hyprland grim pacman)
+makedepends=(rust cargo)
+optdepends=(
+    "yay: AUR helper (auto-detected, preferred over paru)"
+    "paru: AUR helper (fallback when yay is absent)"
+    "polkit: polkit agent for the system password dialog on package ops"
+)
+source=("git+https://github.com/ouanred249-art/___RiceSwap__#branch=main")
+sha256sums=('SKIP')
+
+build() {
+    cd "$srcdir/___RiceSwap__"
+    cargo build --release
+}
+
+package() {
+    cd "$srcdir/___RiceSwap__"
+
+    # Backend binary (freshly compiled from HEAD) → /usr/bin
+    install -Dm755 "target/release/riceswap" "${pkgdir}/usr/bin/riceswap"
+
+    # GUI config → /etc/xdg/quickshell/riceswap/
+    install -Dm644 -r "gui" "${pkgdir}/etc/xdg/quickshell/riceswap"
+
+    # Bundled wallpapers → /usr/share/riceswap/wallpapers/
+    install -Dm644 -r "assets/wallpapers" "${pkgdir}/usr/share/riceswap/wallpapers"
+
+    # Keybind snippet as a data file → /usr/share/riceswap/
+    install -Dm644 "share/riceswap-keybinds.conf" \
+        "${pkgdir}/usr/share/riceswap/riceswap-keybinds.conf"
+}
