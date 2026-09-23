@@ -24,6 +24,7 @@ PanelView {
     Flickable {
         anchors.fill: parent
         anchors.margins: 26
+        contentWidth: width
         contentHeight: column.implicitHeight
         clip: true
         boundsBehavior: Flickable.StopAtBounds

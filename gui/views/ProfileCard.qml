@@ -24,7 +24,6 @@ Rectangle {
     property var viewRoot
 
     signal activateMenu(string name, real x, real y)
-    signal menuAction(string name, string action)
     signal cardPressed()
 
     readonly property var profileMeta: manifest !== null && manifest.profile ? manifest.profile : ({})
@@ -74,6 +73,9 @@ Rectangle {
     border.width: 1
     border.color: hover.hovered || card.menuOpen ? card.theme.border : Qt.rgba(0, 0, 0, 0)
 
+    // 16:9 thumbnail + text area + padding.
+    height: Math.round(width * 9 / 16) + 10 + infoArea.implicitHeight + 12
+
     Behavior on border.color {
         ColorAnimation {
             duration: 120
@@ -82,6 +84,15 @@ Rectangle {
 
     HoverHandler {
         id: hover
+    }
+
+    // Whole-card press: closes an open menu (declared first so the ⋯
+    // button and everything else above it keep their clicks; the menu
+    // overlay itself lives in ProfilesView, above all of this).
+    MouseArea {
+        anchors.fill: parent
+        cursorShape: Qt.PointingHandCursor
+        onClicked: card.cardPressed()
     }
 
     // ------------------------------------------------------------------
@@ -113,7 +124,7 @@ Rectangle {
         Image {
             id: thumb
             anchors.fill: parent
-            source: card.shotPath ? card.shell.fileUrl(card.shotPath) + "?rev=" + card.shotRevision : ""
+            source: card.shotPath ? card.shell.backend.fileUrl(card.shotPath) + "?rev=" + card.shotRevision : ""
             fillMode: Image.PreserveAspectCrop
             asynchronous: true
 
@@ -155,9 +166,7 @@ Rectangle {
                 anchors.fill: parent
                 cursorShape: Qt.PointingHandCursor
                 onClicked: {
-                    if (card.menuOpen) {
-                        card.activateMenu(card.profileName, 0, 0);
-                    } else if (card.viewRoot) {
+                    if (card.viewRoot) {
                         const point = menuBtn.mapToItem(card.viewRoot, menuBtn.width, menuBtn.height);
                         card.activateMenu(card.profileName, point.x, point.y);
                     }
@@ -248,13 +257,5 @@ Rectangle {
                 }
             }
         }
-    }
-
-    // Whole-card press: closes an open menu (the menu itself sits above
-    // this in ProfilesView, so its items are unaffected).
-    MouseArea {
-        anchors.fill: parent
-        cursorShape: Qt.PointingHandCursor
-        onClicked: card.cardPressed()
     }
 }
