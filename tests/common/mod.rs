@@ -697,16 +697,17 @@ impl Run {
     }
 
     /// The final stdout line, validated as the frozen envelope: every earlier
-    /// line is a progress line, and exactly one envelope closes the stream.
+    /// line is a progress or warning line, and exactly one envelope closes
+    /// the stream.
     pub fn envelope(&self) -> Value {
         let Some((last, progress)) = self.lines.split_last() else {
             panic!("riceswap wrote no NDJSON\nstderr:\n{}", self.stderr);
         };
         for line in progress {
             let value: Value = serde_json::from_str(line)
-                .unwrap_or_else(|error| panic!("progress line {line:?} is not JSON: {error}"));
+                .unwrap_or_else(|error| panic!("stream line {line:?} is not JSON: {error}"));
             assert!(
-                value.get("progress").is_some(),
+                value.get("progress").is_some() || value.get("warning").is_some(),
                 "only the final line may carry the envelope, found {line:?}"
             );
         }
@@ -754,10 +755,21 @@ impl Run {
     pub fn progress(&self) -> Vec<Value> {
         self.lines[..self.lines.len() - 1]
             .iter()
-            .map(|line| {
-                serde_json::from_str::<Value>(line).expect("progress line is JSON")["progress"]
-                    .clone()
-            })
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|value| value.get("progress").cloned())
+            .collect()
+    }
+
+    /// The warning lines streamed before the envelope, in arrival order —
+    /// the document the panel renders inline while the operation runs.
+    pub fn streamed_warnings(&self) -> Vec<Value> {
+        if self.lines.is_empty() {
+            return Vec::new();
+        }
+        self.lines[..self.lines.len() - 1]
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|value| value.get("warning").cloned())
             .collect()
     }
 

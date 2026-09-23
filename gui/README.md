@@ -78,8 +78,10 @@ Judgment calls (also reported on the ticket):
 - `shell.qml` — entry point: ShellRoot, panel window, toggle
   (`GlobalShortcut` + `IpcHandler`), view stack (push/pop), Escape.
 - `Backend.qml` — watched `state.json` + one `Process` per operation
-  (NDJSON progress lines → final `{ok, warnings, data}` envelope), plus
-  the direct `grim` spawn.
+  (NDJSON progress and warning lines → final `{ok, warnings, data}`
+  envelope), plus the direct `grim` spawn. Warnings stream as their own
+  lines the moment they happen; the switch cancel is `running = false`,
+  which sends SIGTERM and the backend stops at the next step boundary.
 - `Theme.qml` — palette gate (active profile ∧ parseable palette) and
   the neutral-dark fallback.
 - `views/PanelView.qml` — base for stacked views: shell/theme context,
@@ -92,5 +94,17 @@ Judgment calls (also reported on the ticket):
   full colour when active), rice_info line, package chip, Active badge
   driven by `state.json`.
 - `views/InfoView.qml` — read-only manifest from real `info`.
-- `views/ComingSoonView.qml` — navigation stub for the switch (#19) and
-  snapshot (#18) flows.
+- `views/SnapshotView.qml` — the one-page snapshot flow: name field,
+  pre-checked chip groups fed by real `detect`, inline
+  wallpaper-import candidates, progress from the live stream, success
+  pops back to Profiles.
+- `views/SwitchView.qml` — the switch flow on one view: confirm (real
+  `plan` diff with expandable sections and a Snapshot-first chain for
+  blocked paths), progress (live step list from state.json / the NDJSON
+  stream, inline streamed warnings, SIGTERM cancel at a step boundary),
+  and result (success report or recovery screen with one-click restore
+  from `resume_hint`). Reopening the panel mid-switch resumes the
+  progress view from `state.json`.
+- `views/ComingSoonView.qml` — navigation stub; the flows it once stood
+  in for are now `SnapshotView` and `SwitchView` (kept for any future
+  stack entry that has no view yet).

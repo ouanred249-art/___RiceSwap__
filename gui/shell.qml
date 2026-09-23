@@ -182,12 +182,10 @@ ShellRoot {
                 active: shellRoot.currentView === "snapshot"
             }
 
-            ComingSoonView {
+            SwitchView {
                 shell: shellRoot
                 theme: rsTheme
-                title: "Switch"
-                subtitle: shellRoot.currentView === "switch" && shellRoot.currentArg ? "Target: " + shellRoot.currentArg : ""
-                note: "The diff-first switch confirmation, progress, and result views land with the switch flow ticket."
+                arg: shellRoot.currentView === "switch" && shellRoot.currentArg ? String(shellRoot.currentArg) : ""
                 width: content.width
                 height: content.height
                 active: shellRoot.currentView === "switch"

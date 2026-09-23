@@ -6,6 +6,19 @@ mod common;
 use common::{Mode, STUB_TOOLS, Sandbox, manifest_toml};
 use serde_json::{Value, json};
 use std::fs;
+use std::time::{Duration, Instant};
+
+/// Polls the stub log until `needle` shows up or the deadline passes.
+fn wait_for_log(sandbox: &Sandbox, needle: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if sandbox.log_contains(needle) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
 
 /// Every invocation, successful or not, ends in exactly one envelope line.
 #[test]
@@ -134,6 +147,95 @@ fn state_json_records_warnings_from_a_degraded_environment() {
     assert_eq!(
         sandbox.state()["last_result"],
         json!({ "ok": envelope["ok"], "warnings": warnings })
+    );
+}
+
+/// The step checklist the panel's switch view renders: `state.json` carries
+/// only the step *number*, so the labels beside it are the `switch`
+/// operation's streamed step messages — pinned here as the stream half of
+/// the frozen contract (ticket #19's ProgressView).
+#[test]
+fn switch_streams_the_step_messages_the_panel_renders() {
+    let sandbox = Sandbox::new();
+    sandbox.write_profile("demo", &manifest_toml("demo"));
+
+    let run = sandbox.run(&["switch", "demo"]);
+    run.assert_ok();
+
+    let progress = run.progress();
+    let messages: Vec<&str> = progress
+        .iter()
+        .map(|line| {
+            line["message"]
+                .as_str()
+                .expect("every progress line carries a message")
+        })
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            "verifying profile `demo`",
+            "computing the switch plan",
+            "activating profile `demo`",
+            "stopping old services",
+            "linking managed config paths",
+            "applying package changes",
+            "reloading Hyprland",
+            "starting new services",
+        ],
+        "the panel's checklist rows are exactly these messages, in order"
+    );
+    for (index, line) in progress.iter().enumerate() {
+        assert_eq!(line["operation"], json!("switch"));
+        assert_eq!(
+            line["step"],
+            json!(index + 1),
+            "state.json's step counts these messages one-by-one"
+        );
+    }
+}
+
+/// A panel reopened mid-switch resumes from `state.json`: while `switch`
+/// runs, the document names the operation, its target, and the step it is
+/// on — the three fields the ProgressView renders (ticket #19).
+#[test]
+fn state_json_names_the_running_switch_and_its_step_while_it_runs() {
+    let sandbox = Sandbox::new();
+    sandbox.write_profile("demo", &manifest_toml("demo"));
+    // The first -S stub sleeps inside its transaction, holding the switch
+    // on the package step while the test reads state.json mid-flight.
+    sandbox.delay_on("pacman", "waybar", 2);
+
+    let mut child = sandbox.spawn(&["switch", "demo"]);
+    assert!(
+        wait_for_log(&sandbox, "pacman -S", Duration::from_secs(10)),
+        "the package step never started: {:?}",
+        sandbox.log()
+    );
+
+    let seen = sandbox.state();
+    let operation = &seen["operation"];
+    assert_eq!(operation["name"], json!("switch"));
+    assert_eq!(operation["target"], json!("demo"));
+    assert_eq!(
+        operation["step"],
+        json!(6),
+        "the sixth streamed step — the package step — is the visible one"
+    );
+    assert!(
+        operation["started_at"].as_u64().is_some_and(|at| at > 0),
+        "started_at is Unix epoch seconds"
+    );
+
+    let status = child.wait().expect("wait for the switch");
+    assert!(
+        status.success(),
+        "the operation exits 0 on success, got {status}"
+    );
+    assert_eq!(
+        sandbox.state()["operation"],
+        json!(null),
+        "the finished switch clears the running operation"
     );
 }
 

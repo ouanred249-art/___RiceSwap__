@@ -84,6 +84,16 @@ QtObject {
     property var lastEnvelope: null
     property var pendingEnvelope: null
 
+    // Emitted when an operation starts, so views can clear per-operation
+    // state (e.g. the switch progress view's warnings list).
+    signal operationStarted(string operation)
+
+    // One emitted per streamed warning line, at the moment the warning
+    // happens — the switch progress view renders these inline while the
+    // operation still runs. The final envelope still carries the same
+    // warnings (frozen shape).
+    signal operationWarning(string operation, string message)
+
     // Emitted once per operation with the final envelope (fabricated as a
     // failure when the process died before reporting one).
     signal operationFinished(string operation, bool ok, var envelope)
@@ -109,6 +119,8 @@ QtObject {
         } else if (parsed && parsed.progress) {
             progressMessage = parsed.progress.message ? String(parsed.progress.message) : "";
             progressStep = parsed.progress.step ? parsed.progress.step : 0;
+        } else if (parsed && parsed.warning) {
+            operationWarning(runningOp, parsed.warning.message ? String(parsed.warning.message) : "");
         }
     }
 
@@ -146,6 +158,7 @@ QtObject {
         pendingEnvelope = null;
         opProcess.command = ["riceswap"].concat(args);
         opProcess.running = true;
+        operationStarted(operation);
         return true;
     }
 
@@ -177,6 +190,27 @@ QtObject {
     // profile; the backend's refusal message is shown inline instead.
     function runDelete(name) {
         return run("delete", ["delete", name]);
+    }
+
+    function runPlan(target) {
+        return run("plan", ["plan", target]);
+    }
+
+    function runSwitch(target) {
+        return run("switch", ["switch", target]);
+    }
+
+    // Cancel a running switch: SIGTERM to the backend process (the docs'
+    // "setting running to false sends SIGTERM"). The switch sequence
+    // watches SIGTERM, stops at the next step boundary, then reports its
+    // honest envelope (completed_steps + resume_hint) before exiting — so
+    // the fabricated-envelope path in handleExit only fires if the
+    // backend dies before reaching a boundary.
+    function cancelSwitch() {
+        if (!busy || runningOp !== "switch")
+            return false;
+        opProcess.running = false;
+        return true;
     }
 
     // ------------------------------------------------------------------
