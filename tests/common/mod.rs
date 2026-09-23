@@ -18,7 +18,18 @@ use std::process::{Child, Output, Stdio};
 use tempfile::TempDir;
 
 /// Executables the backend shells out to, stubbed on `PATH` for every test.
-pub const STUB_TOOLS: &[&str] = &["pacman", "yay", "paru", "hyprctl", "grim"];
+/// `pkexec` and `riceswap-float` are the privilege-flow wrappers of ticket
+/// #16: every official package op runs `pkexec pacman`, every AUR helper run
+/// goes through the floating-terminal wrapper.
+pub const STUB_TOOLS: &[&str] = &[
+    "pacman",
+    "yay",
+    "paru",
+    "hyprctl",
+    "grim",
+    "pkexec",
+    "riceswap-float",
+];
 
 /// Service commands the fixture manifests run (`start`/`stop`), stubbed on
 /// `PATH` beside [`STUB_TOOLS`] so a switch can stop and start services
@@ -57,10 +68,21 @@ impl Mode {
 ///   PATH-resolved path answers too) and exits 1 for anything unowned;
 /// - `pacman -Qm` lists the fixture entries marked `aur`;
 /// - `grim <path>` writes the screenshot file it was pointed at;
+/// - `pkexec` and `riceswap-float` answer `--version` like any other tool,
+///   then run the command they were pointed at — `pkexec pacman ...` executes
+///   pacman, `riceswap-float <helper> ...` runs the AUR helper — so the
+///   fixtures underneath decide the outcome; a scripted failure mode is the
+///   polkit denial / dead floating terminal;
+/// - a rule in `RICESWAP_STUB_FAIL_DIR/<tool>` fails just the invocations
+///   whose arguments contain the pattern (see `fail_on`), leaving
+///   `--version` probes answerable — a helper that detects cleanly and then
+///   fails inside its real transaction;
 /// - `-S` installs: a rule in `RICESWAP_STUB_CONFLICTS`
 ///   (`<installed> <installer>`) makes the install conflict — exit 2, message
 ///   naming both packages — while `<installed>` is still in the
-///   `RICESWAP_STUB_PACKAGES` state; installed packages accumulate there;
+///   `RICESWAP_STUB_PACKAGES` state; installed packages accumulate there,
+///   and a successful install prints `installing <pkg>` per package — the
+///   helper output the switch report carries;
 /// - `-R` removes: a package listed in `RICESWAP_STUB_NEEDED` is refused with
 ///   a dependency error (exit 1, "breaks dependency ... required by ..."),
 ///   anything else leaves the state file.
@@ -77,9 +99,31 @@ if [ -n "$RICESWAP_STUB_DELAY_DIR" ] && [ -f "$RICESWAP_STUB_DELAY_DIR/$name" ];
     esac
   done < "$RICESWAP_STUB_DELAY_DIR/$name"
 fi
+if [ -n "$RICESWAP_STUB_FAIL_DIR" ] && [ -r "$RICESWAP_STUB_FAIL_DIR/$name" ]; then
+  while read -r pattern; do
+    [ -n "$pattern" ] || continue
+    case "$*" in
+      *"$pattern"*)
+        printf '%s: scripted failure for arguments containing `%s`\n' "$name" "$pattern" >&2
+        exit 1 ;;
+    esac
+  done < "$RICESWAP_STUB_FAIL_DIR/$name"
+fi
 mode=ok
 if [ -r "$RICESWAP_STUB_MODE_DIR/$name" ]; then read -r mode < "$RICESWAP_STUB_MODE_DIR/$name"; fi
 if [ "$mode" = "ok" ]; then
+  # The privilege wrappers run the command they were pointed at — pkexec
+  # executing pacman, the floating-terminal wrapper running the AUR helper —
+  # but still answer their own version probe.
+  case "$name" in
+    pkexec|riceswap-float)
+      if [ "$1" != "--version" ]; then
+        wrapped=$1
+        shift
+        exec "$wrapped" "$@"
+      fi
+      ;;
+  esac
   if [ "$name" = "pacman" ] && [ "$1" = "-Qo" ]; then
     query=$2
     base=${query##*/}
@@ -143,6 +187,7 @@ if [ "$mode" = "ok" ]; then
           done < "$RICESWAP_STUB_CONFLICTS"
         done
       fi
+      for package in $packages; do printf 'installing %s\n' "$package"; done
       if [ -n "$RICESWAP_STUB_PACKAGES" ]; then
         for package in $packages; do
           if [ ! -f "$RICESWAP_STUB_PACKAGES" ] || ! grep -Fxq "$package" "$RICESWAP_STUB_PACKAGES"; then
@@ -174,6 +219,7 @@ pub struct Sandbox {
     needed: PathBuf,
     packages: PathBuf,
     delays: PathBuf,
+    fails: PathBuf,
 }
 
 impl Sandbox {
@@ -189,7 +235,8 @@ impl Sandbox {
         let needed = root.path().join("still-needed.txt");
         let packages = root.path().join("installed-packages.txt");
         let delays = root.path().join("delays");
-        for dir in [&home, &bin, &modes, &states, &delays] {
+        let fails = root.path().join("fail-on");
+        for dir in [&home, &bin, &modes, &states, &delays, &fails] {
             fs::create_dir_all(dir).expect("create sandbox directory");
         }
         for tool in STUB_TOOLS.iter().chain(SERVICE_STUBS) {
@@ -212,6 +259,7 @@ impl Sandbox {
             needed,
             packages,
             delays,
+            fails,
         }
     }
 
@@ -274,6 +322,21 @@ impl Sandbox {
         fs::write(&path, delays).expect("write delay fixture");
     }
 
+    /// Makes `tool` fail (exit 1, message on stderr) any invocation whose
+    /// arguments contain `pattern`, while `--version` probes keep answering —
+    /// so a tool can be *detected* and then fail inside its real transaction.
+    /// Sticky until cleared by re-scripting the tool's mode.
+    pub fn fail_on(&self, tool: &str, pattern: &str) {
+        assert!(
+            STUB_TOOLS.contains(&tool) || SERVICE_STUBS.contains(&tool),
+            "unknown stub tool {tool}"
+        );
+        let path = self.fails.join(tool);
+        let mut fails = fs::read_to_string(&path).unwrap_or_default();
+        fails.push_str(&format!("{pattern}\n"));
+        fs::write(&path, fails).expect("write fail-on fixture");
+    }
+
     /// Truncates the invocation log, so a test can assert on one operation's
     /// stub traffic alone.
     pub fn clear_log(&self) {
@@ -306,7 +369,8 @@ impl Sandbox {
             .env("RICESWAP_STUB_CONFLICTS", &self.conflicts)
             .env("RICESWAP_STUB_NEEDED", &self.needed)
             .env("RICESWAP_STUB_PACKAGES", &self.packages)
-            .env("RICESWAP_STUB_DELAY_DIR", &self.delays);
+            .env("RICESWAP_STUB_DELAY_DIR", &self.delays)
+            .env("RICESWAP_STUB_FAIL_DIR", &self.fails);
         command
     }
 
@@ -336,6 +400,7 @@ impl Sandbox {
             .env("RICESWAP_STUB_NEEDED", &self.needed)
             .env("RICESWAP_STUB_PACKAGES", &self.packages)
             .env("RICESWAP_STUB_DELAY_DIR", &self.delays)
+            .env("RICESWAP_STUB_FAIL_DIR", &self.fails)
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

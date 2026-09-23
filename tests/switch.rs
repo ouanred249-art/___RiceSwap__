@@ -106,6 +106,28 @@ fn send_sigterm(pid: u32) {
     assert!(status.success(), "SIGTERM must reach the operation");
 }
 
+/// The stub log reduced to the commands underneath the privilege wrappers of
+/// ticket #16: `pkexec pacman -S x` and the pacman it executed both become
+/// `pacman -S x`, so consecutive duplicates collapse and the *locked sequence
+/// itself* stays the assertion — wrappers are asserted separately in
+/// `tests/privilege.rs`.
+fn locked_commands(sandbox: &Sandbox) -> Vec<String> {
+    let mut commands: Vec<String> = Vec::new();
+    for line in sandbox.log() {
+        let trimmed = line.trim_end();
+        let stripped = trimmed.strip_prefix("pkexec ").unwrap_or(trimmed);
+        let stripped = stripped.strip_prefix("riceswap-float ").unwrap_or(stripped);
+        if commands
+            .last()
+            .is_some_and(|last| last.as_str() == stripped)
+        {
+            continue;
+        }
+        commands.push(stripped.to_string());
+    }
+    commands
+}
+
 /// Class: pre-flight plan. Between two fixture profiles `plan` returns the
 /// correct install/remove/symlink/service sets, and a real file at a target
 /// path shows up in `blocked_paths`.
@@ -196,10 +218,8 @@ fn switch_runs_the_locked_sequence_in_order() {
     assert_eq!(data["report"]["reloaded"], json!(true));
     assert!(run.warnings().is_empty(), "{:?}", run.warnings());
 
-    let sequence: Vec<String> = sandbox
-        .log()
-        .iter()
-        .map(|line| line.trim_end().to_string())
+    let sequence: Vec<String> = locked_commands(&sandbox)
+        .into_iter()
         .filter(|line| !line.contains("--version"))
         .collect();
     assert_eq!(
@@ -215,6 +235,14 @@ fn switch_runs_the_locked_sequence_in_order() {
         ],
         "the locked sequence: stop A's services, install-first, plain -R, \
          hyprctl reload, start B's services"
+    );
+    assert!(
+        sandbox
+            .log()
+            .iter()
+            .any(|line| line.trim_end() == "yay -S --noconfirm newaur"),
+        "the AUR helper itself ran (inside its wrapper): {:?}",
+        sandbox.log()
     );
 
     assert_eq!(
@@ -268,7 +296,7 @@ fn a_declared_package_conflict_removes_the_conflicting_package_and_retries() {
     );
     assert!(run.warnings().is_empty(), "{:?}", run.warnings());
 
-    let log = sandbox.log();
+    let log = locked_commands(&sandbox);
     let installs: Vec<usize> = log
         .iter()
         .enumerate()

@@ -12,7 +12,9 @@
 //! ones into a profile — manifest, screenshot, and the shared-hardware
 //! `source =` line included. `plan` and `switch` are the switch core: the
 //! plan computes the real diff, and the switch runs the locked 10-step
-//! sequence. `delete` removes a profile from the store — refusing the active
+//! sequence — official package ops escalated through `pkexec pacman`, AUR
+//! installs through the runtime-detected helper spawned inside the
+//! floating-terminal wrapper. `delete` removes a profile from the store — refusing the active
 //! one unless forced — and `diff` reports the package and config delta
 //! between two profiles, the same computation `plan` uses.
 
@@ -28,13 +30,20 @@ use serde_json::{Value, json};
 use std::ffi::OsStr;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The tools a package-touching operation depends on.
 const PACKAGE_MANAGERS: &[Tool] = &[Tool::Pacman, Tool::Yay, Tool::Paru];
+
+/// The command prefix every official package op runs under: polkit escalation
+/// over pacman, so installs and plain `-R` removals alike pass through the
+/// system password dialog instead of a terminal. The AUR path has its own
+/// prefix — the floating-terminal wrapper naming the detected helper — built
+/// where the helper is known.
+const OFFICIAL: &[&str] = &[Tool::PkExec.name(), Tool::Pacman.name()];
 
 /// The tools a snapshot reports on: the package managers behind the
 /// binary-reference scan and the package split, and `grim` behind the
@@ -197,7 +206,7 @@ fn dispatch(invocation: &Invocation, context: &mut Context) -> Envelope {
         Invocation::Detect => detect(context),
         Invocation::Snapshot { name, force } => snapshot(context, name, *force),
         Invocation::Plan { target } => plan(context, target),
-        Invocation::Switch { target } => switch(context, target),
+        Invocation::Switch { target, aur_helper } => switch(context, target, aur_helper.as_deref()),
         Invocation::List => list(context),
         Invocation::Info { name } => info(context, name),
         Invocation::Delete { name, force } => delete(context, name, *force),
@@ -735,13 +744,19 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 /// The switch sequence's heart: verify the target, compute the plan, check for
-/// blocked paths, then run the fixed idempotent sequence: flip `current` → stop
-/// A's services → flip symlinks → install-first package ops (install B's missing;
-/// on conflict remove the conflicting A-package and retry; then remove A-unique
-/// with plain `pacman -R`, logging "kept" when refused) → `hyprctl reload` →
-/// start B's services (failure = warning). Failures produce `ok: false` with
-/// `completed_steps` + `resume_hint`. SIGTERM cancels at the next step boundary.
-fn switch(context: &mut Context, target: &str) -> Envelope {
+/// blocked paths and — when the plan installs AUR packages — a usable AUR
+/// helper, then run the fixed idempotent sequence: flip `current` → stop A's
+/// services → flip symlinks → install-first package ops (official via
+/// `pkexec pacman`, AUR via the detected helper inside the floating-terminal
+/// wrapper; on conflict remove the conflicting A-package and retry; then
+/// remove A-unique with plain `pkexec pacman -R`, logging "kept" when
+/// refused) → `hyprctl reload` → start B's services (failure = warning).
+/// Failures produce `ok: false` with `completed_steps` + `resume_hint`.
+/// SIGTERM cancels at the next step boundary.
+///
+/// `aur_helper` is the `--aur-helper` override: it pins the helper instead of
+/// runtime detection (yay before paru).
+fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Envelope {
     let mut emitter = Emitter::new("switch");
 
     // Set up SIGTERM handler
@@ -815,6 +830,36 @@ fn switch(context: &mut Context, target: &str) -> Envelope {
             warnings: Vec::new(),
         };
     }
+
+    // AUR installs need a helper before anything is touched: with AUR packages
+    // in the plan and none usable on PATH, refuse here — the error names the
+    // packages that would be left uninstalled, and `current` never flips.
+    let aur_helper = if install_aur.is_empty() {
+        None
+    } else {
+        match detect_aur_helper(aur_helper) {
+            Some(helper) => Some(helper),
+            None => {
+                let looked = match aur_helper {
+                    Some(helper) => {
+                        format!("the AUR helper `{helper}` (--aur-helper) does not answer on PATH")
+                    }
+                    None => "no usable AUR helper on PATH (install `yay` or `paru`, or pass \
+                             `--aur-helper <helper>`)"
+                        .to_string(),
+                };
+                return package_failure(
+                    target,
+                    2,
+                    Vec::new(),
+                    format!(
+                        "{looked}; cannot install the AUR packages: {}",
+                        install_aur.join(", ")
+                    ),
+                );
+            }
+        }
+    };
 
     let mut completed_steps = 2;
     let mut warnings = Vec::new();
@@ -911,53 +956,55 @@ fn switch(context: &mut Context, target: &str) -> Envelope {
         };
     }
 
-    // Step 6-7: install-first package ops
+    // Step 6-7: install-first package ops — official through `pkexec pacman`,
+    // AUR through the detected helper inside the floating-terminal wrapper.
     context.progress(&mut emitter, "applying package changes");
 
     // Install official packages
-    install_packages(
-        &["pacman"],
+    if let Err(error) = install_packages(
+        OFFICIAL,
+        "pkexec pacman",
         &install_official,
         &mut installed,
         &mut removed,
         &mut conflict_removed,
-    );
+    ) {
+        return package_failure(target, completed_steps, warnings, error);
+    }
 
-    // Install AUR packages
-    let helper = if Command::new("yay")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
-        "yay"
-    } else {
-        "paru"
-    };
-    install_packages(
-        &[helper],
-        &install_aur,
-        &mut installed,
-        &mut removed,
-        &mut conflict_removed,
-    );
+    // Install AUR packages — the helper was pinned or detected pre-flight.
+    let mut aur_output = Vec::new();
+    if let Some(helper) = &aur_helper {
+        let actor = format!("the AUR helper `{helper}` in the floating terminal");
+        let prefix = [Tool::FloatTerminal.name(), helper.as_str()];
+        match install_packages(
+            &prefix,
+            &actor,
+            &install_aur,
+            &mut installed,
+            &mut removed,
+            &mut conflict_removed,
+        ) {
+            Err(error) => return package_failure(target, completed_steps, warnings, error),
+            Ok(lines) => aur_output = lines,
+        }
+    }
 
     // Remove A-unique packages (plain -R, never -Rs/-Rdd)
     for package in remove_official.iter().chain(&remove_aur) {
         if conflict_removed.contains(package) {
             continue; // Already removed during conflict resolution
         }
-        let output = Command::new("pacman")
-            .args(["-R", "--noconfirm", package])
-            .output();
-        if let Ok(out) = output {
-            if out.status.success() {
-                removed.push(package.clone());
-            } else {
-                // "still needed" refusal
+        match remove_package(package) {
+            Ok(true) => removed.push(package.clone()),
+            // "still needed" refusal: kept, warned, the switch goes on.
+            Ok(false) => {
                 kept.push(package.clone());
                 warnings.push(format!("kept: {package} (still needed)"));
             }
+            // A polkit denial or dead wrapper on the removal: stop the
+            // package ops and report, per the failure model.
+            Err(error) => return package_failure(target, completed_steps, warnings, error),
         }
     }
     completed_steps += 2;
@@ -1024,6 +1071,7 @@ fn switch(context: &mut Context, target: &str) -> Envelope {
             "removed": removed,
             "kept": kept,
             "conflict_removed": conflict_removed,
+            "aur_output": aur_output,
             "linked": linked,
             "unlinked": unlinked,
             "services_stopped": services_stopped,
@@ -1036,43 +1084,166 @@ fn switch(context: &mut Context, target: &str) -> Envelope {
     envelope
 }
 
-/// Installs a batch of packages with `helper -S --noconfirm <pkg>`, handling
-/// the install-first conflict fallback: when the helper reports a conflict
+/// Installs a batch of packages with `prefix -S --noconfirm <pkg>` — the
+/// prefix being the privilege path: `pkexec pacman` for official packages,
+/// the floating-terminal wrapper naming the AUR helper for AUR ones — handling
+/// the install-first conflict fallback: when the installer reports a conflict
 /// against a package still in the A-set, that conflicting A-package is removed
-/// first and the install retried — exactly the spec's locked sequence.
+/// with plain `pkexec pacman -R` first and the install retried — exactly the
+/// spec's locked sequence.
+///
+/// Returns the stdout the transactions printed — the AUR helper's output the
+/// switch report carries. A polkit denial, a dead wrapper, or any refusal that
+/// is not the declared-conflict dance is an error naming the actor, the
+/// package, and what the transaction said: the failure model's "stop package
+/// ops, report".
 fn install_packages(
-    helper: &[&str],
+    prefix: &[&str],
+    actor: &str,
     packages: &[String],
     installed: &mut Vec<String>,
     removed: &mut Vec<String>,
     conflict_removed: &mut Vec<String>,
-) {
-    let bin = helper[0];
+) -> Result<Vec<String>, String> {
+    let mut output_lines = Vec::new();
     for package in packages {
-        let output = Command::new(bin)
-            .args(["-S", "--noconfirm", package])
-            .output();
-        if let Ok(out) = output {
-            if out.status.code() == Some(2) {
-                // Conflict detected: remove conflicting package and retry
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                if let Some(conflicting) = extract_conflicting_package(&stderr) {
-                    let _ = Command::new("pacman")
-                        .args(["-R", "--noconfirm", &conflicting])
-                        .output();
-                    conflict_removed.push(conflicting.clone());
-                    removed.push(conflicting);
-                    let retry = Command::new(bin)
-                        .args(["-S", "--noconfirm", package])
-                        .output();
-                    if retry.map(|r| r.status.success()).unwrap_or(false) {
-                        installed.push(package.clone());
-                    }
-                }
-            } else if out.status.success() {
+        let output = run_command(prefix, &["-S", "--noconfirm", package])
+            .map_err(|error| format!("cannot run {actor}: {error}"))?;
+        if output.status.code() == Some(2) {
+            // Conflict detected: remove conflicting package and retry
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let Some(conflicting) = extract_conflicting_package(&stderr) else {
+                return Err(format!(
+                    "{actor} failed to install `{package}`: {}",
+                    failure_detail(&output)
+                ));
+            };
+            // Best-effort: if the removal cannot happen, the retry below
+            // reports the conflict that is still standing.
+            let _ = run_command(OFFICIAL, &["-R", "--noconfirm", &conflicting]);
+            conflict_removed.push(conflicting.clone());
+            removed.push(conflicting);
+            let retry = run_command(prefix, &["-S", "--noconfirm", package])
+                .map_err(|error| format!("cannot run {actor}: {error}"))?;
+            if retry.status.success() {
                 installed.push(package.clone());
+                output_lines.extend(stdout_lines(&retry.stdout));
+            } else {
+                return Err(format!(
+                    "{actor} failed to install `{package}` after removing the \
+                     conflicting package: {}",
+                    failure_detail(&retry)
+                ));
             }
+        } else if output.status.success() {
+            installed.push(package.clone());
+            output_lines.extend(stdout_lines(&output.stdout));
+        } else {
+            return Err(format!(
+                "{actor} failed to install `{package}`: {}",
+                failure_detail(&output)
+            ));
         }
+    }
+    Ok(output_lines)
+}
+
+/// Removes one package with plain `pkexec pacman -R` — never `-Rs`/`-Rdd` —
+/// for official and AUR packages alike: pacman is the removal authority
+/// either way. `Ok(false)` is the dependency refusal the caller logs as kept;
+/// anything else (a polkit denial, a spawn failure) is an error, so a denial
+/// on a removal surfaces exactly like one on an install.
+fn remove_package(package: &str) -> Result<bool, String> {
+    let output = run_command(OFFICIAL, &["-R", "--noconfirm", package])
+        .map_err(|error| format!("cannot run pkexec pacman: {error}"))?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("breaks dependency") || stderr.contains("could not satisfy dependencies") {
+        return Ok(false);
+    }
+    Err(format!(
+        "pkexec pacman failed to remove `{package}`: {}",
+        failure_detail(&output)
+    ))
+}
+
+/// Runs one privilege-path command and waits for it: `prefix` first (`pkexec
+/// pacman`, or the floating-terminal wrapper naming the helper), then `args`.
+fn run_command(prefix: &[&str], args: &[&str]) -> std::io::Result<Output> {
+    let (program, escalated) = prefix
+        .split_first()
+        .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "empty command prefix"))?;
+    Command::new(program).args(escalated).args(args).output()
+}
+
+/// What a failed transaction said — or how it died when it said nothing — so
+/// every package failure reaches the envelope with a reason.
+fn failure_detail(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let text = stderr.trim();
+    if !text.is_empty() {
+        return text.to_string();
+    }
+    match output.status.code() {
+        Some(code) => format!("exit code {code}, with no error output"),
+        None => "killed by a signal".to_string(),
+    }
+}
+
+/// The non-empty lines a transaction printed — the AUR helper's output that
+/// flows into the switch report.
+fn stdout_lines(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The AUR helper the switch installs with: the `--aur-helper` override when
+/// given — the testing escape hatch the spec locks in — else the first of
+/// `yay`, `paru` that answers its version probe on PATH, yay before paru.
+/// Detection means "answers cleanly", not merely present: a helper too broken
+/// to report its version must reach the clear no-helper error up front instead
+/// of dying halfway through a transaction.
+fn detect_aur_helper(override_helper: Option<&str>) -> Option<String> {
+    match override_helper {
+        Some(helper) => usable_helper(helper).then(|| helper.to_string()),
+        None => [Tool::Yay.name(), Tool::Paru.name()]
+            .into_iter()
+            .find(|candidate| usable_helper(candidate))
+            .map(str::to_string),
+    }
+}
+
+/// Whether `helper` is on `PATH` and answers `--version` with success.
+fn usable_helper(helper: &str) -> bool {
+    Command::new(helper)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// The failure model behind every package-step stop: `ok: false` carrying the
+/// error, what had completed, and the re-switch hint — no auto-rollback; every
+/// step is idempotent, so the same switch resumes the work.
+fn package_failure(
+    target: &str,
+    completed_steps: i32,
+    warnings: Vec<String>,
+    error: String,
+) -> Envelope {
+    Envelope {
+        ok: false,
+        data: json!({
+            "error": error,
+            "completed_steps": completed_steps,
+            "resume_hint": format!("switch to `{target}` to restore"),
+        }),
+        warnings,
     }
 }
 

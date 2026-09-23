@@ -17,6 +17,11 @@ pub enum Tool {
     Paru,
     Hyprctl,
     Grim,
+    /// The polkit executor every official package op runs under.
+    PkExec,
+    /// The floating-terminal wrapper the AUR helper is spawned inside, so its
+    /// password prompt works without a terminal of our own.
+    FloatTerminal,
 }
 
 impl Tool {
@@ -27,16 +32,20 @@ impl Tool {
         Tool::Paru,
         Tool::Hyprctl,
         Tool::Grim,
+        Tool::PkExec,
+        Tool::FloatTerminal,
     ];
 
     /// The executable name looked up on `PATH`.
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Tool::Pacman => "pacman",
             Tool::Yay => "yay",
             Tool::Paru => "paru",
             Tool::Hyprctl => "hyprctl",
             Tool::Grim => "grim",
+            Tool::PkExec => "pkexec",
+            Tool::FloatTerminal => "riceswap-float",
         }
     }
 }

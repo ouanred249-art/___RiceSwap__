@@ -7,21 +7,42 @@ use std::fmt;
 
 /// The full operation surface, for error messages.
 pub const USAGE: &str = "expected one of: \
-     detect, snapshot <name> [--force], plan <target>, switch <target>, list, info <name>, \
-     delete <name> [--force], diff <a> <b>, wallpaper-import <path>, init";
+     detect, snapshot <name> [--force], plan <target>, switch <target> [--aur-helper <helper>], \
+     list, info <name>, delete <name> [--force], diff <a> <b>, wallpaper-import <path>, init";
 
 /// One parsed operation invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Invocation {
     Detect,
-    Snapshot { name: String, force: bool },
-    Plan { target: String },
-    Switch { target: String },
+    Snapshot {
+        name: String,
+        force: bool,
+    },
+    Plan {
+        target: String,
+    },
+    /// `switch <target> [--aur-helper <helper>]` — the flag pins the AUR
+    /// helper instead of runtime detection, the testing escape hatch the
+    /// privilege-flow spec locks in.
+    Switch {
+        target: String,
+        aur_helper: Option<String>,
+    },
     List,
-    Info { name: String },
-    Delete { name: String, force: bool },
-    Diff { a: String, b: String },
-    WallpaperImport { path: String },
+    Info {
+        name: String,
+    },
+    Delete {
+        name: String,
+        force: bool,
+    },
+    Diff {
+        a: String,
+        b: String,
+    },
+    WallpaperImport {
+        path: String,
+    },
     Init,
 }
 
@@ -47,7 +68,7 @@ impl Invocation {
     pub fn target(&self) -> Option<String> {
         match self {
             Invocation::Snapshot { name, .. } | Invocation::Info { name } => Some(name.clone()),
-            Invocation::Plan { target } | Invocation::Switch { target } => Some(target.clone()),
+            Invocation::Plan { target } | Invocation::Switch { target, .. } => Some(target.clone()),
             Invocation::Delete { name, .. } => Some(name.clone()),
             Invocation::Diff { a, .. } => Some(a.clone()),
             Invocation::WallpaperImport { path } => Some(path.clone()),
@@ -83,9 +104,11 @@ pub fn parse(args: &[String]) -> Result<Invocation, ArgumentError> {
         "plan" => Ok(Invocation::Plan {
             target: one_positional(operation, "<target>", rest)?,
         }),
-        "switch" => Ok(Invocation::Switch {
-            target: one_positional(operation, "<target>", rest)?,
-        }),
+        "switch" => {
+            let (aur_helper, positional) = split_aur_helper(operation, rest)?;
+            let target = exactly_one(operation, "<target>", positional)?;
+            Ok(Invocation::Switch { target, aur_helper })
+        }
         "info" => Ok(Invocation::Info {
             name: one_positional(operation, "<name>", rest)?,
         }),
@@ -207,6 +230,43 @@ fn split_force<'a>(
         }
     }
     Ok((force, positional))
+}
+
+/// Pulls `--aur-helper <name>` out of `switch`'s argument list wherever it
+/// appears, rejecting every other flag. The override pins the AUR helper the
+/// privilege flow would otherwise detect at runtime.
+fn split_aur_helper<'a>(
+    operation: &str,
+    rest: &'a [String],
+) -> Result<(Option<String>, Vec<&'a str>), ArgumentError> {
+    let mut helper = None;
+    let mut positional = Vec::new();
+    let mut arguments = rest.iter();
+    while let Some(argument) = arguments.next() {
+        if argument == "--aur-helper" {
+            let usage = format!(
+                "`{operation}` needs a helper name after `--aur-helper`; \
+                 usage: {operation} <target> --aur-helper <helper>"
+            );
+            let Some(name) = arguments.next() else {
+                return Err(ArgumentError(usage));
+            };
+            if name.starts_with("--") {
+                return Err(ArgumentError(usage));
+            }
+            if helper.is_some() {
+                return Err(ArgumentError(format!(
+                    "`{operation}` was given `--aur-helper` more than once"
+                )));
+            }
+            helper = Some(name.clone());
+        } else if argument.starts_with("--") {
+            return Err(unknown_flag(operation, argument));
+        } else {
+            positional.push(argument.as_str());
+        }
+    }
+    Ok((helper, positional))
 }
 
 fn unknown_flag(operation: &str, flag: &str) -> ArgumentError {
