@@ -174,6 +174,14 @@ ShellRoot {
                 active: shellRoot.currentView === "info"
             }
 
+            SnapshotView {
+                shell: shellRoot
+                theme: rsTheme
+                width: content.width
+                height: content.height
+                active: shellRoot.currentView === "snapshot"
+            }
+
             ComingSoonView {
                 shell: shellRoot
                 theme: rsTheme
@@ -183,17 +191,6 @@ ShellRoot {
                 width: content.width
                 height: content.height
                 active: shellRoot.currentView === "switch"
-            }
-
-            ComingSoonView {
-                shell: shellRoot
-                theme: rsTheme
-                title: "Snapshot"
-                subtitle: ""
-                note: "The one-page snapshot checklist lands with the snapshot flow ticket."
-                width: content.width
-                height: content.height
-                active: shellRoot.currentView === "snapshot"
             }
         }
     }

@@ -161,6 +161,18 @@ QtObject {
         return run("info", ["info", name]);
     }
 
+    function runDetect() {
+        return run("detect", ["detect"]);
+    }
+
+    function runSnapshot(name) {
+        return run("snapshot", ["snapshot", name]);
+    }
+
+    function runWallpaperImport(path) {
+        return run("wallpaper-import", ["wallpaper-import", path]);
+    }
+
     // Never force: the panel offers no path that deletes the active
     // profile; the backend's refusal message is shown inline instead.
     function runDelete(name) {
