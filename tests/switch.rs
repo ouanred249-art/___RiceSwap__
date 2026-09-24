@@ -251,7 +251,13 @@ fn switch_runs_the_locked_sequence_in_order() {
     let sequence: Vec<String> = locked_commands(&sandbox)
         .into_iter()
         .filter(|line| {
-            !(line.ends_with("--version") || line.ends_with("-h") || line.ends_with(" version"))
+            // `pacman -Qq` is the read-only "what is already installed" query
+            // that sizes the install list; like the probes it is not part of
+            // the locked sequence.
+            !(line.ends_with("--version")
+                || line.ends_with("-h")
+                || line.ends_with(" version")
+                || line == "pacman -Qq")
         })
         .collect();
     assert_eq!(
@@ -1032,6 +1038,47 @@ fn warnings_stream_inline_as_they_arrive_and_still_close_the_envelope() {
         "kept: legacydep",
     );
     between("starting new services", run.lines.len() - 1, "`ags`");
+}
+
+/// Class: package scope. A first switch has no active profile, so the
+/// manifest-to-manifest diff reports every declared package as an install.
+/// Installing the ones the machine already has is not merely wasted: each
+/// `pkexec pacman -S` is its own polkit prompt, so a profile declaring 22
+/// present packages asks for the password 22 times and the switch ends looking
+/// like a credential failure. The machine is the other half of the question.
+#[test]
+fn a_first_switch_installs_only_the_packages_the_machine_lacks() {
+    let sandbox = Sandbox::new();
+    fixture(&sandbox);
+    // Every package both fixtures declare is already on this machine.
+    for package in ["oldbar", "shared", "newbar", "oldaur", "newaur"] {
+        sandbox.mark_installed(package);
+    }
+    // No active profile: this is the first switch, where the raw diff would
+    // call all of beta's packages an install.
+    let _ = fs::remove_file(sandbox.data_dir().join("current"));
+    sandbox.clear_log();
+
+    let data = sandbox.run(&["switch", "beta"]).assert_ok();
+
+    assert_eq!(
+        data["report"]["installed"],
+        json!([]),
+        "nothing needs installing, so nothing is reported installed: {}",
+        data["report"]
+    );
+    for line in sandbox.log() {
+        assert!(
+            !line.contains(" -S --noconfirm"),
+            "an already-installed package must not be reinstalled — that is a password prompt per package: {line}"
+        );
+        // `pkexec --version` is a tool probe, not a transaction: polkit does
+        // not authenticate it. Only a real package op must be absent.
+        assert!(
+            !(line.starts_with("pkexec ") && !line.contains("--version")),
+            "no password prompt at all when there is nothing to install: {line}"
+        );
+    }
 }
 
 /// Class: the confirmation is read-only (ticket #19). The plan behind the

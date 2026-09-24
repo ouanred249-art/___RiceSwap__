@@ -242,9 +242,12 @@ fn no_usable_aur_helper_fails_with_an_error_naming_the_packages() {
     assert_eq!(sandbox.current_target(), Some(sandbox.profile_dir("alpha")));
     assert_eq!(sandbox.state()["active_profile"], json!("alpha"));
     for line in sandbox.log() {
+        // `pacman -Qq` is the read-only "what is already installed" query the
+        // switch uses to size its install list. It transacts nothing and
+        // authenticates nothing; the refusal is still before any real op.
         assert!(
-            line.ends_with("--version"),
-            "no package op ran before the refusal: {line}"
+            line.ends_with("--version") || line == "pacman -Qq",
+            "no package transaction ran before the refusal: {line}"
         );
     }
 }

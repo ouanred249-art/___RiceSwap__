@@ -839,6 +839,15 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
                 Vec::new(),
             )
         };
+    // The diff above is manifest-to-manifest, so with no active profile it
+    // reports every declared package as an install — including the ones the
+    // machine already has. Installing those anyway is not merely wasteful: each
+    // `pkexec pacman -S` is its own polkit prompt, so a profile declaring 22
+    // present packages asks for the password 22 times and the switch dies
+    // looking like a credential failure. The machine is the other half of the
+    // question, and `plan` already asks it — the switch asks it too.
+    let install_official = missing_from_machine(&install_official);
+    let install_aur = missing_from_machine(&install_aur);
 
     let (services_stop, services_start) = if let Some(ref current) = active_manifest {
         compute_service_changes(&current.services, &target_manifest.services)
