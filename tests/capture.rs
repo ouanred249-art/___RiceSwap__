@@ -267,6 +267,68 @@ fn detect_proposes_shell_and_prompt_config_dirs() {
     );
 }
 
+/// Class: pre-flight detection. Quickshell keeps every shell in one directory,
+/// each its own config named by `-c`. Proposing `.config/quickshell` captures
+/// all of them at once, so the profile for one shell swallows every other and
+/// two shells can never both be profiles — whichever is captured second owns
+/// the path the first one needs. The children are proposed instead, so
+/// `ii` and `caelestia` can each be a profile.
+#[test]
+fn detect_splits_a_quickshell_container_into_its_individual_shells() {
+    let sandbox = Sandbox::new();
+    sandbox.write_home(".config/hypr/hyprland.conf", "exec-once = kitty\n");
+    sandbox.write_home(".config/quickshell/ii/shell.qml", "import Quickshell\n");
+    sandbox.write_home(".config/quickshell/ii/scripts/cliphist.qml", "// helper\n");
+    sandbox.write_home(
+        ".config/quickshell/caelestia/shell.qml",
+        "import Quickshell\n",
+    );
+    // The RiceSwap panel lives in the same container, so it must be separable
+    // too — otherwise capturing `ii` would also capture the tool doing it.
+    sandbox.write_home(
+        ".config/quickshell/riceswap/shell.qml",
+        "import Quickshell\n",
+    );
+
+    let data = sandbox.run(&["detect"]).assert_ok();
+    let dirs = data["config_dirs"].as_array().expect("config_dirs array");
+
+    for expected in [
+        ".config/quickshell/ii",
+        ".config/quickshell/caelestia",
+        ".config/quickshell/riceswap",
+    ] {
+        assert!(
+            dirs.iter().any(|dir| dir == expected),
+            "each shell must be proposed on its own: {expected} in {dirs:?}"
+        );
+    }
+    assert!(
+        !dirs.iter().any(|dir| dir == ".config/quickshell"),
+        "the container must never be proposed — it would swallow every shell: {dirs:?}"
+    );
+}
+
+/// Class: pre-flight detection. A container is only split when its children
+/// really are independent configs. A flat directory of one rice's own files is
+/// still proposed as itself, or every existing rice would lose its config.
+#[test]
+fn a_plain_config_dir_is_still_proposed_whole() {
+    let sandbox = Sandbox::new();
+    sandbox.write_home(".config/hypr/hyprland.conf", "exec-once = kitty\n");
+    // A subdirectory that is not a config — no QML at its top level — must not
+    // turn its parent into a split container.
+    sandbox.write_home(".config/kitty/close_on_child_death.conf", "# kitty\n");
+
+    let data = sandbox.run(&["detect"]).assert_ok();
+    let dirs = data["config_dirs"].as_array().expect("config_dirs array");
+
+    assert!(
+        dirs.iter().any(|dir| dir == ".config/kitty"),
+        "a flat config dir must be proposed whole: {dirs:?}"
+    );
+}
+
 /// Class: detection dedup. A file-allowlist entry that already sits inside an
 /// allowlisted *directory* must not be proposed a second time. A manifest
 /// holding both `.config/fish` and `.config/fish/config.fish` can never be
@@ -527,6 +589,81 @@ fn the_hardware_source_line_lands_exactly_once_across_resnapshots() {
         from_live.matches(source_line).count(),
         1,
         "an already-sourced live config is captured as-is:\n{from_live}"
+    );
+}
+
+/// Class: capture scope. `detect` proposes everything the desktop is made of,
+/// but the snapshot view lets the user uncheck chips, so `--only` must narrow
+/// the capture to the confirmed paths. Without it the confirmation is theatre
+/// and a profile captures config the user explicitly said not to keep.
+#[test]
+fn only_narrows_the_capture_to_the_confirmed_paths() {
+    let sandbox = Sandbox::new();
+    sandbox.write_home(".config/hypr/hyprland.conf", "exec-once = kitty\n");
+    sandbox.write_home(".config/kitty/kitty.conf", "font_size 12\n");
+    sandbox.write_home(".config/waybar/config.jsonc", "{}\n");
+    sandbox.write_home(".config/fuzzel/fuzzel.ini", "[main]\n");
+
+    let data = sandbox
+        .run(&[
+            "snapshot",
+            "narrow",
+            "--only",
+            ".config/hypr,.config/waybar",
+        ])
+        .assert_ok();
+
+    for kept in [".config/hypr", ".config/waybar"] {
+        assert!(
+            data["checked_paths"]
+                .as_array()
+                .is_some_and(|paths| paths.iter().any(|path| path == kept)),
+            "a confirmed path must be captured: {kept} in {}",
+            data["checked_paths"]
+        );
+        assert!(
+            sandbox.profile_dir("narrow").join(kept).exists(),
+            "{kept} must exist in the profile store"
+        );
+    }
+    for dropped in [".config/kitty", ".config/fuzzel"] {
+        assert!(
+            !data["checked_paths"]
+                .as_array()
+                .is_some_and(|paths| paths.iter().any(|path| path == dropped)),
+            "an unchecked path must not be captured: {dropped} in {}",
+            data["checked_paths"]
+        );
+        assert!(
+            !sandbox.profile_dir("narrow").join(dropped).exists(),
+            "{dropped} must not exist in the profile store"
+        );
+    }
+}
+
+/// Class: capture scope. `--only` takes the paths `detect` actually proposed.
+/// A path that does not exist narrows to nothing and fails loudly, rather
+/// than silently capturing a different set than the one that was confirmed.
+#[test]
+fn only_with_an_unknown_path_captures_nothing_and_says_so() {
+    let sandbox = Sandbox::new();
+    sandbox.write_home(".config/hypr/hyprland.conf", "exec-once = kitty\n");
+    sandbox.write_home(".config/kitty/kitty.conf", "font_size 12\n");
+
+    let data = sandbox
+        .run(&["snapshot", "empty", "--only", ".config/nonexistent"])
+        .assert_ok();
+
+    assert!(
+        data["checked_paths"]
+            .as_array()
+            .is_some_and(|paths| paths.is_empty()),
+        "nothing was confirmed, so nothing is captured: {}",
+        data["checked_paths"]
+    );
+    assert!(
+        !sandbox.profile_dir("empty").join(".config/kitty").exists(),
+        "an unconfirmed config must not be captured"
     );
 }
 

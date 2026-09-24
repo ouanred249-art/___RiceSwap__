@@ -7,7 +7,7 @@ use std::fmt;
 
 /// The full operation surface, for error messages.
 pub const USAGE: &str = "expected one of: \
-     detect, snapshot <name> [--force], plan <target>, switch <target> [--aur-helper <helper>], \
+     detect, snapshot <name> [--force] [--only <paths>], plan <target>, switch <target> [--aur-helper <helper>], \
      list, info <name>, delete <name> [--force], diff <a> <b>, wallpaper-import <path>, init";
 
 /// One parsed operation invocation.
@@ -17,6 +17,9 @@ pub enum Invocation {
     Snapshot {
         name: String,
         force: bool,
+        /// The home-relative paths to capture, when the user confirmed a
+        /// subset of what `detect` proposed. `None` captures all of it.
+        only: Option<Vec<String>>,
     },
     Plan {
         target: String,
@@ -97,9 +100,10 @@ pub fn parse(args: &[String]) -> Result<Invocation, ArgumentError> {
         "list" => no_args(operation, rest, Invocation::List),
         "init" => no_args(operation, rest, Invocation::Init),
         "snapshot" => {
-            let (force, positional) = split_force(operation, rest)?;
+            let (only, rest) = split_only(operation, rest)?;
+            let (force, positional) = split_force(operation, &rest)?;
             let name = exactly_one(operation, "<name>", positional)?;
-            Ok(Invocation::Snapshot { name, force })
+            Ok(Invocation::Snapshot { name, force, only })
         }
         "plan" => Ok(Invocation::Plan {
             target: one_positional(operation, "<target>", rest)?,
@@ -230,6 +234,46 @@ fn split_force<'a>(
         }
     }
     Ok((force, positional))
+}
+
+/// Pulls `--only <path,path,...>` out of `snapshot`'s argument list wherever
+/// it appears, rejecting every other flag. The comma-separated values are the
+/// home-relative paths the user confirmed on screen — the same strings
+/// `detect` reported as `config_dirs` and `assets`. Without the flag the
+/// capture takes everything detected, which is what a scripted snapshot means.
+fn split_only(
+    operation: &str,
+    rest: &[String],
+) -> Result<(Option<Vec<String>>, Vec<String>), ArgumentError> {
+    let mut only = None;
+    let mut kept = Vec::new();
+    let mut arguments = rest.iter();
+    while let Some(argument) = arguments.next() {
+        if argument == "--only" {
+            let Some(value) = arguments.next() else {
+                return Err(ArgumentError(format!(
+                    "`--only` on `{operation}` needs a comma-separated list of paths"
+                )));
+            };
+            let paths: Vec<String> = value
+                .split(',')
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if paths.is_empty() {
+                return Err(ArgumentError(format!(
+                    "`--only` on `{operation}` needs at least one path"
+                )));
+            }
+            only = Some(paths);
+        } else if argument.starts_with("--") && argument != "--force" {
+            return Err(unknown_flag(operation, argument));
+        } else {
+            kept.push(argument.clone());
+        }
+    }
+    Ok((only, kept))
 }
 
 /// Pulls `--aur-helper <name>` out of `switch`'s argument list wherever it

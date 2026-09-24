@@ -27,6 +27,7 @@ use crate::profile::{
 use crate::state::StateStore;
 use crate::tools::{self, Tool};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
@@ -204,7 +205,9 @@ pub fn run(invocation: Invocation) {
 fn dispatch(invocation: &Invocation, context: &mut Context) -> Envelope {
     match invocation {
         Invocation::Detect => detect(context),
-        Invocation::Snapshot { name, force } => snapshot(context, name, *force),
+        Invocation::Snapshot { name, force, only } => {
+            snapshot(context, name, *force, only.as_deref())
+        }
         Invocation::Plan { target } => plan(context, target),
         Invocation::Switch { target, aur_helper } => switch(context, target, aur_helper.as_deref()),
         Invocation::List => list(context),
@@ -362,7 +365,7 @@ fn plan(context: &mut Context, target: &str) -> Envelope {
 /// is never overwritten in place, force included: snapshotting over an active
 /// profile forks the live desktop into the new profile instead, symlinks
 /// dereferenced, and the `current` symlink untouched.
-fn snapshot(context: &mut Context, name: &str, force: bool) -> Envelope {
+fn snapshot(context: &mut Context, name: &str, force: bool, only: Option<&[String]>) -> Envelope {
     let mut emitter = Emitter::new("snapshot");
     context.progress(&mut emitter, &format!("checking the name `{name}`"));
     if let Err(error) = context.store.validate_name(name) {
@@ -406,6 +409,29 @@ fn snapshot(context: &mut Context, name: &str, force: bool) -> Envelope {
     selected.extend(detection::scan_assets(&context.home));
     selected.sort();
     selected.dedup();
+    // A confirmed selection narrows the capture to exactly what the user kept
+    // checked on screen. Without it every detected path is captured, which is
+    // what a scripted snapshot means. Narrowing here, after the scan, means
+    // `detect` on screen and `snapshot` on disk cannot disagree about what was
+    // available — only about which parts of it were kept.
+    if let Some(only) = only {
+        let kept: BTreeSet<&str> = only.iter().map(String::as_str).collect();
+        let dropped: Vec<String> = selected
+            .iter()
+            .filter(|path| !kept.contains(path.as_str()))
+            .cloned()
+            .collect();
+        if !dropped.is_empty() {
+            context.progress(
+                &mut emitter,
+                &format!(
+                    "narrowing the capture to the {} confirmed paths",
+                    only.len()
+                ),
+            );
+        }
+        selected.retain(|path| kept.contains(path.as_str()));
+    }
 
     context.progress(&mut emitter, "copying the selected files into the profile");
     let mut warnings: Vec<String> = Vec::new();

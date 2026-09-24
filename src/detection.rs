@@ -264,7 +264,9 @@ pub fn scan_config(home: &Path) -> ConfigScan {
                 continue;
             }
             if entry.path().is_dir() {
-                dirs.insert(format!(".config/{name}"));
+                for candidate in shell_candidates(&entry.path(), &name) {
+                    insert_candidate(&mut dirs, candidate);
+                }
             }
         }
     }
@@ -403,7 +405,20 @@ fn follow_hyprland_refs(
             }
             for reference in path_references(line) {
                 if let Some(candidate) = candidate_for(home, &reference) {
-                    insert_candidate(dirs, candidate);
+                    // A reference into a container of independent configs
+                    // proposes the same per-config paths the allowlist would,
+                    // so a Hyprland line cannot reintroduce the parent that
+                    // `shell_candidates` just split up.
+                    let name = candidate
+                        .strip_prefix(".config/")
+                        .and_then(|rest| rest.split('/').next());
+                    if name == Some("quickshell") && candidate == ".config/quickshell" {
+                        for each in shell_candidates(&home.join(&candidate), name.unwrap_or("")) {
+                            insert_candidate(dirs, each);
+                        }
+                    } else {
+                        insert_candidate(dirs, candidate);
+                    }
                 }
                 if depth < MAX_FOLLOW_DEPTH
                     && (is_sourcey(line) || has_config_extension(&reference))
@@ -416,6 +431,49 @@ fn follow_hyprland_refs(
             }
         }
     }
+}
+
+/// What a config directory proposes, when that directory is a container of
+/// independently-switchable things rather than one rice's own files.
+///
+/// `~/.config/quickshell` is the case that matters: Quickshell keeps every
+/// shell in one directory, each its own config named by `-c`. Capturing the
+/// parent takes all of them at once, so the profile for one shell swallows
+/// every other — and two shells can never both be profiles, because whichever
+/// is captured second owns the path the first one needs. The same is true of
+/// any directory whose immediate children are each a complete config.
+///
+/// A child that holds QML at its top level is one, so the children are
+/// proposed instead of the parent. Anything else — a flat directory of this
+/// rice's own files — is proposed as itself, exactly as before.
+fn shell_candidates(dir: &Path, name: &str) -> Vec<String> {
+    let name = name.to_owned();
+    let mut children = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let Some(child) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let has_qml = std::fs::read_dir(entry.path()).is_ok_and(|files| {
+                files.flatten().any(|file| {
+                    file.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.ends_with(".qml"))
+                })
+            });
+            if has_qml {
+                children.push(format!(".config/{name}/{child}"));
+            }
+        }
+    }
+    if children.is_empty() {
+        return vec![format!(".config/{name}")];
+    }
+    children.sort();
+    children
 }
 
 /// Adds a proposed directory unless an entry already covers it — a reference
