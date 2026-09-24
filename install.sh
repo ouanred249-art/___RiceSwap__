@@ -129,6 +129,9 @@ BIN_PATH="$REPO_DIR/target/release/$BIN_NAME"
 echo "==> 2/6 installing binary → $PREFIX/bin/$BIN_NAME"
 $SUDO install -Dm755 "$BIN_PATH" "$PREFIX/bin/$BIN_NAME"
 
+echo "    installing floating-terminal wrapper → $PREFIX/bin/riceswap-float"
+$SUDO install -Dm755 "$REPO_DIR/scripts/riceswap-float" "$PREFIX/bin/riceswap-float"
+
 echo "==> 3/6 installing Quickshell GUI → $DEST_GUI_DIR (qs -c riceswap)"
 if [[ -e "$DEST_GUI_DIR" && ! -L "$DEST_GUI_DIR" ]]; then
     echo "    note: $DEST_GUI_DIR already exists — leaving it in place (update manually if needed)"
@@ -201,5 +204,5 @@ else
     echo
 fi
 echo "Then:  $PREFIX/bin/$BIN_NAME init     (bootstrap)  and   qs -c riceswap"
-echo "Toggle the panel with Super+R, or:  qs ipc call riceswap toggle"
+echo "Toggle the panel with Super+R, or:  qs ipc -c riceswap call riceswap toggle"
 echo "============================================================"

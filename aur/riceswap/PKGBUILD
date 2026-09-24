@@ -1,7 +1,7 @@
 # Maintainer: the RiceSwap project
 #
-# Source build of RiceSwap: compiles the pinned release tarball with cargo and
-# installs the same four artifacts as riceswap-bin — same locked locations,
+# Source build of RiceSwap: compiles the pinned release tag with cargo and
+# installs the same five artifacts as riceswap-bin — same locked locations,
 # same keybind snippet as a data file. Never writes to $HOME or
 # hyprland.conf.
 
@@ -23,20 +23,29 @@ optdepends=(
     "paru: AUR helper (fallback when yay is absent)"
     "polkit: polkit agent for the system password dialog on package ops"
 )
-# The same CI tarball as riceswap-bin — it carries the source tree's four
-# layout dirs, so the source build just adds a cargo build on top.
-source=("https://github.com/ouanred249-art/___RiceSwap__/releases/download/${_pkgtag}/riceswap-${pkgver}-x86_64-linux-gnu.tar.gz")
+# The full source archive for the tag. Not the CI release tarball: that one
+# carries only built artifacts — no Rust sources for cargo to compile.
+source=("https://github.com/ouanred249-art/___RiceSwap__/archive/refs/tags/${_pkgtag}.tar.gz")
+sha256sums=('SKIP')
 
 prepare() {
-    local root="riceswap-${pkgver}"
-    mv "$root" riceswap
+    # GitHub's tag archive extracts to <repo>-<version>; flatten to
+    # `riceswap/` so build()/package() paths stay stable across releases.
+    mv "___RiceSwap__-${pkgver}" riceswap
 }
 
 build() {
     cd riceswap
-    # The tarball carries the prebuilt binary; the source build replaces it
-    # with one compiled from the tree that ships in the same tarball.
     cargo build --release
+}
+
+# GNU `install` has no -r flag (that's BSD's): copy the whole tree, then
+# normalize file modes to data-file permissions. Same layout install.sh uses.
+_install_tree() {
+    local src="$1" dest="$2"
+    install -d -m755 "$dest"
+    cp -a -- "$src/." "$dest/"
+    find "$dest" -type f -exec chmod 644 {} +
 }
 
 package() {
@@ -45,14 +54,16 @@ package() {
     # Backend binary (freshly compiled) → /usr/bin
     install -Dm755 "target/release/riceswap" "${pkgdir}/usr/bin/riceswap"
 
+    # Floating-terminal wrapper (AUR-helper transactions) → /usr/bin
+    install -Dm755 "scripts/riceswap-float" "${pkgdir}/usr/bin/riceswap-float"
+
     # GUI config → /etc/xdg/quickshell/riceswap/
-    install -Dm644 -r "etc/xdg/quickshell/riceswap" "${pkgdir}/etc/xdg/quickshell/riceswap"
+    _install_tree gui "${pkgdir}/etc/xdg/quickshell/riceswap"
 
     # Bundled wallpapers → /usr/share/riceswap/wallpapers/
-    install -Dm644 -r "usr/share/riceswap/wallpapers" \
-        "${pkgdir}/usr/share/riceswap/wallpapers"
+    _install_tree assets/wallpapers "${pkgdir}/usr/share/riceswap/wallpapers"
 
     # Keybind snippet as a data file → /usr/share/riceswap/
-    install -Dm644 "usr/share/riceswap/riceswap-keybinds.conf" \
+    install -Dm644 "share/riceswap-keybinds.conf" \
         "${pkgdir}/usr/share/riceswap/riceswap-keybinds.conf"
 }

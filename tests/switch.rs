@@ -230,7 +230,9 @@ fn switch_runs_the_locked_sequence_in_order() {
 
     let sequence: Vec<String> = locked_commands(&sandbox)
         .into_iter()
-        .filter(|line| !line.contains("--version"))
+        .filter(|line| {
+            !(line.ends_with("--version") || line.ends_with("-h") || line.ends_with(" version"))
+        })
         .collect();
     assert_eq!(
         sequence,

@@ -114,7 +114,7 @@ exec-once = qs -c riceswap
 bind = $mainMod, R, global, quickshell:riceswap-toggle
 ```
 
-Prefer no keybind? `qs ipc call riceswap toggle` does the same thing.
+Prefer no keybind? `qs ipc -c riceswap call riceswap toggle` does the same thing.
 
 ---
 

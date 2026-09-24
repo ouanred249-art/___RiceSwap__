@@ -45,7 +45,7 @@ bind = $mainMod, R, global, quickshell:riceswap-toggle
 Fallback / scripting path (no bind needed):
 
 ```sh
-qs ipc call riceswap toggle
+qs ipc -c riceswap call riceswap toggle
 ```
 
 Escape closes a pushed view, or the panel itself at the root view.

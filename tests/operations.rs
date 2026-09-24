@@ -37,8 +37,13 @@ fn detect_probes_every_tool_and_reports_the_candidate_environment() {
         );
     }
     for tool in STUB_TOOLS {
+        let probe = match *tool {
+            "grim" => "-h",
+            "hyprctl" => "version",
+            _ => "--version",
+        };
         assert!(
-            sandbox.log_contains(&format!("{tool} --version")),
+            sandbox.log_contains(&format!("{tool} {probe}")),
             "stub log is missing {tool}: {:?}",
             sandbox.log()
         );
@@ -68,7 +73,7 @@ fn plan_reports_the_switch_preflight_shape() {
         );
     }
     assert!(
-        !sandbox.log_contains("hyprctl --version"),
+        !sandbox.log_contains("hyprctl"),
         "plan must not touch Hyprland"
     );
 }
@@ -98,12 +103,13 @@ fn snapshot_takes_a_profile_name_and_probes_the_package_managers() {
         sandbox.profile_dir("demo").join("screenshot.png").is_file(),
         "grim captured the profile screenshot"
     );
-    for tool in ["pacman", "yay", "paru", "grim"] {
+    for tool in ["pacman", "yay", "paru"] {
         assert!(
             sandbox.log_contains(&format!("{tool} --version")),
             "{tool} was not probed"
         );
     }
+    assert!(sandbox.log_contains("grim -h"), "grim was not probed");
 }
 
 /// Class: the switch sequence.

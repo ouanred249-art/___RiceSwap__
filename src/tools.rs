@@ -48,6 +48,22 @@ impl Tool {
             Tool::FloatTerminal => "riceswap-float",
         }
     }
+
+    /// The arguments that make this tool answer a version probe cleanly.
+    /// Not every tool spells it the same way: `grim`'s getopt rejects
+    /// `--version` outright (its `-h` usage banner is the clean answer),
+    /// and `hyprctl` has no version flag at all but answers the `version`
+    /// subcommand with exit 0. Probing every tool with `--version` made a
+    /// perfectly usable machine look broken — which is exactly what the
+    /// pre-flight warning is supposed to detect, so the probe must match
+    /// each tool's real interface.
+    pub const fn version_args(self) -> &'static [&'static str] {
+        match self {
+            Tool::Grim => &["-h"],
+            Tool::Hyprctl => &["version"],
+            _ => &["--version"],
+        }
+    }
 }
 
 /// What the version probe learned about one tool.
@@ -82,7 +98,7 @@ pub fn probe_all(tools: &[Tool]) -> ToolReport {
 }
 
 fn probe(tool: Tool) -> ToolStatus {
-    match Command::new(tool.name()).arg("--version").output() {
+    match Command::new(tool.name()).args(tool.version_args()).output() {
         Err(error) => ToolStatus {
             available: false,
             exit_code: None,

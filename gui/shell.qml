@@ -14,7 +14,7 @@ import "views"
 // Keybind:
 //     bind = $mainMod, R, global, quickshell:riceswap-toggle
 // IPC fallback:
-//     qs ipc call riceswap toggle
+//     qs ipc -c riceswap call riceswap toggle
 ShellRoot {
     id: shellRoot
 
@@ -84,13 +84,17 @@ ShellRoot {
         onPressed: shellRoot.toggle()
     }
 
-    // Scripting / fallback path: qs ipc call riceswap toggle.
-    // `target` is read-only and derived from the config directory name
-    // (`~/.config/quickshell/riceswap` → "riceswap"), so we only declare
-    // the functions it serves.
+    // Scripting / fallback path: qs ipc -c riceswap call riceswap toggle.
     IpcHandler {
+        target: "riceswap"
+
         function toggle(): void {
             shellRoot.toggle();
+        }
+
+        // State query for debugging and scripts: is the panel open?
+        function isOpen(): bool {
+            return shellRoot.open;
         }
     }
 

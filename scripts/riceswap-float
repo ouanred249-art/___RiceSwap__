@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# riceswap-float — the floating-terminal wrapper `riceswap switch` runs every
+# AUR helper transaction inside, so `yay`/`paru` can show a sudo password
+# prompt the user can actually see and answer.
+#
+# Contract (pinned by tests/privilege.rs):
+#   riceswap-float --version   prints a version and exits 0 (the probe).
+#   riceswap-float <cmd...>    runs <cmd...> in a GUI terminal, streams the
+#                              command's combined output to *this* process's
+#                              stdout (so it lands in the switch report), and
+#                              exits with the command's status.
+# With no usable terminal on PATH the command runs attached instead — the
+# output still flows; only the visible password prompt is lost.
+set -uo pipefail
+
+if [[ "${1:-}" == "--version" ]]; then
+    echo "riceswap-float 1.0"
+    exit 0
+fi
+
+if [[ $# -lt 1 ]]; then
+    echo "riceswap-float: usage: riceswap-float <command> [args...]" >&2
+    exit 2
+fi
+
+terminal=""
+for candidate in kitty foot wezterm alacritty xterm; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+        terminal="$candidate"
+        break
+    fi
+done
+
+if [[ -z "$terminal" ]]; then
+    exec "$@"
+fi
+
+work=$(mktemp -d) || { exec "$@"; }
+trap 'rm -rf "$work"' EXIT
+log="$work/output"
+status="$work/status"
+
+runner="$work/runner"
+{
+    echo '#!/usr/bin/env bash'
+    printf '"$@" 2>&1 | tee "%s"\n' "$log"
+    printf 'echo "${PIPESTATUS[0]}" > "%s"\n' "$status"
+} > "$runner"
+chmod +x "$runner"
+
+# The terminal's argument style for "run this command" differs per emulator;
+# the command always ends up being this runner script.
+case "$terminal" in
+    kitty)
+        # The title is the handle the floating dispatch below matches on.
+        kitty --title riceswap-float --class riceswap-float bash "$runner" "$@" &
+        ;;
+    foot)
+        foot -- bash "$runner" "$@" &
+        ;;
+    wezterm)
+        wezterm start -- bash "$runner" "$@" &
+        ;;
+    alacritty)
+        alacritty --command bash "$runner" "$@" &
+        ;;
+    xterm)
+        xterm -e bash "$runner" "$@" &
+        ;;
+esac
+terminal_pid=$!
+
+# Best-effort: float the helper window so it does not hide behind the panel.
+# Non-kitty terminals, or a non-Hyprland session, simply skip this.
+if [[ "$terminal" == kitty && -n "${WAYLAND_DISPLAY:-}" ]] && command -v hyprctl >/dev/null 2>&1; then
+    (
+        sleep 0.6
+        hyprctl dispatch focuswindow class:riceswap-float >/dev/null 2>&1 \
+            && hyprctl dispatch togglefloating >/dev/null 2>&1
+    ) &
+fi
+
+# The live view is the floating terminal itself (where tee shows the helper's
+# output and the sudo prompt waits for the user). Our own stdout gets the
+# whole transcript once the window closes — that is what `riceswap switch`
+# captures into the switch report.
+wait "$terminal_pid" 2>/dev/null
+[[ -f "$log" ]] && cat "$log"
+
+if [[ -f "$status" ]]; then
+    exit "$(cat "$status")"
+fi
+# The window closed before the runner could record a status: the user killed
+# it, or the terminal died. The transaction did not complete.
+echo "riceswap-float: the terminal exited before \`$1\` finished" >&2
+exit 1

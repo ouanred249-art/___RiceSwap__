@@ -67,7 +67,8 @@ impl Mode {
 ///   `RICESWAP_STUB_OWNERS` fixture maps (by exact name or by basename, so a
 ///   PATH-resolved path answers too) and exits 1 for anything unowned;
 /// - `pacman -Qm` lists the fixture entries marked `aur`;
-/// - `grim <path>` writes the screenshot file it was pointed at;
+/// - `grim <path>` writes the screenshot file it was pointed at (its version
+///   probe is `grim -h`, which falls through to the generic answer);
 /// - `pkexec` and `riceswap-float` answer `--version` like any other tool,
 ///   then run the command they were pointed at — `pkexec pacman ...` executes
 ///   pacman, `riceswap-float <helper> ...` runs the AUR helper — so the
@@ -146,7 +147,7 @@ if [ "$mode" = "ok" ]; then
     fi
     exit 0
   fi
-  if [ "$name" = "grim" ] && [ "$1" != "--version" ]; then
+  if [ "$name" = "grim" ] && [ "$1" != "-h" ]; then
     for argument in "$@"; do destination=$argument; done
     printf 'stub screenshot' > "$destination"
     exit 0

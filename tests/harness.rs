@@ -8,6 +8,18 @@ use common::{Mode, STUB_TOOLS, Sandbox, manifest_toml};
 use serde_json::json;
 use std::fs;
 
+/// The arguments each tool's version probe uses — mirroring
+/// `Tool::version_args`, because not every tool spells its version flag the
+/// same way (`grim` rejects `--version`, `hyprctl` takes a `version`
+/// subcommand).
+fn probe_args(tool: &str) -> &'static str {
+    match tool {
+        "grim" => "-h",
+        "hyprctl" => "version",
+        _ => "--version",
+    }
+}
+
 /// Every tool name gets an executable stub, and `PATH` finds it.
 #[test]
 fn stubs_are_installed_for_every_tool_the_backend_shells_out_to() {
@@ -16,7 +28,7 @@ fn stubs_are_installed_for_every_tool_the_backend_shells_out_to() {
 
     for tool in STUB_TOOLS {
         assert!(
-            sandbox.log_contains(&format!("{tool} --version")),
+            sandbox.log_contains(&format!("{tool} {}", probe_args(tool))),
             "no stub invocation recorded for {tool}: {:?}",
             sandbox.log()
         );
@@ -38,7 +50,7 @@ fn stub_log_records_invocations_in_order_with_arguments() {
     for line in &log {
         let (tool, args) = line.split_once(' ').expect("log line is `tool args`");
         assert!(STUB_TOOLS.contains(&tool), "unexpected stub logged: {line}");
-        assert_eq!(args, "--version", "unexpected arguments in {line}");
+        assert_eq!(args, probe_args(tool), "unexpected arguments in {line}");
     }
 }
 
