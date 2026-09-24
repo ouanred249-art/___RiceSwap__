@@ -84,10 +84,11 @@ ShellRoot {
         onPressed: shellRoot.toggle()
     }
 
-    // Scripting / fallback path: qs ipc call riceswap toggle
+    // Scripting / fallback path: qs ipc call riceswap toggle.
+    // `target` is read-only and derived from the config directory name
+    // (`~/.config/quickshell/riceswap` → "riceswap"), so we only declare
+    // the functions it serves.
     IpcHandler {
-        target: "riceswap"
-
         function toggle(): void {
             shellRoot.toggle();
         }

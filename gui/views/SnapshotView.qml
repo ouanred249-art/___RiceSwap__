@@ -209,6 +209,7 @@ PanelView {
                 border.color: view.nameError !== "" ? view.theme.danger : view.theme.border
 
                 TextInput {
+                    id: nameInput
                     anchors.fill: parent
                     anchors.leftMargin: 12
                     anchors.rightMargin: 12
@@ -217,8 +218,18 @@ PanelView {
                     onTextChanged: view.profileName = text
                     color: view.theme.foreground
                     font.pixelSize: 14
-                    placeholderText: "my-rice"
-                    placeholderTextColor: view.theme.muted
+                }
+
+                // Placeholder for the bare TextInput (QtQuick.Controls'
+                // TextField would bring its own background styling we'd
+                // have to fight; this keeps the bordered Rectangle).
+                Text {
+                    anchors.left: nameInput.left
+                    anchors.verticalCenter: nameInput.verticalCenter
+                    visible: nameInput.text === "" && !nameInput.activeFocus
+                    text: "my-rice"
+                    color: view.theme.muted
+                    font.pixelSize: 14
                 }
             }
 

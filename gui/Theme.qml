@@ -52,7 +52,7 @@ QtObject {
         onFileChanged: paletteView.reload()
     }
 
-    Connections {
+    property Connections paletteConn: Connections {
         target: paletteView
         function onDataChanged() {
             theme.paletteRev++;

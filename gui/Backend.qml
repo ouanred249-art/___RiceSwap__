@@ -35,7 +35,7 @@ QtObject {
         onFileChanged: stateView.reload()
     }
 
-    Connections {
+    property Connections stateConn: Connections {
         target: stateView
         function onDataChanged() {
             rsBackend.stateRev++;
