@@ -8,6 +8,7 @@
   <img src="https://img.shields.io/badge/rice-swap-Hyprland-F4538A?style=for-the-badge&labelColor=2E294E">
   <img src="https://img.shields.io/badge/backend-Rust-E9D48D?style=for-the-badge&labelColor=2E294E">
   <img src="https://img.shields.io/badge/gui-Quickshell-569CD6?style=for-the-badge&labelColor=2E294E">
+  <img src="https://img.shields.io/badge/license-MIT-74A9C6?style=for-the-badge&labelColor=2E294E">
 </p>
 
 <p align="center">
@@ -113,8 +114,10 @@ Then, from the panel:
    of detected configs/packages/fonts, and watch the screenshot appear.
 2. **Switch** to any profile — review the diff (packages in/out, services
    stop/start, blocked paths), confirm, and follow the live step checklist.
-3. **Snapshot-first** — if a switch is blocked by a real file at a target, the
-   panel chains you into a snapshot so nothing gets clobbered.
+3. **Snapshot-first** — if a switch is blocked by a real (non-symlink) file
+   at one of its targets, the panel chains you into a snapshot of your current
+   desktop first (adopting that file into a profile) so the switch never
+   clobbers it.
 4. **Cancel or recover** — cancel stops at the next safe step boundary; a
    failed switch ends on a recovery screen with one-click restore.
 
@@ -150,9 +153,6 @@ helper (`yay`/`paru`) in a small floating terminal so its prompt always works.
 
 ## 🔧 The operations
 
-Everything the panel does is a scriptable backend operation — the same ten the
-GUI drives:
-
 | Operation | Does |
 |---|---|
 | `init` | Idempotent first-run bootstrap: shared layers, hardware extraction, bundled wallpapers |
@@ -166,8 +166,8 @@ GUI drives:
 | `diff <a> <b>` | Package/config delta between two profiles |
 | `wallpaper-import <path>` | Moves an image into the shared wallpapers layer |
 
-They're not a user-facing CLI in v1 — they're the seam the GUI drives, which
-is also the seam every test runs through.
+In v1 these are not a user-facing CLI — they're the seam the GUI drives and
+every test runs through.
 
 ---
 
@@ -192,6 +192,6 @@ binary available for the panel to spawn. GUI details live in [gui/README.md](gui
 
 <p align="center">
   <sub>
-    Arch-first · x86_64 · Rust backend + Quickshell GUI
+    Arch-first · x86_64 · Rust backend + Quickshell GUI · MIT
   </sub>
 </p>
