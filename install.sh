@@ -16,7 +16,8 @@ BIN_NAME="riceswap"
 PREFIX="/usr/local"
 GIT_URL="https://github.com/ouanred249-art/___RiceSwap__"
 HYPR_CONF=""
-DEST_GUI_DIR="$PREFIX/quickshell/riceswap"
+DEST_GUI_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/quickshell/riceswap"
+DEST_XDG_GUI="/etc/xdg/quickshell/riceswap"
 DEST_WALL_DIR="$PREFIX/share/riceswap/wallpapers"
 DEST_KEYBINDS="$PREFIX/share/riceswap/riceswap-keybinds.conf"
 
@@ -32,9 +33,9 @@ What it does:
   0. finds a local checkout, or clones main from GitHub
   1. cargo build --release          (backend binary)
   2. installs the binary           → /usr/local/bin/riceswap
-  3. installs the Quickshell GUI   → /usr/local/quickshell/riceswap
-                                     (+ symlinks into ~/.config/quickshell
-                                      and /etc/xdg/quickshell if you have them)
+  3. installs the Quickshell GUI   → ~/.config/quickshell/riceswap/
+                                     (where `qs -c riceswap` looks) and, when
+                                      running with sudo, also to /etc/xdg/quickshell
   4. installs bundled wallpapers   → /usr/local/share/riceswap/wallpapers
   5. installs the keybind snippet  → /usr/share/riceswap/riceswap-keybinds.conf
   6. adds the two keybind lines to your Hyprland config (--hyprland,
@@ -128,21 +129,18 @@ BIN_PATH="$REPO_DIR/target/release/$BIN_NAME"
 echo "==> 2/6 installing binary → $PREFIX/bin/$BIN_NAME"
 $SUDO install -Dm755 "$BIN_PATH" "$PREFIX/bin/$BIN_NAME"
 
-echo "==> 3/6 installing Quickshell GUI → $DEST_GUI_DIR"
-if [[ -n "$SUDO" ]]; then
-    $SUDO bash -c "mkdir -p '$DEST_GUI_DIR'; cp -a '$REPO_DIR'/gui/. '$DEST_GUI_DIR'/; find '$DEST_GUI_DIR' -type f -exec chmod 644 {} +"
+echo "==> 3/6 installing Quickshell GUI → $DEST_GUI_DIR (qs -c riceswap)"
+if [[ -e "$DEST_GUI_DIR" && ! -L "$DEST_GUI_DIR" ]]; then
+    echo "    note: $DEST_GUI_DIR already exists — leaving it in place (update manually if needed)"
 else
+    rm -rf "$DEST_GUI_DIR" 2>/dev/null || true
     install_tree "$REPO_DIR/gui" "$DEST_GUI_DIR" 644
 fi
-# Make it discoverable by `qs` without copying: user dir, then xdg fallback.
-for candidate in "$HOME/.config/quickshell/riceswap" "/etc/xdg/quickshell/riceswap"; do
-    [[ -d "$candidate" || -L "$candidate" ]] || continue
-    if [[ -n "$SUDO" ]]; then
-        $SUDO ln -sfn "$DEST_GUI_DIR" "$candidate" 2>/dev/null || true
-    else
-        ln -sfn "$DEST_GUI_DIR" "$candidate" 2>/dev/null || true
-    fi
-done
+# System-wide fallback for multi-user setups: install to the xdg dir too, so
+# `qs -c riceswap` resolves for users without a personal copy.
+if [[ -n "$SUDO" ]]; then
+    $SUDO bash -c "mkdir -p '$DEST_XDG_GUI'; cp -a '$REPO_DIR'/gui/. '$DEST_XDG_GUI'/; find '$DEST_XDG_GUI' -type f -exec chmod 644 {} +" 2>/dev/null || true
+fi
 
 echo "==> 4/6 installing bundled wallpapers → $DEST_WALL_DIR"
 if [[ -n "$SUDO" ]]; then
