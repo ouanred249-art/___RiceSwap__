@@ -67,6 +67,8 @@ impl Mode {
 ///   `RICESWAP_STUB_OWNERS` fixture maps (by exact name or by basename, so a
 ///   PATH-resolved path answers too) and exits 1 for anything unowned;
 /// - `pacman -Qm` lists the fixture entries marked `aur`;
+/// - `pacman -Qq` lists the packages the fixture's install state says are
+///   present, which is what `plan`'s `install_missing` is computed against;
 /// - `grim <path>` writes the screenshot file it was pointed at (its version
 ///   probe is `grim -h`, which falls through to the generic answer);
 /// - `pkexec` and `riceswap-float` answer `--version` like any other tool,
@@ -138,6 +140,12 @@ if [ "$mode" = "ok" ]; then
     fi
     printf "error: no possible owner found for '%s'\n" "$query" >&2
     exit 1
+  fi
+  if [ "$name" = "pacman" ] && [ "$1" = "-Qq" ]; then
+    if [ -n "$RICESWAP_STUB_PACKAGES" ] && [ -f "$RICESWAP_STUB_PACKAGES" ]; then
+      cat "$RICESWAP_STUB_PACKAGES"
+    fi
+    exit 0
   fi
   if [ "$name" = "pacman" ] && [ "$1" = "-Qm" ]; then
     if [ -r "$RICESWAP_STUB_OWNERS" ]; then

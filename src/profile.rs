@@ -92,6 +92,12 @@ impl Store {
         self.profiles_dir().join(name)
     }
 
+    /// `~/.local/share/riceswap/profiles/<name>/backups`, where a switch keeps
+    /// the real files it was about to replace.
+    pub fn backups_dir(&self, name: &str) -> PathBuf {
+        self.profile_dir(name).join("backups")
+    }
+
     /// `~/.local/share/riceswap/current`, the activation primitive: flipping the
     /// active profile means pointing this symlink at another profile directory.
     pub fn current_link(&self) -> PathBuf {

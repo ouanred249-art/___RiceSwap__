@@ -167,6 +167,170 @@ fn detect_resolves_binary_references_into_an_official_aur_split() {
     );
 }
 
+/// Class: pre-flight detection, lua-configured desktop. A machine whose
+/// Hyprland entrypoint is `hyprland.lua` — and has no `hyprland.conf` at all —
+/// is still scanned: the config-referenced dirs and the `hl.exec_cmd`
+/// startup services it declares both come back.
+#[test]
+fn detect_scans_a_lua_hyprland_entrypoint_with_no_conf() {
+    let sandbox = Sandbox::new();
+    sandbox.write_home(
+        ".config/hypr/hyprland.lua",
+        "-- entrypoint\nrequire(\"hyprland.execs\")\nrequire(\"hyprland.env\")\n",
+    );
+    sandbox.write_home(
+        ".config/hypr/hyprland/execs.lua",
+        "hl.on(\"hyprland.start\", function ()\n    \
+         hl.exec_cmd(\"hypridle\")\n    \
+         hl.exec_cmd(\"easyeffects --hide-window --service-mode\")\n    \
+         hl.exec_cmd(\"$HOME/.config/hypr/hyprland/scripts/agent.sh\")\n\
+         end)\n",
+    );
+    sandbox.write_home(
+        ".config/hypr/hyprland/env.lua",
+        "hl.env(\"SOMETHING\", \"$HOME/.config/ricekit/theme.lua\")\n",
+    );
+    sandbox.write_home(".config/ricekit/theme.lua", "-- theme\n");
+    sandbox.write_home(".config/hypr/hyprland/scripts/agent.sh", "#!/bin/sh\n");
+
+    let data = sandbox.run(&["detect"]).assert_ok();
+
+    let manifest = sandbox.run(&["snapshot", "luarice"]).assert_ok();
+    let services = sandbox.run(&["info", "luarice"]).assert_ok()["manifest"]["services"].clone();
+    assert!(
+        services
+            .as_array()
+            .is_some_and(|list| { list.iter().any(|service| service["name"] == "hypridle") }),
+        "an `hl.exec_cmd` startup line is a service: {services}"
+    );
+    assert!(
+        services
+            .as_array()
+            .is_some_and(|list| { list.iter().any(|service| service["name"] == "easyeffects") }),
+        "a lua command with flags is still a service: {services}"
+    );
+    assert!(
+        !services
+            .as_array()
+            .is_some_and(|list| list.iter().any(|service| service["name"] == "agent.sh")),
+        "a path-valued command is a script, not a service: {services}"
+    );
+    assert!(
+        data["config_dirs"]
+            .as_array()
+            .is_some_and(|dirs| dirs.iter().any(|dir| dir == ".config/ricekit")),
+        "a dir only the lua config references is proposed: {}",
+        data["config_dirs"]
+    );
+    let _ = manifest;
+}
+
+/// Class: pre-flight detection, shell config. A rice's terminal shell lives in
+/// `~/.config` like any other config dir, so the allowlist proposes it instead
+/// of leaving the shell out of the profile.
+#[test]
+fn detect_proposes_shell_and_prompt_config_dirs() {
+    let sandbox = Sandbox::new();
+    sandbox.write_home(".config/hypr/hyprland.conf", "exec-once = kitty\n");
+    sandbox.write_home(".config/fish/config.fish", "# fish\n");
+    sandbox.write_home(".config/zsh/.zshrc", "# zsh\n");
+    sandbox.write_home(".config/starship.toml", "add_newline = true\n");
+    sandbox.write_home(".config/bash/bashrc", "# bash\n");
+    sandbox.write_home(".zshrc", "export EDITOR=nvim\n");
+    sandbox.write_home(".config/some-unrelated-app/config.toml", "x = 1\n");
+
+    let data = sandbox.run(&["detect"]).assert_ok();
+
+    for expected in [
+        ".config/fish",
+        ".config/zsh",
+        // starship keeps its config in a single file, not a directory — a
+        // dir-only allowlist could never propose it.
+        ".config/starship.toml",
+        ".config/bash",
+        ".zshrc",
+    ] {
+        assert!(
+            data["config_dirs"]
+                .as_array()
+                .is_some_and(|dirs| dirs.iter().any(|dir| dir == expected)),
+            "a shell config dir must be proposed: {expected} in {}",
+            data["config_dirs"]
+        );
+    }
+    assert!(
+        !data["config_dirs"]
+            .as_array()
+            .is_some_and(|dirs| dirs.iter().any(|dir| dir == ".config/some-unrelated-app")),
+        "the allowlist is still an allowlist: {}",
+        data["config_dirs"]
+    );
+}
+
+/// Class: detection dedup. A file-allowlist entry that already sits inside an
+/// allowlisted *directory* must not be proposed a second time. A manifest
+/// holding both `.config/fish` and `.config/fish/config.fish` can never be
+/// switched: `compute_symlink_changes` sorts the link set, so the child is
+/// linked first, the parent is then cleared with `remove_dir_all`, and the
+/// child's symlink is destroyed with it. On a machine that has never switched
+/// it fails earlier still — the real `config.fish` trips `check_blocked_paths`
+/// and aborts the whole switch.
+#[test]
+fn a_shell_rc_inside_its_own_config_dir_is_not_proposed_twice() {
+    let sandbox = Sandbox::new();
+    sandbox.write_home(".config/hypr/hyprland.conf", "exec-once = kitty\n");
+    // fish: an allowlisted directory that *contains* an allowlisted file.
+    sandbox.write_home(".config/fish/config.fish", "# fish\n");
+    // starship: an allowlisted file with no parent directory to dedup against.
+    sandbox.write_home(".config/starship.toml", "add_newline = true\n");
+
+    let data = sandbox.run(&["detect"]).assert_ok();
+    let dirs = data["config_dirs"]
+        .as_array()
+        .expect("config_dirs is an array");
+
+    assert!(
+        dirs.iter().any(|dir| dir == ".config/fish"),
+        "the fish directory is still proposed: {dirs:?}"
+    );
+    assert!(
+        dirs.iter().any(|dir| dir == ".config/starship.toml"),
+        "a file with no covering directory is still proposed: {dirs:?}"
+    );
+    assert!(
+        !dirs.iter().any(|dir| dir == ".config/fish/config.fish"),
+        "a child of an already-proposed directory must not be proposed too: {dirs:?}"
+    );
+}
+
+/// Class: snapshot attribution. A profile that owns a nested shell dir
+/// (`.config/quickshell/caelestia`) is a quickshell desktop exactly as much as
+/// one owning `.config/quickshell` outright — the profile card says so.
+#[test]
+fn a_nested_shell_dir_still_attributes_the_bar_and_the_terminal() {
+    let sandbox = Sandbox::new();
+    sandbox.write_home(".config/hypr/hyprland.conf", "exec-once = kitty\n");
+    sandbox.write_home(".config/quickshell/caelestia/shell.qml", "Shell { }\n");
+    sandbox.write_home(".config/kitty/kitty.conf", "font_size 12\n");
+    sandbox.own("kitty", "kitty", false);
+
+    sandbox.run(&["snapshot", "nested"]).assert_ok();
+    let manifest = sandbox.run(&["info", "nested"]).assert_ok()["manifest"].clone();
+
+    assert_eq!(
+        manifest["rice_info"]["bar"],
+        json!("quickshell"),
+        "a nested quickshell capture is still a quickshell bar: {}",
+        manifest["rice_info"]
+    );
+    assert_eq!(
+        manifest["rice_info"]["terminal"],
+        json!("kitty"),
+        "the terminal still attributes: {}",
+        manifest["rice_info"]
+    );
+}
+
 /// Class: pre-flight detection. Fonts and icons are proposed from the
 /// standard asset locations, and image files in `~/Downloads` come back as
 /// wallpaper-import candidates (non-images excluded).

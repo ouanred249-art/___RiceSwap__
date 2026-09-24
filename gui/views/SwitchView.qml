@@ -36,7 +36,10 @@ PanelView {
     property bool servicesOpen: false
     property bool configsOpen: false
 
-    readonly property var planBlocked: planData !== null && planData.blocked_paths ? planData.blocked_paths : []
+    // Real files at a target path no longer stop the switch. The ones that
+    // differ from the profile are copied under the profile's `backups/` first,
+    // so this list is a promise about what is kept, not a wall.
+    readonly property var planBackedUp: planData !== null && planData.backed_up_paths ? planData.backed_up_paths : []
 
     readonly property var planInstall: {
         const install = planData && planData.package_diff && planData.package_diff.install ? planData.package_diff.install : {};
@@ -206,12 +209,6 @@ PanelView {
         shell.backend.cancelSwitch();
     }
 
-    function snapshotFirst() {
-        // Chain into the snapshot flow; SnapshotView re-detects on open and
-        // this view re-plans when it comes back active.
-        shell.push("snapshot", null);
-    }
-
     function finishSwitch() {
         // Success: the switch view is done. Pop the whole stack; the
         // Profiles home re-lists and re-badges the now-active profile.
@@ -351,7 +348,7 @@ PanelView {
             Item {
                 width: confirmColumn.width
                 height: summaryText.implicitHeight + (summarySubText.implicitHeight > 0 ? summarySubText.implicitHeight + 4 : 0)
-                visible: view.planData !== null && view.planBlocked.length === 0
+                visible: view.planData !== null
 
                 Text {
                     id: summaryText
@@ -512,26 +509,27 @@ PanelView {
                 }
             }
 
-            // Blocked paths → Snapshot first chain.
+            // Real files at a target path: the switch keeps them, so this is a
+            // note about what is preserved rather than a reason to stop.
             Column {
                 width: confirmColumn.width
-                visible: view.planBlocked.length > 0
+                visible: view.planBackedUp.length > 0
                 spacing: 8
 
                 Text {
                     width: parent.width
                     wrapMode: Text.WordWrap
-                    text: "These target paths hold real files that would be overwritten:"
-                    color: view.theme.danger
+                    text: "These files differ from the profile. They are copied into the profile's backups/ folder before the switch replaces them — nothing is lost."
+                    color: view.theme.muted
                     font.pixelSize: 13
                     font.bold: true
                 }
 
                 Repeater {
-                    model: view.planBlocked
+                    model: view.planBackedUp
                     delegate: Text {
                         text: "•  " + modelData
-                        color: view.theme.danger
+                        color: view.theme.muted
                         font.pixelSize: 12
                         font.family: "monospace"
                     }
@@ -540,37 +538,13 @@ PanelView {
                 Text {
                     width: parent.width
                     wrapMode: Text.WordWrap
-                    text: "Snapshot your current desktop first to adopt them into a profile, then come back and switch."
+                    text: "You can put any of them back afterwards from that folder."
                     color: view.theme.muted
                     font.pixelSize: 12
                 }
 
                 Row {
                     spacing: 10
-
-                    Rectangle {
-                        width: snapLabel.implicitWidth + 28
-                        height: 38
-                        radius: 8
-                        color: view.theme.surface
-                        border.width: 1
-                        border.color: view.theme.accent
-
-                        Text {
-                            id: snapLabel
-                            anchors.centerIn: parent
-                            text: "Snapshot first"
-                            color: view.theme.accent
-                            font.pixelSize: 13
-                            font.bold: true
-                        }
-
-                        MouseArea {
-                            anchors.fill: parent
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: view.snapshotFirst()
-                        }
-                    }
 
                     Rectangle {
                         width: cancelLabel.implicitWidth + 28
@@ -597,10 +571,10 @@ PanelView {
                 }
             }
 
-            // Switch now / Cancel — only when nothing blocks the switch.
+            // Switch now / Cancel.
             Row {
                 width: confirmColumn.width
-                visible: view.planData !== null && view.planBlocked.length === 0 && !view.planning
+                visible: view.planData !== null && !view.planning
                 spacing: 10
 
                 Rectangle {

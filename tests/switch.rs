@@ -2,8 +2,8 @@
 //! between fixture profiles (install/remove/symlink/service sets and blocked
 //! paths), the locked switch sequence against stubbed pacman, the install-first
 //! conflict fallback, kept-package refusals, service-start warnings, SIGTERM
-//! cancellation at a step boundary, idempotent re-runs, and the refusal to
-//! ever clobber a real file.
+//! cancellation at a step boundary, idempotent re-runs, and the preservation of
+//! a real file the switch is about to replace.
 
 mod common;
 
@@ -177,16 +177,36 @@ fn plan_between_fixture_profiles_reports_the_diff_and_blocked_paths() {
         "the live managed paths are symlinks, not real files"
     );
 
-    // A real file where beta wants a symlink is flagged, never planned over.
+    // A real file where beta wants a symlink is flagged, and the plan says which
+    // side of the identical/backed-up split it falls on.
     sandbox.write_home(".config/kitty", "my own kitty config\n");
     let data = sandbox.run(&["plan", "beta"]).assert_ok();
     assert_eq!(data["blocked_paths"], json!([".config/kitty"]));
+    assert_eq!(data["backed_up_paths"], json!([".config/kitty"]));
+    assert_eq!(data["identical_paths"], json!([]));
 
     // A missing target refuses through the failed envelope, naming it.
     let message = sandbox.run(&["plan", "ghost"]).assert_failed();
     assert!(
         message.contains("ghost"),
         "the refusal must name the profile: {message}"
+    );
+
+    // A first switch has no active manifest, so the package diff names every
+    // declared package. `install_missing` is that set against what the machine
+    // actually has — the honest count, and what a profile carrying a real
+    // rice's dependency list is really asking for.
+    sandbox.mark_installed("newbar");
+    let data = sandbox.run(&["plan", "beta"]).assert_ok();
+    assert_eq!(
+        data["package_diff"]["install"],
+        json!({ "official": ["newbar"], "aur": ["newaur"] }),
+        "the diff stays manifest-to-manifest: {data}"
+    );
+    assert_eq!(
+        data["install_missing"],
+        json!({ "official": [], "aur": ["newaur"] }),
+        "only the package the machine lacks is reported missing: {data}"
     );
 
     for line in sandbox.log() {
@@ -285,9 +305,254 @@ fn switch_runs_the_locked_sequence_in_order() {
     );
 }
 
-/// Class: conflict fallback. A declared pacman conflict on an install removes
-/// just the conflicting A-package, retries the install, and the switch
-/// completes.
+/// Class: real directories at managed paths. The fixture above symlinks the
+/// managed paths the way an activated profile leaves them, which is the only
+/// shape the old `remove_file` could clear. A machine that has never switched —
+/// or whose config is a plain directory — is the other case, and it used to
+/// report a successful switch that changed nothing.
+#[test]
+fn a_real_directory_at_a_managed_path_is_replaced_by_the_symlink() {
+    let sandbox = Sandbox::new();
+    fixture(&sandbox);
+
+    // Put the live tree back the way a fresh machine has it: real directories,
+    // not links. This is the state the original code silently no-opped on.
+    fs::remove_file(sandbox.home().join(".config/waybar")).expect("drop the waybar link");
+    fs::remove_file(sandbox.home().join(".config/hypr")).expect("drop the hypr link");
+    fs::create_dir_all(sandbox.home().join(".config/waybar")).expect("real waybar dir");
+    fs::write(
+        sandbox.home().join(".config/waybar/config.jsonc"),
+        "{ \"rice\": \"live\" }\n",
+    )
+    .expect("real waybar config");
+    fs::create_dir_all(sandbox.home().join(".config/hypr")).expect("real hypr dir");
+    fs::write(
+        sandbox.home().join(".config/hypr/hyprland.conf"),
+        "exec-once = waybar\n",
+    )
+    .expect("real hypr config");
+    sandbox.clear_log();
+
+    let data = sandbox.run(&["switch", "beta"]).assert_ok();
+
+    assert_eq!(
+        fs::read_link(sandbox.home().join(".config/waybar")).ok(),
+        Some(sandbox.profile_dir("beta").join(".config/waybar")),
+        "the real directory is replaced by a link into the target profile"
+    );
+    assert!(
+        data["report"]["linked"]
+            .as_array()
+            .expect("linked is a list")
+            .contains(&json!(".config/waybar")),
+        "a path that really linked is reported as linked"
+    );
+    assert_eq!(
+        fs::read_to_string(sandbox.home().join(".config/waybar/config.jsonc"))
+            .expect("read through the new link"),
+        "{ \"rice\": \"beta\" }\n",
+        "the link resolves into the target profile, not the old directory"
+    );
+    assert!(
+        fs::symlink_metadata(sandbox.home().join(".config/hypr")).is_err(),
+        "an unlinked real directory is cleared, not left behind"
+    );
+}
+
+/// A real *file* at a managed path is user data, so it is never destroyed: a
+/// file the profile does not already hold byte for byte is preserved under the
+/// profile's `backups/` before the symlink goes in.
+#[test]
+fn a_real_file_is_backed_up_before_a_managed_path_replaces_it() {
+    let sandbox = Sandbox::new();
+    fixture(&sandbox);
+
+    fs::remove_file(sandbox.home().join(".config/waybar")).expect("drop the waybar link");
+    fs::write(sandbox.home().join(".config/waybar"), "not a directory\n")
+        .expect("a real file where a config dir belongs");
+
+    let data = sandbox.run(&["switch", "beta"]).assert_ok();
+
+    assert_eq!(
+        data["report"]["backed_up"],
+        json!([".config/waybar"]),
+        "the report names what it preserved: {data}"
+    );
+    assert_eq!(
+        fs::read_to_string(sandbox.profile_dir("beta").join("backups/.config/waybar"))
+            .expect("the user's file is kept under the profile"),
+        "not a directory\n",
+        "the backup holds the bytes that were there before the switch"
+    );
+    assert!(
+        fs::symlink_metadata(sandbox.home().join(".config/waybar"))
+            .expect("the path is linked now")
+            .file_type()
+            .is_symlink(),
+        "the managed path is the profile's own copy again"
+    );
+    assert_eq!(sandbox.current_target(), Some(sandbox.profile_dir("beta")));
+}
+
+/// A file the profile already holds byte for byte carries no information the
+/// profile does not have, so it is linked with no backup and no report entry.
+/// This is the common case for a shell rc the snapshot copied straight back.
+#[test]
+fn a_real_file_identical_to_the_profile_links_without_a_backup() {
+    let sandbox = Sandbox::new();
+    sandbox.write_profile(
+        "prompt",
+        &profile_toml("prompt", &[], &[], &[], &[".config/starship.toml"]),
+    );
+    sandbox.write_profile_file("prompt", ".config/starship.toml", "add_newline = true\n");
+    // The live file is the same bytes, but a real file rather than a link.
+    sandbox.write_home(".config/starship.toml", "add_newline = true\n");
+
+    let plan = sandbox.run(&["plan", "prompt"]).assert_ok();
+    assert_eq!(
+        plan["identical_paths"],
+        json!([".config/starship.toml"]),
+        "plan separates the identical from the ones it would keep: {plan}"
+    );
+    assert_eq!(plan["backed_up_paths"], json!([]), "{plan}");
+
+    let data = sandbox.run(&["switch", "prompt"]).assert_ok();
+    assert_eq!(data["report"]["backed_up"], json!([]), "{data}");
+    assert!(
+        !sandbox.profile_dir("prompt").join("backups").exists(),
+        "nothing differed, so nothing was copied"
+    );
+}
+
+/// A nested real file keeps its shape under `backups/`, so the restore path is
+/// the same path the user had.
+#[test]
+fn a_nested_real_file_is_backed_up_at_a_nested_path() {
+    let sandbox = Sandbox::new();
+    sandbox.write_profile(
+        "prompt",
+        &profile_toml(
+            "prompt",
+            &[],
+            &[],
+            &[],
+            &[".config/starship.toml", ".config/kitty"],
+        ),
+    );
+    sandbox.write_profile_file("prompt", ".config/starship.toml", "from the profile\n");
+    sandbox.write_profile_file("prompt", ".config/kitty/kitty.conf", "font 12\n");
+    sandbox.write_home(".config/starship.toml", "my own prompt\n");
+
+    let data = sandbox.run(&["switch", "prompt"]).assert_ok();
+
+    assert_eq!(
+        data["report"]["backed_up"],
+        json!([".config/starship.toml"])
+    );
+    assert_eq!(
+        fs::read_to_string(
+            sandbox
+                .profile_dir("prompt")
+                .join("backups/.config/starship.toml")
+        )
+        .expect("nested backup"),
+        "my own prompt\n"
+    );
+}
+
+/// Switching twice over the same path must not overwrite the first backup:
+/// the first switch's copy is the one the user would go back to.
+#[test]
+fn a_second_switch_keeps_the_first_backup() {
+    let sandbox = Sandbox::new();
+    fixture(&sandbox);
+    let backups = sandbox.profile_dir("beta").join("backups/.config/waybar");
+
+    for content in ["first\n", "second\n"] {
+        fs::remove_file(sandbox.home().join(".config/waybar")).ok();
+        fs::write(sandbox.home().join(".config/waybar"), content).expect("a real file");
+        sandbox.run(&["switch", "beta"]).assert_ok();
+    }
+
+    let kept: Vec<String> = fs::read_dir(backups.parent().expect("the backups dir"))
+        .expect("backups exist")
+        .map(|entry| {
+            entry
+                .expect("a directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(kept.len(), 2, "both copies are kept: {kept:?}");
+    assert_eq!(
+        fs::read_to_string(&backups).expect("the first backup is intact"),
+        "first\n",
+        "the earlier backup is the one the user had first"
+    );
+}
+
+/// A nested managed path — a profile that owns `.config/quickshell/caelestia`
+/// rather than all of `.config/quickshell` — links even when the parent holds
+/// unrelated siblings that must survive.
+#[test]
+fn a_nested_managed_path_links_without_disturbing_its_siblings() {
+    let sandbox = Sandbox::new();
+    sandbox.write_profile(
+        "nested",
+        &profile_toml("nested", &[], &[], &[], &[".config/quickshell/caelestia"]),
+    );
+    sandbox.write_profile_file(
+        "nested",
+        ".config/quickshell/caelestia/shell.qml",
+        "Shell { }\n",
+    );
+    // A sibling shell the profile does not claim.
+    fs::create_dir_all(sandbox.home().join(".config/quickshell/ii")).expect("sibling dir");
+    fs::write(
+        sandbox.home().join(".config/quickshell/ii/shell.qml"),
+        "Sibling { }\n",
+    )
+    .expect("sibling config");
+    fs::create_dir_all(sandbox.home().join(".config/quickshell/caelestia"))
+        .expect("a real dir where the nested profile belongs");
+    fs::write(
+        sandbox
+            .home()
+            .join(".config/quickshell/caelestia/shell.qml"),
+        "Live { }\n",
+    )
+    .expect("live nested config");
+
+    sandbox.run(&["switch", "nested"]).assert_ok();
+
+    assert_eq!(
+        fs::read_link(sandbox.home().join(".config/quickshell/caelestia")).ok(),
+        Some(
+            sandbox
+                .profile_dir("nested")
+                .join(".config/quickshell/caelestia")
+        ),
+        "the nested path is linked into the profile"
+    );
+    assert_eq!(
+        fs::read_to_string(sandbox.home().join(".config/quickshell/ii/shell.qml"))
+            .expect("sibling survives"),
+        "Sibling { }\n",
+        "a path the profile does not manage is never touched"
+    );
+    assert_eq!(
+        fs::read_to_string(
+            sandbox
+                .home()
+                .join(".config/quickshell/caelestia/shell.qml")
+        )
+        .expect("read through the link"),
+        "Shell { }\n",
+        "the nested link resolves into the profile"
+    );
+}
+
 #[test]
 fn a_declared_package_conflict_removes_the_conflicting_package_and_retries() {
     let sandbox = Sandbox::new();
@@ -619,65 +884,53 @@ fn switch_is_idempotent_a_second_run_ends_in_the_same_state() {
     assert_eq!(sandbox.state()["active_profile"], json!("beta"));
 }
 
-/// Class: blocked paths. A real file at a target path is flagged by `plan`
-/// and `switch` refuses before touching anything — no flip, no symlinks, no
-/// pacman, no services, and the file itself untouched.
+/// Class: blocked paths. A real file at a target path is reported by `plan` and
+/// preserved by `switch` — the bytes survive under the profile's `backups/`, the
+/// switch carries on to completion, and the report names what it kept. This is
+/// what makes a switch possible at all on a machine that has never switched: a
+/// real `$HOME` always has a `.bashrc`.
 #[test]
-fn a_real_file_at_a_target_path_blocks_plan_and_switch_refuses_before_touching() {
+fn a_real_file_at_a_target_path_is_preserved_and_the_switch_completes() {
     let sandbox = Sandbox::new();
     fixture(&sandbox);
     let kitty = sandbox.write_home(".config/kitty", "my own kitty config\n");
 
     let plan = sandbox.run(&["plan", "beta"]).assert_ok();
     assert_eq!(plan["blocked_paths"], json!([".config/kitty"]));
-    sandbox.clear_log();
-    let before = sandbox.home_tree();
+    assert_eq!(
+        plan["backed_up_paths"],
+        json!([".config/kitty"]),
+        "plan says which files it would keep: {plan}"
+    );
+    assert_eq!(plan["identical_paths"], json!([]), "{plan}");
 
     let run = sandbox.run(&["switch", "beta"]);
-    let envelope = run.envelope();
-    assert_eq!(envelope["ok"], json!(false), "{}", run.stdout);
-    let data = &envelope["data"];
-    let message = data["error"]
-        .as_str()
-        .expect("failed envelope carries an error")
-        .to_string();
-    assert!(
-        message.contains(".config/kitty"),
-        "the refusal must name the blocked path: {message}"
-    );
-    assert!(
-        message.contains("snapshot"),
-        "the refusal points at the adoption path: {message}"
-    );
-    assert_eq!(data["completed_steps"], json!(2), "{data}");
-    assert_eq!(data["resume_hint"], json!("switch to `beta` to restore"));
+    let data = run.assert_ok();
+    run.assert_no_panic();
 
     assert_eq!(
-        sandbox.current_target(),
-        Some(sandbox.profile_dir("alpha")),
-        "a refused switch never flips `current`"
-    );
-    assert_eq!(sandbox.state()["active_profile"], json!("alpha"));
-    assert_eq!(
-        sandbox.home_tree(),
-        before,
-        "a refused switch changes nothing under the fake $HOME"
-    );
-    let metadata = fs::symlink_metadata(&kitty).expect("the real file is still there");
-    assert!(
-        !metadata.file_type().is_symlink(),
-        "real files are never clobbered"
+        data["report"]["backed_up"],
+        json!([".config/kitty"]),
+        "the report names the preserved path: {data}"
     );
     assert_eq!(
-        fs::read_to_string(&kitty).expect("read the real file"),
-        "my own kitty config\n"
+        fs::read_to_string(sandbox.profile_dir("beta").join("backups/.config/kitty"))
+            .expect("the real file's bytes are kept"),
+        "my own kitty config\n",
+        "real files are never lost"
     );
     assert!(
-        sandbox.log().is_empty(),
-        "a refused switch never reaches pacman or the services: {:?}",
-        sandbox.log()
+        fs::symlink_metadata(&kitty)
+            .expect("the path is linked now")
+            .file_type()
+            .is_symlink()
     );
-    run.assert_no_panic();
+    assert_eq!(sandbox.current_target(), Some(sandbox.profile_dir("beta")));
+    assert_eq!(sandbox.state()["active_profile"], json!("beta"));
+    assert!(
+        !kitty.to_string_lossy().is_empty(),
+        "the switch ran to the end, not a refusal"
+    );
 }
 
 /// Class: live warnings (ticket #19). Warnings reach the panel as they
@@ -812,8 +1065,12 @@ fn the_confirmation_plan_is_read_only_so_cancel_aborts_before_anything_runs() {
     );
     for line in sandbox.log() {
         assert!(
-            line.ends_with("--version"),
-            "plan only probes tools, never transacts: {line}"
+            line == "pacman -Qq" || line.ends_with("--version"),
+            "plan only probes tools and asks pacman what is installed, never transacts: {line}"
+        );
+        assert!(
+            !line.starts_with("pkexec "),
+            "a preview must never ask for a password: {line}"
         );
     }
 }

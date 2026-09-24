@@ -319,7 +319,9 @@ fn plan(context: &mut Context, target: &str) -> Envelope {
         )
     };
 
-    let blocked_paths = check_blocked_paths(&context.home, &symlink_link);
+    let profile_dir = context.store.profile_dir(target);
+    let classified = classify_blocked_paths(&context.home, &profile_dir, &symlink_link);
+    let blocked_paths = blocked_paths_of(&classified);
 
     let mut envelope = Envelope::ok(json!({
         "target": target,
@@ -327,8 +329,22 @@ fn plan(context: &mut Context, target: &str) -> Envelope {
             "install": { "official": install_official, "aur": install_aur },
             "remove": { "official": remove_official, "aur": remove_aur },
         },
+        // The diff above is manifest-to-manifest, so on a first switch it
+        // names every package the profile declares even when the machine
+        // already has it. This is the same set intersected with what pacman
+        // says is actually absent — the honest count, and what a profile
+        // imported from a rice's own dependency list is really asking for.
+        "install_missing": {
+            "official": missing_from_machine(&install_official),
+            "aur": missing_from_machine(&install_aur),
+        },
         "service_changes": { "stop": services_stop, "start": services_start },
         "symlink_changes": { "link": symlink_link, "unlink": symlink_unlink },
+        // A real file at a target no longer stops the switch: the ones that
+        // differ are preserved under the profile's `backups/` first, and the
+        // report says which. The two lists partition `blocked_paths`.
+        "backed_up_paths": classified.backed_up,
+        "identical_paths": classified.identical,
         "blocked_paths": blocked_paths,
     }));
     with_tools(&mut envelope, PACKAGE_MANAGERS);
@@ -681,13 +697,20 @@ fn build_manifest(
 /// finds it.
 fn auto_rice_info(files: &[String], packages: &PackageScan) -> RiceInfo {
     const BARS: &[&str] = &["waybar", "ags", "quickshell"];
-    const TERMINALS: &[&str] = &["kitty", "foot"];
+    const TERMINALS: &[&str] = &["kitty", "foot", "fish", "alacritty", "wezterm", "ghostty"];
     const COLOR_SCHEMES: &[&str] = &["matugen", "pywal"];
 
+    // A captured path counts as the candidate's own config when it is that
+    // config dir or anything inside it: a profile owning
+    // `.config/quickshell/caelestia` is a quickshell desktop exactly as much as
+    // one owning `.config/quickshell` outright, and an exact match would
+    // silently drop the attribution for every nested capture.
     let present = |candidate: &str| {
+        let dir = format!(".config/{candidate}");
+        let nested = format!("{dir}/");
         files
             .iter()
-            .any(|path| path.as_str() == format!(".config/{candidate}"))
+            .any(|path| path.as_str() == dir || path.starts_with(&nested))
             || packages
                 .official
                 .iter()
@@ -817,18 +840,33 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
         )
     };
 
-    let blocked_paths = check_blocked_paths(&context.home, &symlink_link);
-    if !blocked_paths.is_empty() {
-        let paths_list = blocked_paths.join(", ");
-        return Envelope {
-            ok: false,
-            data: json!({
-                "error": format!("cannot switch: real files block these target paths: {}. Use `snapshot` to adopt them into a profile first.", paths_list),
-                "completed_steps": 2,
-                "resume_hint": format!("switch to `{target}` to restore"),
-            }),
-            warnings: Vec::new(),
+    // A real file at a target is the user's own, and replacing it must not lose
+    // it. Files that match the profile byte for byte carry nothing the profile
+    // does not already hold; the rest are copied under the target profile's
+    // `backups/` here, before `current` flips, so a failure part-way through
+    // leaves the live tree exactly as it was.
+    let profile_dir = context.store.profile_dir(target);
+    let classified = classify_blocked_paths(&context.home, &profile_dir, &symlink_link);
+    let backups_dir = context.store.backups_dir(target);
+    let mut backed_up = Vec::new();
+    for relative in &classified.backed_up {
+        let stored = match backup_managed_file(&backups_dir, relative, &context.home.join(relative))
+        {
+            Ok(stored) => stored,
+            Err(error) => {
+                return Envelope {
+                    ok: false,
+                    data: json!({
+                        "error": format!("cannot preserve your `{relative}` before switching: {error}"),
+                        "completed_steps": 2,
+                        "resume_hint": format!("switch to `{target}` to restore"),
+                    }),
+                    warnings: Vec::new(),
+                };
+            }
         };
+        emitter.warning(&format!("kept your `{relative}` at {}", stored.display()));
+        backed_up.push(relative.clone());
     }
 
     // AUR installs need a helper before anything is touched: with AUR packages
@@ -927,19 +965,28 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
     // Step 5: flip symlinks
     context.progress(&mut emitter, "linking managed config paths");
     for relative in &symlink_unlink {
-        let path = context.home.join(relative);
-        let _ = std::fs::remove_file(&path);
+        if let Err(error) = clear_managed_path(&context.home.join(relative)) {
+            return package_failure(
+                target,
+                completed_steps,
+                warnings,
+                format!("cannot unlink the managed path `{relative}`: {error}"),
+            );
+        }
         unlinked.push(relative.clone());
     }
     let profile_dir = context.store.profile_dir(target);
     for relative in &symlink_link {
         let link = context.home.join(relative);
         let target_path = profile_dir.join(relative);
-        if let Some(parent) = link.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        if let Err(error) = link_managed_path(&link, &target_path) {
+            return package_failure(
+                target,
+                completed_steps,
+                warnings,
+                format!("cannot link the managed path `{relative}`: {error}"),
+            );
         }
-        let _ = std::fs::remove_file(&link);
-        let _ = std::os::unix::fs::symlink(&target_path, &link);
         linked.push(relative.clone());
     }
     completed_steps += 1;
@@ -1078,6 +1125,7 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
             "aur_output": aur_output,
             "linked": linked,
             "unlinked": unlinked,
+            "backed_up": backed_up,
             "services_stopped": services_stopped,
             "services_started": services_started,
             "reloaded": reloaded,
@@ -2026,16 +2074,221 @@ fn compute_symlink_changes(
     (link, unlink)
 }
 
-/// Checks for real files at target symlink paths (blocked paths)
-fn check_blocked_paths(home: &Path, paths: &[String]) -> Vec<String> {
-    paths
+/// The packages in `wanted` that this machine does not have, per `pacman -Qq`.
+///
+/// `plan` reports the raw manifest difference, which on a first switch is every
+/// package the target declares. Intersecting with what is actually installed
+/// is what turns "this profile declares 20 packages" into "this machine is
+/// missing 5", which is the number worth putting in front of someone before
+/// they authorise a switch.
+///
+/// The query runs under plain `pacman`, never the `OFFICIAL` prefix: `plan` is
+/// a preview, and a preview that asks for a password is not a preview. A query
+/// pacman cannot answer leaves the set alone — the manifest difference stays
+/// the conservative answer.
+fn missing_from_machine(wanted: &[String]) -> Vec<String> {
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let Ok(output) = run_command(&[Tool::Pacman.name()], &["-Qq"]) else {
+        return wanted.to_vec();
+    };
+    if !output.status.success() {
+        return wanted.to_vec();
+    }
+    let listing = String::from_utf8_lossy(&output.stdout).into_owned();
+    let installed: std::collections::HashSet<&str> = listing
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    wanted
         .iter()
-        .filter_map(|relative| {
-            let metadata = std::fs::symlink_metadata(home.join(relative)).ok()?;
-            (!metadata.file_type().is_symlink() && metadata.is_file()).then(|| relative.clone())
-        })
+        .filter(|package| !installed.contains(package.as_str()))
+        .cloned()
         .collect()
 }
+
+/// The real files standing at the paths a switch would link, split by what the
+/// switch would do about each one.
+struct BlockedPaths {
+    /// Byte-for-byte the same as the profile's own copy: replacing it loses
+    /// nothing, so the switch says nothing and links it.
+    identical: Vec<String>,
+    /// Genuinely different: the switch copies these into the target profile's
+    /// `backups/` before it replaces them, and the report names each one.
+    backed_up: Vec<String>,
+}
+
+/// Classifies the real files sitting at the paths a switch would link.
+///
+/// A real file at a link target used to abort the whole switch, which made any
+/// profile un-switchable on a machine that had never switched — and every real
+/// machine has a `.bashrc` and a `.zshrc`. Nothing is clobbered either way: a
+/// file that matches the profile byte for byte carries no information the
+/// profile does not already hold, and one that differs is preserved under
+/// `backups/` first.
+fn classify_blocked_paths(home: &Path, profile: &Path, paths: &[String]) -> BlockedPaths {
+    let mut identical = Vec::new();
+    let mut backed_up = Vec::new();
+    for relative in paths {
+        let live = home.join(relative);
+        let Ok(metadata) = std::fs::symlink_metadata(&live) else {
+            continue; // Absent: nothing stands in the way.
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            continue; // Already managed, or a directory this handles elsewhere.
+        }
+        let (Ok(mine), Ok(theirs)) = (std::fs::read(&live), std::fs::read(profile.join(relative)))
+        else {
+            // The profile has no copy to compare against, so the difference is
+            // unprovable: treat it as something worth keeping.
+            backed_up.push(relative.clone());
+            continue;
+        };
+        if mine == theirs {
+            identical.push(relative.clone());
+        } else {
+            backed_up.push(relative.clone());
+        }
+    }
+    BlockedPaths {
+        identical,
+        backed_up,
+    }
+}
+
+/// Every real file at a link target, whatever the switch would do with it: the
+/// blocked set `plan` reports, in path order.
+fn blocked_paths_of(classified: &BlockedPaths) -> Vec<String> {
+    let mut all: Vec<String> = classified
+        .identical
+        .iter()
+        .chain(&classified.backed_up)
+        .cloned()
+        .collect();
+    all.sort();
+    all
+}
+
+/// Copies a real file the switch is about to replace into the target profile's
+/// `backups/`, so the bytes survive the switch.
+///
+/// The copy is staged beside its destination and renamed into place, the same
+/// staged-then-rename primitive `Store::flip` and `link_managed_path` use, so a
+/// crash mid-write cannot leave a truncated file where the user's config used to
+/// be. `now_rfc3339` names a collision suffix, so a second switch over the same
+/// path keeps both copies instead of overwriting the first.
+fn backup_managed_file(backups: &Path, relative: &str, live: &Path) -> Result<PathBuf, String> {
+    let mut destination = backups.join(relative);
+    let parent = destination
+        .parent()
+        .ok_or_else(|| format!("the backup path for `{relative}` has no parent directory"))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+
+    if destination.exists() {
+        let stem = destination
+            .file_stem()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| relative.to_string());
+        let extension = destination
+            .extension()
+            .map(|name| format!(".{}", name.to_string_lossy()))
+            .unwrap_or_default();
+        // Two switches over the same path, minutes apart: keep both.
+        destination = parent.join(format!("{stem}.{}.bak{extension}", now_rfc3339()));
+    }
+
+    let staged = staged_backup_path(&destination);
+    let _ = std::fs::remove_file(&staged);
+    std::fs::copy(live, &staged).map_err(|error| {
+        format!(
+            "cannot copy {} to {}: {error}",
+            live.display(),
+            staged.display()
+        )
+    })?;
+    if let Err(error) = std::fs::rename(&staged, &destination) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(format!(
+            "cannot store the backup at {}: {error}",
+            destination.display()
+        ));
+    }
+    Ok(destination)
+}
+
+/// The scratch name a backup is written under before it is renamed into place.
+fn staged_backup_path(destination: &Path) -> PathBuf {
+    let mut name = destination.as_os_str().to_os_string();
+    name.push(".riceswap-staged");
+    PathBuf::from(name)
+}
+
+/// Clears a managed path the active profile owned and the target no longer does,
+/// so the switch leaves nothing of the old rice behind.
+///
+/// A symlink is simply unlinked. A real **directory** is the profile's own copy of
+/// a `$HOME` path — the shape every captured config dir has — and is removed in
+/// full: the live tree is mid-switch, and leaving a half-old config in place is
+/// worse than replacing it. A real **file** is user data that no profile claims, so
+/// it refuses rather than deleting it. Anything that cannot be inspected is left
+/// alone: an absent path is already clear.
+fn clear_managed_path(path: &Path) -> Result<(), String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
+    };
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        return std::fs::remove_file(path)
+            .map_err(|error| format!("cannot remove {}: {error}", path.display()));
+    }
+    if metadata.is_dir() {
+        return std::fs::remove_dir_all(path)
+            .map_err(|error| format!("cannot remove {}: {error}", path.display()));
+    }
+    // A fifo or socket holds nothing a config switch needs to clear.
+    Ok(())
+}
+
+/// Points `link` at the target profile's copy of a managed path.
+///
+/// The link is staged beside its destination and renamed into place, the same
+/// staged-then-rename primitive `Store::flip` uses for the `current` symlink, so a
+/// watcher never observes a half-linked config. The destination is cleared first:
+/// a path the old profile left as a real directory has to be replaced wholesale,
+/// which `remove_file` alone cannot do.
+fn link_managed_path(link: &Path, target: &Path) -> Result<(), String> {
+    if let Some(parent) = link.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    }
+    clear_managed_path(link)?;
+    let staged = staged_link_path(link);
+    let _ = std::fs::remove_file(&staged);
+    std::os::unix::fs::symlink(target, &staged)
+        .map_err(|error| format!("cannot create {}: {error}", staged.display()))?;
+    if let Err(error) = std::fs::rename(&staged, link) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(format!(
+            "cannot point {} at the profile: {error}",
+            link.display()
+        ));
+    }
+    Ok(())
+}
+
+/// The staging path a managed link is built at before being renamed onto its
+/// destination: the destination with a `.riceswap-staged` suffix, in the same
+/// directory so the rename stays within one filesystem.
+fn staged_link_path(link: &Path) -> PathBuf {
+    let mut name = link.as_os_str().to_os_string();
+    name.push(".riceswap-staged");
+    PathBuf::from(name)
+}
+
 fn describe(status: &tools::ToolStatus) -> String {
     match (&status.error, status.exit_code) {
         (Some(error), _) if !status.available => error.clone(),
