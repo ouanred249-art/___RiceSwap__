@@ -57,6 +57,23 @@ Every rice gets these four, so a profile is never left with a broken desktop:
 
 ## 📦 Install
 
+**No AUR, no yay** — one script, straight from the repo:
+
+```sh
+git clone https://github.com/ouanred249-art/___RiceSwap__
+cd ___RiceSwap__
+./install.sh        # builds the backend, installs binary + GUI + wallpapers,
+                    # and adds the two keybind lines to your Hyprland config
+```
+
+`./install.sh` works from any checkout, or from anywhere (it clones main into
+a temp dir if you're not in one). Options: `--prefix <dir>` (default
+`/usr/local`), `--no-sudo` (installs into `~/local`), `--hyprland <path>`
+(point at your config; classic `hyprland.conf` files get the lines written
+into a managed block, Lua configs get the lines printed for you).
+
+### From the AUR (alternative)
+
 RiceSwap is distributed through the AUR (Arch-first, x86_64):
 
 | Package | What it is |
