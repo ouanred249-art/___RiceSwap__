@@ -419,6 +419,9 @@ pub struct Manifest {
     pub packages: Packages,
     #[serde(default)]
     pub services: Vec<Service>,
+    /// The desktop shell this profile owns, if it claims one. See `Shell`.
+    #[serde(default)]
+    pub shell: Option<Shell>,
     #[serde(default)]
     pub files: Vec<FileEntry>,
     #[serde(default)]
@@ -453,6 +456,28 @@ pub struct Packages {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Service {
+    pub name: String,
+    pub start: String,
+    pub stop: String,
+}
+
+/// The `[shell]` table: the desktop shell this profile owns.
+///
+/// A shell is a service like any other, and that is exactly the problem. Two
+/// profiles both list a `qs` service, and the switch diffs services by *name*,
+/// so switching between two shells reads as "nothing changed" and the old shell
+/// is never stopped. Worse, the command both profiles record is `qs -c $qsConfig`
+/// — the same string — and `$qsConfig` is an environment variable, so the
+/// profile does not choose the shell, the session does.
+///
+/// Naming it separately, with the shell spelled out, is what lets a switch say
+/// "these are two different shells" and run the right pair of commands.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Shell {
+    /// The shell's identity — `ii`, `caelestia`, whatever `qs -c` is given.
+    /// Two profiles holding the same name are the same shell, and a switch
+    /// between them restarts nothing.
     pub name: String,
     pub start: String,
     pub stop: String,

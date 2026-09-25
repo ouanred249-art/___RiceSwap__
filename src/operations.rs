@@ -22,7 +22,8 @@ use crate::cli::Invocation;
 use crate::detection::{self, IMAGE_EXTENSIONS, PackageScan};
 use crate::envelope::{Emitter, Envelope};
 use crate::profile::{
-    CURRENT_MANIFEST_VERSION, FileEntry, Manifest, Packages, ProfileInfo, RiceInfo, Service, Store,
+    CURRENT_MANIFEST_VERSION, FileEntry, Manifest, Packages, ProfileInfo, RiceInfo, Service, Shell,
+    Store,
 };
 use crate::state::StateStore;
 use crate::tools::{self, Tool};
@@ -307,6 +308,15 @@ fn plan(context: &mut Context, target: &str) -> Envelope {
         )
     };
 
+    // Reported separately from the services for the reason
+    // `compute_shell_change` gives: a shell swap is invisible to a service diff,
+    // and a panel that cannot see it is a panel that cannot warn about the one
+    // step that actually ends the old desktop.
+    let (shell_stop, shell_start) = compute_shell_change(
+        active_manifest.as_ref().and_then(|m| m.shell.as_ref()),
+        target_manifest.shell.as_ref(),
+    );
+
     context.progress(&mut emitter, "checking managed paths for conflicts");
 
     let (symlink_link, symlink_unlink) = if let Some(ref current) = active_manifest {
@@ -342,6 +352,10 @@ fn plan(context: &mut Context, target: &str) -> Envelope {
             "aur": missing_from_machine(&install_aur),
         },
         "service_changes": { "stop": services_stop, "start": services_start },
+        "shell_change": {
+            "stop": shell_stop.map(|shell| shell.name.clone()),
+            "start": shell_start.map(|shell| shell.name.clone()),
+        },
         "symlink_changes": { "link": symlink_link, "unlink": symlink_unlink },
         // A real file at a target no longer stops the switch: the ones that
         // differ are preserved under the profile's `backups/` first, and the
@@ -706,6 +720,10 @@ fn build_manifest(
             aur: packages.aur.clone(),
         },
         services,
+        // A snapshot records the shell it found running, so a later switch can
+        // recognise it and end it. `detect` reads it off the environment the
+        // same way it reads the services out of `exec-once`.
+        shell: None,
         files: files
             .iter()
             .map(|path| FileEntry {
@@ -862,6 +880,15 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
         )
     };
 
+    // The shell is computed apart from the services, because a shell change is
+    // invisible to a service diff: both profiles record a `qs` service running
+    // `qs -c $qsConfig`, so the names match, the strings match, and the diff
+    // concludes nothing happened. It did not stop the old shell.
+    let (shell_stop, shell_start) = compute_shell_change(
+        active_manifest.as_ref().and_then(|m| m.shell.as_ref()),
+        target_manifest.shell.as_ref(),
+    );
+
     let (symlink_link, symlink_unlink) = if let Some(ref current) = active_manifest {
         compute_symlink_changes(&current.files, &target_manifest.files)
     } else {
@@ -942,8 +969,11 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
     let mut conflict_removed = Vec::new();
     let mut linked = Vec::new();
     let mut unlinked = Vec::new();
+    let mut preserved = Vec::new();
     let mut services_stopped = Vec::new();
     let mut services_started = Vec::new();
+    let mut shell_stopped = None;
+    let mut shell_started = None;
     let mut reloaded = false;
 
     // Step 3: flip `current` symlink
@@ -983,6 +1013,14 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
             }
         }
     }
+    // The shell stops here too, and for the same reason the other services do:
+    // it belongs to the profile being left. It is driven by its own `[shell]`
+    // table rather than the service list because the service list cannot tell
+    // two shells apart — see `compute_shell_change`.
+    if let Some(shell) = shell_stop {
+        let _ = Command::new("sh").arg("-c").arg(&shell.stop).output();
+        shell_stopped = Some(shell.name.clone());
+    }
     completed_steps += 1;
 
     if cancelled.load(Ordering::Relaxed) {
@@ -999,8 +1037,25 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
 
     // Step 5: flip symlinks
     context.progress(&mut emitter, "linking managed config paths");
+    // A path the old profile managed and the new one does not used to be
+    // deleted. That is the one place the switch could still lose data: the
+    // whole promise is that you can go back, and on the way back the old
+    // profile's own files are exactly the ones the new profile stopped claiming.
+    // So the path is moved into the *leaving* profile's `backups/` before the
+    // link is replaced, and the report names where it went.
     for relative in &symlink_unlink {
-        if let Err(error) = clear_managed_path(&context.home.join(relative)) {
+        let live = context.home.join(relative);
+        if let Some(name) = active.name.as_ref() {
+            let backups = context.store.backups_dir(name);
+            if let Err(error) = preserve_managed_path(&backups, relative, &live) {
+                return package_failure(
+                    target,
+                    completed_steps,
+                    warnings,
+                    format!("cannot preserve the path `{relative}`: {error}"),
+                );
+            }
+        } else if let Err(error) = clear_managed_path(&live) {
             return package_failure(
                 target,
                 completed_steps,
@@ -1009,6 +1064,7 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
             );
         }
         unlinked.push(relative.clone());
+        preserved.push(relative.clone());
     }
     let profile_dir = context.store.profile_dir(target);
     for relative in &symlink_link {
@@ -1146,6 +1202,34 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
             }
         }
     }
+    // The target's shell starts last, after the reload, so it comes up against
+    // the config the reload has already installed. A shell that starts too early
+    // reads the old config and keeps it — the failure this ordering exists to
+    // prevent.
+    if let Some(shell) = shell_start {
+        let output = Command::new("sh").arg("-c").arg(&shell.start).output();
+        // A shell that will not start is a warning, not a failure: the other
+        // services, the packages and the links all succeeded, and the config is
+        // correct for the next login. Failing the switch here would report a
+        // broken profile for a shell that is merely not up yet.
+        match output {
+            Ok(out) if out.status.success() => shell_started = Some(shell.name.clone()),
+            Ok(out) => {
+                let note = format!(
+                    "shell `{}` failed to start: {}",
+                    shell.name,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                emitter.warning(&note);
+                warnings.push(note);
+            }
+            Err(error) => {
+                let note = format!("shell `{}` failed to start: {error}", shell.name);
+                emitter.warning(&note);
+                warnings.push(note);
+            }
+        }
+    }
     completed_steps += 2;
 
     let mut envelope = Envelope::ok(json!({
@@ -1160,9 +1244,12 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
             "aur_output": aur_output,
             "linked": linked,
             "unlinked": unlinked,
+            "preserved": preserved,
             "backed_up": backed_up,
             "services_stopped": services_stopped,
             "services_started": services_started,
+            "shell_stopped": shell_stopped,
+            "shell_started": shell_started,
             "reloaded": reloaded,
         },
     }));
@@ -2068,6 +2155,34 @@ fn compute_package_diff(
     (install_official, install_aur, remove_official, remove_aur)
 }
 
+/// The shell change a switch implies: (stop, start).
+///
+/// The rule is name equality, because the name is the only thing that says
+/// "same shell". Two profiles both carrying a `qs` service whose command is the
+/// identical string `qs -c $qsConfig` are two different shells wearing one
+/// service name; comparing services alone says nothing changed and leaves the
+/// old shell running under the new one's config. Comparing the shells says
+/// `ii` and `caelestia` differ, which is the truth.
+///
+/// `stop` is the shell to end, `start` the one to begin. Each is `None` when
+/// that half is not called for.
+fn compute_shell_change<'a>(
+    current: Option<&'a Shell>,
+    target: Option<&'a Shell>,
+) -> (Option<&'a Shell>, Option<&'a Shell>) {
+    match (current, target) {
+        // No active profile: nothing is known to be running, so the target's
+        // shell starts — the same call the service diff makes with no `current`.
+        (None, target) => (None, target),
+        // The target claims no shell. Ending the old one would leave a desktop
+        // with none, so it stays: a profile that does not name a shell has no
+        // opinion about the one running.
+        (Some(_), None) => (None, None),
+        (Some(current), Some(target)) if current.name == target.name => (None, None),
+        (Some(current), Some(target)) => (Some(current), Some(target)),
+    }
+}
+
 /// Computes service changes: (stop, start)
 fn compute_service_changes(current: &[Service], target: &[Service]) -> (Vec<String>, Vec<String>) {
     let current_names: std::collections::HashSet<&str> =
@@ -2204,6 +2319,114 @@ fn blocked_paths_of(classified: &BlockedPaths) -> Vec<String> {
         .collect();
     all.sort();
     all
+}
+
+/// Moves a path the new profile no longer manages into the *leaving* profile's
+/// `backups/`, so the switch gives the path back instead of deleting it.
+///
+/// The bytes already exist — inside the leaving profile, which is what the path
+/// is currently a symlink to — so what is being preserved is the right to have
+/// them back at this path without a second profile copy. A symlink is recreated
+/// under the backup name pointing at its own profile copy; a real file or
+/// directory is moved, recursively, so a profile that was edited in place since
+/// it was captured is preserved as edited rather than as the stale capture.
+///
+/// `now_rfc3339` names the collision suffix, so returning to a profile twice
+/// keeps both generations.
+fn preserve_managed_path(backups: &Path, relative: &str, live: &Path) -> Result<(), String> {
+    let Ok(metadata) = std::fs::symlink_metadata(live) else {
+        return Ok(()); // Absent: nothing to preserve, nothing to unlink.
+    };
+    let mut destination = backups.join(relative);
+    let parent = destination
+        .parent()
+        .ok_or_else(|| format!("the backup path for `{relative}` has no parent directory"))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+
+    if destination.exists() || std::fs::symlink_metadata(&destination).is_ok() {
+        let stem = destination
+            .file_stem()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| relative.to_string());
+        let extension = destination
+            .extension()
+            .map(|name| format!(".{}", name.to_string_lossy()))
+            .unwrap_or_default();
+        destination = parent.join(format!("{stem}.{}.bak{extension}", now_rfc3339()));
+    }
+
+    if metadata.file_type().is_symlink() {
+        // A link to the leaving profile's own copy: recreating it under
+        // `backups/` keeps those bytes reachable, and a plain `remove_file`
+        // would have discarded the pointer to them.
+        std::os::unix::fs::symlink(
+            std::fs::read_link(live)
+                .map_err(|error| format!("cannot read the link at {}: {error}", live.display()))?,
+            &destination,
+        )
+        .map_err(|error| {
+            format!(
+                "cannot store the link at {}: {error}",
+                destination.display()
+            )
+        })?;
+        return std::fs::remove_file(live)
+            .map_err(|error| format!("cannot remove {}: {error}", live.display()));
+    }
+
+    if metadata.is_dir() {
+        return move_directory(&destination, live);
+    }
+    std::fs::rename(live, &destination).map_err(|error| {
+        format!(
+            "cannot move {} to {}: {error}",
+            live.display(),
+            destination.display()
+        )
+    })
+}
+
+/// Moves a directory and everything under it, creating the destination as it
+/// goes, so a half-finished move leaves the source intact rather than a
+/// truncated tree in both places.
+fn move_directory(destination: &Path, source: &Path) -> Result<(), String> {
+    let mut entries: Vec<_> = std::fs::read_dir(source)
+        .map_err(|error| format!("cannot read {}: {error}", source.display()))?
+        .collect::<Result<_, _>>()
+        .map_err(|error| format!("cannot read {}: {error}", source.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    std::fs::create_dir_all(destination)
+        .map_err(|error| format!("cannot create {}: {error}", destination.display()))?;
+    for entry in entries {
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        let metadata = std::fs::symlink_metadata(&from)
+            .map_err(|error| format!("cannot inspect {}: {error}", from.display()))?;
+        if metadata.file_type().is_symlink() {
+            std::os::unix::fs::symlink(
+                std::fs::read_link(&from).map_err(|error| {
+                    format!("cannot read the link at {}: {error}", from.display())
+                })?,
+                &to,
+            )
+            .map_err(|error| format!("cannot store the link at {}: {error}", to.display()))?;
+            std::fs::remove_file(&from)
+                .map_err(|error| format!("cannot remove {}: {error}", from.display()))?;
+        } else if metadata.is_dir() {
+            move_directory(&to, &from)?;
+        } else {
+            std::fs::rename(&from, &to).map_err(|error| {
+                format!(
+                    "cannot move {} to {}: {error}",
+                    from.display(),
+                    to.display()
+                )
+            })?;
+        }
+    }
+    std::fs::remove_dir(source)
+        .map_err(|error| format!("cannot remove {}: {error}", source.display()))
 }
 
 /// Copies a real file the switch is about to replace into the target profile's

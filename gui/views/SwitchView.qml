@@ -61,6 +61,13 @@ PanelView {
         const start = planData && planData.service_changes && planData.service_changes.start ? planData.service_changes.start : [];
         return start;
     }
+    // The shell swap is the one step that ends the running desktop, and a
+    // service diff cannot see it: both profiles record a `qs` service running
+    // the same command, so the service list is empty across a shell change.
+    // It gets its own line so the panel never shows "nothing to do" while the
+    // old shell is about to be killed.
+    readonly property string planShellStop: planData && planData.shell_change && planData.shell_change.stop ? planData.shell_change.stop : ""
+    readonly property string planShellStart: planData && planData.shell_change && planData.shell_change.start ? planData.shell_change.start : ""
     readonly property var planLink: planData && planData.symlink_changes ? planData.symlink_changes.link : []
     readonly property var planUnlink: planData && planData.symlink_changes ? planData.symlink_changes.unlink : []
 
@@ -78,6 +85,8 @@ PanelView {
             parts.push("stop " + stop + " service" + (stop === 1 ? "" : "s"));
         if (start > 0)
             parts.push("start " + start + " service" + (start === 1 ? "" : "s"));
+        if (planShellStop.length > 0)
+            parts.push("swap shell " + planShellStop + " → " + planShellStart);
         if (planLink.length > 0)
             parts.push("link " + planLink.length + " config path" + (planLink.length === 1 ? "" : "s"));
         if (planUnlink.length > 0)
@@ -416,6 +425,27 @@ PanelView {
                             font.family: "monospace"
                         }
                     }
+                }
+            }
+
+            // The shell swap, called out on its own rather than folded into the
+            // service counts: a shell is the one service whose loss is visible
+            // the instant it happens, and it is invisible to the service diff.
+            Column {
+                width: confirmColumn.width
+                visible: view.planData !== null && view.planShellStop.length > 0
+                spacing: 2
+
+                Text {
+                    text: "shell  " + view.planShellStop + "  →  " + view.planShellStart
+                    color: view.theme.accent
+                    font.pixelSize: 12
+                    font.family: "monospace"
+                }
+                Text {
+                    text: "your current desktop closes and " + view.planShellStart + " takes over"
+                    color: view.theme.muted
+                    font.pixelSize: 11
                 }
             }
 

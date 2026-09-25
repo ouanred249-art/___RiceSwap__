@@ -33,8 +33,10 @@ pub const STUB_TOOLS: &[&str] = &[
 
 /// Service commands the fixture manifests run (`start`/`stop`), stubbed on
 /// `PATH` beside [`STUB_TOOLS`] so a switch can stop and start services
-/// end-to-end. Not probed by `detect`: they are fixtures, not tools.
-pub const SERVICE_STUBS: &[&str] = &["pkill", "ags", "waybar"];
+/// end-to-end. Not probed by `detect`: they are fixtures, not tools. `qs` is
+/// here because a desktop shell *is* a service, and the shell-swap tests need
+/// to see it run.
+pub const SERVICE_STUBS: &[&str] = &["pkill", "ags", "waybar", "qs"];
 
 /// How a stub executable answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -428,6 +430,12 @@ impl Sandbox {
         self.log().iter().any(|line| line.contains(needle))
     }
 
+    /// The stub log's path, for a test that needs the raw text (ordering, say)
+    /// rather than a membership answer.
+    pub fn log_path(&self) -> PathBuf {
+        self.stub_log.clone()
+    }
+
     /// The `state.json` the backend wrote inside the fake `$HOME`.
     pub fn state(&self) -> Value {
         let raw = fs::read_to_string(self.state_path())
@@ -668,6 +676,23 @@ pub fn profile_toml(
         manifest.push_str(&format!("\n[[files]]\npath = \"{file}\"\n"));
     }
     manifest
+}
+
+/// `profile_toml` plus a `[shell]` table, for the fixtures whose whole point
+/// is that the two profiles own different shells.
+pub fn profile_toml_with_shell(
+    name: &str,
+    official: &[&str],
+    aur: &[&str],
+    services: &[(&str, &str, &str)],
+    files: &[&str],
+    shell: (&str, &str, &str),
+) -> String {
+    let (shell_name, start, stop) = shell;
+    format!(
+        "{}\n[shell]\nname = \"{shell_name}\"\nstart = \"{start}\"\nstop = \"{stop}\"\n",
+        profile_toml(name, official, aur, services, files)
+    )
 }
 
 /// One finished invocation.

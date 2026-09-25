@@ -1121,3 +1121,402 @@ fn the_confirmation_plan_is_read_only_so_cancel_aborts_before_anything_runs() {
         );
     }
 }
+
+/// Class: the shell swap. A desktop shell is a service like any other, and a
+/// service diff cannot see that two profiles hold *different* shells — both
+/// record a `qs` service whose command is the identical string
+/// `qs -c $qsConfig`, so the names match, the strings match, and the diff
+/// concludes nothing happened. It did not stop the old shell. The `[shell]`
+/// table is what says `ii` and `caelestia` differ.
+///
+/// The fixture is the real one: identical `qs` service in both profiles,
+/// different `[shell]` names.
+fn shell_fixture(sandbox: &Sandbox) {
+    let service = ("qs", "qs -c $qsConfig", "pkill qs");
+    sandbox.write_profile(
+        "ii",
+        &common::profile_toml_with_shell(
+            "ii",
+            &[],
+            &[],
+            &[service],
+            &[".config/quickshell/ii"],
+            ("ii", "qs -c ii", "pkill qs"),
+        ),
+    );
+    sandbox.write_profile(
+        "caelestia",
+        &common::profile_toml_with_shell(
+            "caelestia",
+            &[],
+            &[],
+            &[service],
+            &[".config/quickshell/caelestia"],
+            ("caelestia", "qs -c caelestia", "pkill qs"),
+        ),
+    );
+    sandbox.activate("ii");
+}
+
+#[test]
+fn switching_between_two_shells_stops_the_old_one_and_starts_the_new_one() {
+    let sandbox = Sandbox::new();
+    shell_fixture(&sandbox);
+    sandbox.clear_log();
+
+    let data = sandbox.run(&["switch", "caelestia"]).assert_ok();
+
+    // The report names the shell by name, both ways. This is the assertion the
+    // whole feature exists for: a service diff reports nothing here.
+    assert_eq!(data["report"]["shell_stopped"], json!("ii"));
+    assert_eq!(data["report"]["shell_started"], json!("caelestia"));
+
+    // The stop runs the *leaving* profile's command and the start runs the
+    // *entering* profile's, each with its shell spelled out rather than read
+    // from an environment variable that says `ii`.
+    assert!(
+        sandbox.log_contains("pkill qs"),
+        "the old shell is stopped: {:?}",
+        sandbox.log()
+    );
+    assert!(
+        sandbox.log_contains("qs -c caelestia"),
+        "the new shell is started by name, not via $qsConfig: {:?}",
+        sandbox.log()
+    );
+    assert!(
+        !sandbox.log_contains("qs -c $qsConfig"),
+        "the switch never runs the env-dependent command: {:?}",
+        sandbox.log()
+    );
+}
+
+#[test]
+fn switching_to_a_profile_with_the_same_shell_restarts_nothing() {
+    let sandbox = Sandbox::new();
+    shell_fixture(&sandbox);
+    // A second profile wearing the same shell: a settings change, not a
+    // desktop change. The shell is already right, so restarting it would drop
+    // the user's session for nothing.
+    sandbox.write_profile(
+        "ii-tweaked",
+        &common::profile_toml_with_shell(
+            "ii-tweaked",
+            &[],
+            &[],
+            &[("qs", "qs -c $qsConfig", "pkill qs")],
+            &[".config/quickshell/ii"],
+            ("ii", "qs -c ii", "pkill qs"),
+        ),
+    );
+    sandbox.clear_log();
+
+    let data = sandbox.run(&["switch", "ii-tweaked"]).assert_ok();
+
+    assert_eq!(data["report"]["shell_stopped"], Value::Null);
+    assert_eq!(data["report"]["shell_started"], Value::Null);
+    assert!(
+        !sandbox.log_contains("pkill qs"),
+        "the same shell is left running: {:?}",
+        sandbox.log()
+    );
+}
+
+#[test]
+fn a_profile_with_no_shell_leaves_the_running_one_alone() {
+    let sandbox = Sandbox::new();
+    shell_fixture(&sandbox);
+    // A profile that names no shell has no opinion about the one running —
+    // a theme tweak, a keybind change. Ending the desktop because such a
+    // profile was activated would be a switch that breaks the machine.
+    sandbox.write_profile(
+        "plain",
+        &common::profile_toml(
+            "plain",
+            &[],
+            &[],
+            &[("qs", "qs -c $qsConfig", "pkill qs")],
+            &[],
+        ),
+    );
+    sandbox.clear_log();
+
+    let data = sandbox.run(&["switch", "plain"]).assert_ok();
+
+    assert_eq!(data["report"]["shell_stopped"], Value::Null);
+    assert_eq!(data["report"]["shell_started"], Value::Null);
+    assert!(
+        !sandbox.log_contains("pkill qs"),
+        "no shell is named, so none is ended: {:?}",
+        sandbox.log()
+    );
+}
+
+#[test]
+fn plan_reports_the_shell_change_before_anything_runs() {
+    let sandbox = Sandbox::new();
+    shell_fixture(&sandbox);
+    sandbox.clear_log();
+
+    let data = sandbox.run(&["plan", "caelestia"]).assert_ok();
+
+    // The service diff alone says nothing changed. The shell diff is the only
+    // thing in the payload that tells the panel a desktop is about to end, so
+    // it has to be there before the user commits.
+    assert_eq!(data["service_changes"]["stop"], json!([]));
+    assert_eq!(data["service_changes"]["start"], json!([]));
+    assert_eq!(data["shell_change"]["stop"], json!("ii"));
+    assert_eq!(data["shell_change"]["start"], json!("caelestia"));
+    assert!(
+        !sandbox.log_contains("pkill qs"),
+        "the preview stops nothing: {:?}",
+        sandbox.log()
+    );
+}
+
+#[test]
+fn the_shell_starts_after_the_reload_so_it_reads_the_new_config() {
+    let sandbox = Sandbox::new();
+    shell_fixture(&sandbox);
+    sandbox.clear_log();
+    let log_path = sandbox.log_path();
+
+    sandbox.run(&["switch", "caelestia"]).assert_ok();
+    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    let reload = log
+        .lines()
+        .position(|line| line.contains("hyprctl reload"))
+        .expect("the reload runs");
+    let start = log
+        .lines()
+        .position(|line| line.contains("qs -c caelestia"))
+        .expect("the shell starts");
+
+    // A shell that comes up before the reload reads the old config and keeps
+    // it — the exact half-switched state that started this.
+    assert!(
+        start > reload,
+        "the shell must start after the reload, not before:\n{log}"
+    );
+}
+
+#[test]
+fn a_shell_that_will_not_start_warns_without_failing_the_switch() {
+    let sandbox = Sandbox::new();
+    shell_fixture(&sandbox);
+    sandbox.fail_on("qs", "-c caelestia");
+    sandbox.clear_log();
+
+    let run = sandbox.run(&["switch", "caelestia"]);
+    let data = run.assert_ok();
+
+    // Everything else succeeded and the config is correct for the next login,
+    // so failing here would report a broken profile for a shell not yet up.
+    assert_eq!(data["completed_steps"], json!(10));
+    assert_eq!(data["report"]["shell_started"], Value::Null);
+    assert!(
+        run.warnings().iter().any(|w| w.contains("caelestia")),
+        "the failure names the shell: {:?}",
+        run.warnings()
+    );
+    assert_eq!(
+        sandbox.current_target(),
+        Some(sandbox.profile_dir("caelestia"))
+    );
+}
+
+/// Class: the way back. A path the new profile no longer manages used to be
+/// deleted outright — and on the return leg the old profile's *own* files are
+/// exactly the ones the new profile stopped claiming. Deleting them makes the
+/// round trip the tool exists to support lossy: you can go out, but coming
+/// home finds the config gone. The path is moved into the leaving profile's
+/// `backups/` instead, and the report says so.
+fn round_trip_fixture(sandbox: &Sandbox) {
+    sandbox.write_profile(
+        "out",
+        &common::profile_toml_with_shell(
+            "out",
+            &[],
+            &[],
+            &[("qs", "qs -c $qsConfig", "pkill qs")],
+            &[".config/quickshell/out"],
+            ("out", "qs -c out", "pkill qs"),
+        ),
+    );
+    sandbox.write_profile(
+        "home",
+        &common::profile_toml_with_shell(
+            "home",
+            &[],
+            &[],
+            &[("qs", "qs -c $qsConfig", "pkill qs")],
+            &[".config/quickshell/ii"],
+            ("ii", "qs -c ii", "pkill qs"),
+        ),
+    );
+    // Real content for the managed symlinks to point at — a manifest naming a
+    // path with nothing behind it tests the wiring, not the preservation.
+    sandbox.write_profile_file("out", ".config/quickshell/out/shell.qml", "out shell\n");
+    sandbox.write_profile_file("home", ".config/quickshell/ii/shell.qml", "home shell\n");
+    sandbox.activate("out");
+    // Activation in the real store leaves the managed paths linked; the
+    // fixture mirrors that, or nothing at `~/.config/quickshell/out` exists to
+    // take back.
+    let link = sandbox.home().join(".config/quickshell/out");
+    fs::create_dir_all(link.parent().expect("a parent")).expect("create the parent");
+    symlink(
+        sandbox.profile_dir("out").join(".config/quickshell/out"),
+        &link,
+    )
+    .expect("link the active profile's config");
+}
+
+#[test]
+fn a_path_the_new_profile_does_not_manage_is_preserved_not_deleted() {
+    let sandbox = Sandbox::new();
+    round_trip_fixture(&sandbox);
+    sandbox.clear_log();
+
+    // `plan` is the side that names the paths; `switch` is the side that acts
+    // on them. Both are asserted, so the promise is checked from both ends.
+    let planned = sandbox.run(&["plan", "home"]).assert_ok();
+    let data = sandbox.run(&["switch", "home"]).assert_ok();
+
+    // The path the leaving profile owned and the arriving one does not.
+    assert_eq!(
+        planned["symlink_changes"]["unlink"],
+        json!([".config/quickshell/out"]),
+        "the outgoing shell config is among the paths the switch takes back"
+    );
+    assert_eq!(
+        data["report"]["unlinked"],
+        json!([".config/quickshell/out"]),
+        "and the switch reports acting on it"
+    );
+    assert_eq!(
+        data["report"]["preserved"],
+        json!([".config/quickshell/out"]),
+        "and reports preserving it rather than dropping it"
+    );
+
+    // Its bytes are still there — inside the leaving profile's backups.
+    let backups = sandbox.profile_dir("out").join("backups");
+    assert!(
+        backups.join(".config/quickshell/out").exists(),
+        "the path is preserved under the leaving profile, not deleted: {}",
+        backups.display()
+    );
+    // The profile's own copy is untouched: this is a pointer being moved, not
+    // the config being consumed.
+    assert!(
+        sandbox
+            .profile_dir("out")
+            .join(".config/quickshell/out/shell.qml")
+            .exists(),
+        "the leaving profile still holds its own config"
+    );
+}
+
+#[test]
+fn a_switch_out_and_back_leaves_both_profiles_whole() {
+    let sandbox = Sandbox::new();
+    round_trip_fixture(&sandbox);
+    let out_before = sandbox
+        .profile_dir("out")
+        .join(".config/quickshell/out/shell.qml")
+        .exists();
+    let home_before = sandbox
+        .profile_dir("home")
+        .join(".config/quickshell/ii/shell.qml")
+        .exists();
+    assert!(out_before && home_before, "the fixture ships both configs");
+
+    // Out to the other shell, then home again. The promise is that the second
+    // leg works from a machine the first leg did not damage.
+    sandbox.run(&["switch", "home"]).assert_ok();
+    let returned = sandbox.run(&["switch", "out"]).assert_ok();
+
+    assert_eq!(returned["completed_steps"], json!(10));
+    assert_eq!(sandbox.current_target(), Some(sandbox.profile_dir("out")));
+    assert_eq!(returned["report"]["shell_started"], json!("out"));
+    assert!(
+        sandbox
+            .profile_dir("out")
+            .join(".config/quickshell/out/shell.qml")
+            .exists(),
+        "the first profile's config survived the trip and the return"
+    );
+    assert!(
+        sandbox
+            .profile_dir("home")
+            .join(".config/quickshell/ii/shell.qml")
+            .exists(),
+        "so did the second's"
+    );
+    assert!(
+        sandbox.home().join(".config/quickshell/out").exists(),
+        "and the path is live again, linked to the profile that owns it"
+    );
+}
+
+#[test]
+fn a_second_take_back_of_the_same_path_keeps_both_generations() {
+    let sandbox = Sandbox::new();
+    round_trip_fixture(&sandbox);
+
+    // Out, home, and home again by way of a third profile: the same path is
+    // taken back twice. Neither generation may overwrite the other.
+    sandbox.write_profile(
+        "third",
+        &common::profile_toml_with_shell(
+            "third",
+            &[],
+            &[],
+            &[("qs", "qs -c $qsConfig", "pkill qs")],
+            &[".config/quickshell/ii"],
+            ("ii", "qs -c ii", "pkill qs"),
+        ),
+    );
+    sandbox.run(&["switch", "home"]).assert_ok();
+    sandbox.run(&["switch", "out"]).assert_ok();
+    sandbox.run(&["switch", "home"]).assert_ok();
+    sandbox.run(&["switch", "third"]).assert_ok();
+
+    let backups = sandbox
+        .profile_dir("out")
+        .join("backups/.config/quickshell");
+    let generations: Vec<_> = fs::read_dir(&backups)
+        .expect("the backups directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        generations.len() >= 2,
+        "both take-backs are kept: {generations:?}"
+    );
+}
+
+#[test]
+fn a_path_edited_in_place_while_linked_is_preserved_as_edited() {
+    let sandbox = Sandbox::new();
+    round_trip_fixture(&sandbox);
+
+    // The user replaced the symlink with a real directory and put their own
+    // config in it — a legitimate thing to do while a profile is active. What
+    // is preserved must be *their* version, not the profile's stale capture.
+    let live = sandbox.home().join(".config/quickshell/out");
+    let _ = fs::remove_file(&live);
+    fs::create_dir_all(&live).expect("make a real directory");
+    fs::write(live.join("mine.qml"), "user edit\n").expect("write the edit");
+
+    sandbox.run(&["switch", "home"]).assert_ok();
+
+    let preserved = sandbox
+        .profile_dir("out")
+        .join("backups/.config/quickshell/out/mine.qml");
+    assert_eq!(
+        fs::read_to_string(&preserved).unwrap_or_default(),
+        "user edit\n",
+        "the edit is preserved, not the profile's copy"
+    );
+}
