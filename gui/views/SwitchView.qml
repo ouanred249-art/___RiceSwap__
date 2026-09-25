@@ -68,6 +68,7 @@ PanelView {
     // old shell is about to be killed.
     readonly property string planShellStop: planData && planData.shell_change && planData.shell_change.stop ? planData.shell_change.stop : ""
     readonly property string planShellStart: planData && planData.shell_change && planData.shell_change.start ? planData.shell_change.start : ""
+    readonly property var planRemoveProtected: planData && planData.remove_protected ? planData.remove_protected : []
     readonly property var planLink: planData && planData.symlink_changes ? planData.symlink_changes.link : []
     readonly property var planUnlink: planData && planData.symlink_changes ? planData.symlink_changes.unlink : []
 
@@ -421,6 +422,18 @@ PanelView {
                         delegate: Text {
                             text: "−  " + modelData
                             color: view.theme.danger
+                            font.pixelSize: 12
+                            font.family: "monospace"
+                        }
+                    }
+                    // Foundation packages the leaving profile's manifest asked
+                    // to remove. The switch declines them without ever asking
+                    // pacman, so the panel says so rather than hiding it.
+                    Repeater {
+                        model: view.planRemoveProtected
+                        delegate: Text {
+                            text: "=  " + modelData + "   kept (system)"
+                            color: view.theme.muted
                             font.pixelSize: 12
                             font.family: "monospace"
                         }

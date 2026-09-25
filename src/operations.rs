@@ -336,6 +336,15 @@ fn plan(context: &mut Context, target: &str) -> Envelope {
     let classified = classify_blocked_paths(&context.home, &profile_dir, &symlink_link);
     let blocked_paths = blocked_paths_of(&classified);
 
+    // The preview's removal lists are gated against the system-package floor
+    // the same way the switch gates them, so the panel never offers a removal
+    // the switch will decline — and the declined ones are named, because a
+    // silent decline in a preview is a surprise at switch time.
+    let (remove_official, mut protected) = partition_removals(&remove_official);
+    let (remove_aur, aur_protected) = partition_removals(&remove_aur);
+    protected.extend(aur_protected);
+    protected.sort();
+
     let mut envelope = Envelope::ok(json!({
         "target": target,
         "package_diff": {
@@ -351,6 +360,11 @@ fn plan(context: &mut Context, target: &str) -> Envelope {
             "official": missing_from_machine(&install_official),
             "aur": missing_from_machine(&install_aur),
         },
+        // The floor in action: what the diff asked to remove and the switch
+        // will decline to, because removing `glibc` or `coreutils` is not a
+        // package change but a dead machine. Named here so the panel can show
+        // it and the switch report can repeat it.
+        "remove_protected": protected,
         "service_changes": { "stop": services_stop, "start": services_start },
         "shell_change": {
             "stop": shell_stop.map(|shell| shell.name.clone()),
@@ -867,6 +881,28 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
     let install_official = missing_from_machine(&install_official);
     let install_aur = missing_from_machine(&install_aur);
 
+    // Removals are gated against the system-package floor, and it matters far
+    // more than the install gate above. The diff is "packages the leaving
+    // profile had that the arriving one does not", which on two real shells
+    // reads `glibc` as removable and raised a polkit prompt the user answered
+    // correctly — only for pacman to decline the *request*. Installing a present
+    // package is waste; attempting to remove a foundation package is a dead
+    // machine, so it is never even asked for. What the floor withholds is
+    // named here and in the report, so the decline is not silent.
+    let (remove_official, mut protected) = partition_removals(&remove_official);
+    let (remove_aur, aur_protected) = partition_removals(&remove_aur);
+    protected.extend(aur_protected);
+    protected.sort();
+    let mut warnings = Vec::new();
+    if !protected.is_empty() {
+        let note = format!(
+            "kept: {} (system packages are never removed by a switch)",
+            protected.join(", ")
+        );
+        emitter.warning(&note);
+        warnings.push(note);
+    }
+
     let (services_stop, services_start) = if let Some(ref current) = active_manifest {
         compute_service_changes(&current.services, &target_manifest.services)
     } else {
@@ -962,7 +998,6 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
     };
 
     let mut completed_steps = 2;
-    let mut warnings = Vec::new();
     let mut installed = Vec::new();
     let mut removed = Vec::new();
     let mut kept = Vec::new();
@@ -1246,6 +1281,7 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
             "unlinked": unlinked,
             "preserved": preserved,
             "backed_up": backed_up,
+            "protected": protected,
             "services_stopped": services_stopped,
             "services_started": services_started,
             "shell_stopped": shell_stopped,
@@ -1320,6 +1356,86 @@ fn install_packages(
         }
     }
     Ok(output_lines)
+}
+
+/// Packages no switch may remove, whatever the manifests say.
+///
+/// The package diff is manifest-to-manifest: "packages the leaving profile had
+/// that the arriving one does not". It is a statement about two rice configs,
+/// not evidence that a package is expendable. A profile that captured the
+/// machine it was written on carries that machine's foundations in its manifest
+/// — `glibc`, `gcc-libs`, `coreutils`, the init system — because the config
+/// referenced something that needed them, not because the rice installed them.
+/// The moment a *different* profile happens not to list `glibc`, the diff reads
+/// it as something to remove, and `pkexec pacman -R glibc` is not a package
+/// change; it is a dead system. This is exactly what happened on a return
+/// switch between two shells whose manifests disagreed about `glibc`.
+///
+/// `remove_package` already keeps a package pacman refuses ("breaks
+/// dependency"), so on a healthy system pacman would have saved `glibc` from
+/// itself. But a polkit *denial* surfaces as a hard error, not a keep — so the
+/// dialog this profile produced aborted the switch before pacman could refuse.
+/// Declining to even raise the transaction for a foundation package is what
+/// makes the return path safe without a password. The list is the floor, not a
+/// filter one machine can adjust.
+///
+/// The floor holds two kinds. First, the system itself: `glibc`, `bash`,
+/// `pacman` — pacman's own dependency guard would mostly refuse these, but a
+/// guard that answers after a polkit round-trip is a guard that can abort the
+/// switch instead of saving the package. Second, the session RiceSwap runs
+/// inside: `hyprland`, `quickshell`. For these there is no guard to rely on —
+/// nothing declares a pacman-level dependency on the compositor, so
+/// `pacman -R hyprland` succeeds and takes the live desktop, the reload of
+/// step 8, and the panel itself down with it. A rice can only exist on top of
+/// the session, never as a replacement for it.
+const SYSTEM_PACKAGES: &[&str] = &[
+    // The system.
+    "filesystem",
+    "glibc",
+    "gcc-libs",
+    "gcc",
+    "binutils",
+    "coreutils",
+    "bash",
+    "sh",
+    "systemd",
+    "systemd-libs",
+    "systemd-sysvcompat",
+    "dbus",
+    "util-linux",
+    "pacman",
+    "linux",
+    "linux-api-headers",
+    "linux-firmware",
+    "base",
+    "base-devel",
+    // The session.
+    "hyprland",
+    "hyprland-git",
+    "quickshell",
+    "quickshell-git",
+    "quickshell-nightly",
+];
+
+/// Whether `package` is one no profile gets to remove.
+fn is_system_package(package: &str) -> bool {
+    SYSTEM_PACKAGES.contains(&package)
+}
+
+/// Splits `removals` into the ones a switch may act on and the foundation
+/// packages it must not, preserving the caller's order on the act list. The
+/// protected list is what the report names so a decline is never silent.
+fn partition_removals(removals: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut actionable = Vec::new();
+    let mut protected = Vec::new();
+    for package in removals {
+        if is_system_package(package) {
+            protected.push(package.clone());
+        } else {
+            actionable.push(package.clone());
+        }
+    }
+    (actionable, protected)
 }
 
 /// Removes one package with plain `pkexec pacman -R` — never `-Rs`/`-Rdd` —

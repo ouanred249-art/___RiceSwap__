@@ -1520,3 +1520,85 @@ fn a_path_edited_in_place_while_linked_is_preserved_as_edited() {
         "the edit is preserved, not the profile's copy"
     );
 }
+
+/// A leaving profile whose manifest names foundation packages — the exact
+/// shape the real caelestia manifest had, which raised `pkexec pacman -R
+/// glibc` and died on a polkit denial mid-switch.
+fn system_package_fixture(sandbox: &Sandbox) {
+    let alpha = profile_toml(
+        "alpha",
+        &["glibc", "coreutils", "oldbar"],
+        &["gcc-libs"],
+        &[("waybar", "waybar", "pkill waybar")],
+        &[".config/waybar", ".config/hypr"],
+    );
+    fixture_with(sandbox, &alpha);
+}
+
+/// Class: removal safety. The system-package floor is raised before pacman is
+/// ever asked: a switch away from a profile whose manifest lists foundation
+/// packages removes the ordinary ones, keeps the foundation ones without a
+/// transaction, completes all ten steps, and names what it kept.
+#[test]
+fn a_switch_never_raises_a_transaction_for_system_packages() {
+    let sandbox = Sandbox::new();
+    system_package_fixture(&sandbox);
+
+    let run = sandbox.run(&["switch", "beta"]);
+    let data = run.assert_ok();
+
+    assert_eq!(
+        data["completed_steps"],
+        json!(10),
+        "the switch completes instead of dying at a denial: {data}"
+    );
+    assert_eq!(data["report"]["removed"], json!(["oldbar"]));
+    assert_eq!(
+        data["report"]["protected"],
+        json!(["coreutils", "gcc-libs", "glibc"]),
+        "the floor's keeps are named, official and AUR alike"
+    );
+    assert!(
+        run.warnings().iter().any(|warning| warning
+            .contains("glibc")
+            .then(|| warning.contains("coreutils") && warning.contains("gcc-libs"))
+            .unwrap_or(false)),
+        "the decline is warned about, live: {:?}",
+        run.warnings()
+    );
+
+    let log = sandbox.log();
+    for forbidden in ["glibc", "coreutils", "gcc-libs"] {
+        assert!(
+            !log.iter()
+                .any(|line| line.contains("-R") && line.contains(forbidden)),
+            "no removal transaction is ever raised for {forbidden}: {log:?}"
+        );
+    }
+    assert!(
+        log.iter()
+            .any(|line| line.contains("pacman -R --noconfirm oldbar")),
+        "the ordinary removal still happens: {log:?}"
+    );
+}
+
+/// Class: removal safety. The preview gates removals the same way the switch
+/// does, so the panel never offers a `glibc` removal the switch will decline,
+/// and the declined ones are named in the plan for the panel to show.
+#[test]
+fn plan_names_the_removals_the_floor_will_decline() {
+    let sandbox = Sandbox::new();
+    system_package_fixture(&sandbox);
+
+    let data = sandbox.run(&["plan", "beta"]).assert_ok();
+    assert_eq!(
+        data["package_diff"]["remove"],
+        json!({ "official": ["oldbar"], "aur": [] }),
+        "the offered removals exclude the floor: {data}"
+    );
+    assert_eq!(
+        data["remove_protected"],
+        json!(["coreutils", "gcc-libs", "glibc"]),
+        "the declines are named, not hidden"
+    );
+}
