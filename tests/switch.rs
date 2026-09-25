@@ -1325,6 +1325,81 @@ fn a_shell_that_will_not_start_warns_without_failing_the_switch() {
     );
 }
 
+#[test]
+fn a_shell_that_never_exits_does_not_hang_the_switch() {
+    let sandbox = Sandbox::new();
+    fixture(&sandbox);
+    // The real manifests start `qs -c ii` — the desktop itself, which never
+    // exits. A switch that waits for such a start to finish waits forever: it
+    // has already killed the session at step 4, so a hang at step 10 is a dead
+    // desktop and a terminal wedged on one switch line, with no report and no
+    // way back. Beta's shell here is the honest shape of that command: a
+    // process that simply stays alive.
+    sandbox.write_profile(
+        "beta",
+        &common::profile_toml_with_shell(
+            "beta",
+            &["newbar", "shared"],
+            &["newaur"],
+            &[("ags", "ags", "pkill ags")],
+            &[".config/waybar", ".config/kitty"],
+            ("neverends", "sleep 30", "pkill neverends"),
+        ),
+    );
+    sandbox.clear_log();
+
+    let mut child = sandbox.spawn(&["switch", "beta"]);
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (lines_tx, lines_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut buffer = String::new();
+        while reader.read_line(&mut buffer).unwrap_or(0) > 0 {
+            let line = buffer.trim_end().to_string();
+            buffer.clear();
+            if lines_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    // The watchdog the suite lacked: every earlier fixture stub exited
+    // instantly, so `.output()` looked safe in tests and wedged on the real
+    // machine. This switch must close its own envelope in seconds, while the
+    // daemon it started is still sleeping.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut lines: Vec<String> = Vec::new();
+    loop {
+        match lines_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(line) => lines.push(line),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "the switch never finished — it is waiting for a start that never exits. Lines so far: {lines:?}"
+                    );
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let status = child.wait().expect("wait for the switch");
+    assert!(status.success(), "the switch exited {status}");
+    let run = Run::from_parts(lines, String::new());
+    let data = run.envelope();
+    assert_eq!(data["ok"], json!(true), "{}", run.stdout);
+    assert_eq!(
+        data["data"]["completed_steps"],
+        json!(10),
+        "the steps after the daemon start still ran: {}",
+        run.stdout
+    );
+    // Survival through the grace window is reported as started — the desktop
+    // came up and stayed up, which is exactly what happened.
+    assert_eq!(data["data"]["report"]["shell_started"], json!("neverends"));
+}
+
 /// Class: the way back. A path the new profile no longer manages used to be
 /// deleted outright — and on the return leg the old profile's *own* files are
 /// exactly the ones the new profile stopped claiming. Deleting them makes the
@@ -1559,10 +1634,11 @@ fn a_switch_never_raises_a_transaction_for_system_packages() {
         "the floor's keeps are named, official and AUR alike"
     );
     assert!(
-        run.warnings().iter().any(|warning| warning
-            .contains("glibc")
-            .then(|| warning.contains("coreutils") && warning.contains("gcc-libs"))
-            .unwrap_or(false)),
+        run.warnings().iter().any(|warning| {
+            warning.contains("glibc")
+                && warning.contains("coreutils")
+                && warning.contains("gcc-libs")
+        }),
         "the decline is warned about, live: {:?}",
         run.warnings()
     );

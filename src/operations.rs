@@ -32,10 +32,10 @@ use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The tools a package-touching operation depends on.
 const PACKAGE_MANAGERS: &[Tool] = &[Tool::Pacman, Tool::Yay, Tool::Paru];
@@ -1220,17 +1220,14 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
     context.progress(&mut emitter, "starting new services");
     for service in &target_manifest.services {
         if services_start.contains(&service.name) {
-            let output = Command::new("sh").arg("-c").arg(&service.start).output();
-            if let Ok(out) = output {
-                if out.status.success() {
-                    services_started.push(service.name.clone());
-                } else {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    let note = format!(
-                        "service `{}` failed to start: {}",
-                        service.name,
-                        stderr.trim()
-                    );
+            // A service that is still running after the grace window is up —
+            // `qs`, `wl-paste --watch` and friends are daemons that never
+            // exit. Waiting for one is waiting forever, so the switch gives
+            // each start only the window and reads survival as success.
+            match start_daemonized(&service.start) {
+                Ok(()) => services_started.push(service.name.clone()),
+                Err(detail) => {
+                    let note = format!("service `{}` failed to start: {}", service.name, detail);
                     emitter.warning(&note);
                     warnings.push(note);
                 }
@@ -1242,24 +1239,17 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
     // reads the old config and keeps it — the failure this ordering exists to
     // prevent.
     if let Some(shell) = shell_start {
-        let output = Command::new("sh").arg("-c").arg(&shell.start).output();
         // A shell that will not start is a warning, not a failure: the other
         // services, the packages and the links all succeeded, and the config is
         // correct for the next login. Failing the switch here would report a
-        // broken profile for a shell that is merely not up yet.
-        match output {
-            Ok(out) if out.status.success() => shell_started = Some(shell.name.clone()),
-            Ok(out) => {
-                let note = format!(
-                    "shell `{}` failed to start: {}",
-                    shell.name,
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
-                emitter.warning(&note);
-                warnings.push(note);
-            }
-            Err(error) => {
-                let note = format!("shell `{}` failed to start: {error}", shell.name);
+        // broken profile for a shell that is merely not up yet. The start is
+        // daemonised for the same reason the services' are: `qs -c ii` is the
+        // desktop itself, and it never exits — waiting for it to is waiting
+        // for a switch that has already succeeded to never finish.
+        match start_daemonized(&shell.start) {
+            Ok(()) => shell_started = Some(shell.name.clone()),
+            Err(detail) => {
+                let note = format!("shell `{}` failed to start: {detail}", shell.name);
                 emitter.warning(&note);
                 warnings.push(note);
             }
@@ -1471,15 +1461,108 @@ fn run_command(prefix: &[&str], args: &[&str]) -> std::io::Result<Output> {
 /// What a failed transaction said — or how it died when it said nothing — so
 /// every package failure reaches the envelope with a reason.
 fn failure_detail(output: &Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let text = stderr.trim();
-    if !text.is_empty() {
-        return text.to_string();
+    describe_failure(
+        String::from_utf8_lossy(&output.stderr).trim(),
+        output.status,
+    )
+}
+
+/// Why a command that ran and exited badly is reported: its own stderr if it
+/// printed one, else the bare facts of how it died (code or signal), so every
+/// failure reaches the envelope with a reason.
+fn describe_failure(stderr: &str, status: ExitStatus) -> String {
+    if !stderr.is_empty() {
+        return stderr.to_string();
     }
-    match output.status.code() {
+    match status.code() {
         Some(code) => format!("exit code {code}, with no error output"),
         None => "killed by a signal".to_string(),
     }
+}
+
+/// How long a service or shell gets to prove it will not die on its own. A
+/// daemon — `qs -c ii`, `wl-paste --watch` — never exits, so the switch must
+/// not wait for it to; but a start that is *going* to fail almost always
+/// fails within its first moments (no binary, no display, bad config), and
+/// the grace window gives those failures their stderr back instead of
+/// reporting a success the desktop will not show.
+const START_GRACE: Duration = Duration::from_millis(700);
+
+/// Runs one `start` command and reports whether to count it as started, in a
+/// bounded time no matter what the command does.
+///
+/// `sh -c` plus a blocking `.output()` was the old shape, and it hangs:
+/// Quickshell *is* the desktop, it does not exit, and a switch that waits for
+/// the shell to exit waits forever — at step 10, with the session already
+/// killed at step 4. Instead the command runs with a stdout and stdin of
+/// `/dev/null` and its stderr pointed at a capture file, and the child is
+/// watched without blocking for [`START_GRACE`]: an early exit is read as
+/// success or failure with the command's own error text from the file, and a
+/// command still alive when the window closes is a daemon coming up. The file
+/// is then deleted: a surviving daemon keeps writing into the unlinked inode,
+/// which is harmless, where a pipe it inherited would hand it `SIGPIPE` the
+/// moment the switch exited.
+///
+/// The returned `Err` string is the failure's text: the captured stderr when
+/// the command said one, else the bare facts of how it died.
+fn start_daemonized(start: &str) -> Result<(), String> {
+    let capture = std::env::temp_dir().join(format!(
+        "riceswap-start-{}-{:x}.log",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0),
+    ));
+    let quoted = format!("'{}'", capture.display().to_string().replace('\'', r"'\''"));
+    let mut child = match Command::new("sh")
+        .arg("-c")
+        // `exec` replaces the shell with the command, so what the grace window
+        // watches is the daemon itself, not a shell waiting behind it; the
+        // `2>` is applied before the exec and is what makes the daemon's own
+        // error text recoverable. Every descriptor the command would otherwise
+        // inherit is /dev/null or the capture file — nothing it holds open can
+        // keep the switch's stdout reader waiting after the switch has exited.
+        .arg(format!("exec {start} 2>{quoted}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => return Err(format!("cannot run `{start}`: {error}")),
+    };
+
+    // `try_wait` never blocks, so the window is polled to its deadline; a
+    // process that exits on its own is seen on the very next poll.
+    let deadline = Instant::now() + START_GRACE;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = std::fs::remove_file(&capture);
+                return Err(format!("cannot watch `{start}`: {error}"));
+            }
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+
+    let outcome = match status {
+        // Still running at the deadline: a daemon is up. Already exited 0:
+        // a one-shot service did its job. Either way, started.
+        None => Ok(()),
+        Some(exit) if exit.success() => Ok(()),
+        Some(exit) => {
+            let stderr = std::fs::read_to_string(&capture).unwrap_or_default();
+            Err(describe_failure(stderr.trim(), exit))
+        }
+    };
+    let _ = std::fs::remove_file(&capture);
+    outcome
 }
 
 /// The non-empty lines a transaction printed — the AUR helper's output that
