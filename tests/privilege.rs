@@ -61,13 +61,8 @@ fn official_package_ops_run_through_pkexec_pacman() {
         sandbox.log()
     );
     assert!(
-        log_has(&sandbox, "pkexec pacman -R --noconfirm oldbar"),
-        "removals are escalated too: {:?}",
-        sandbox.log()
-    );
-    assert!(
-        log_has(&sandbox, "pkexec pacman -R --noconfirm oldaur"),
-        "AUR packages are still removed with plain pacman -R under pkexec: {:?}",
+        log_has(&sandbox, "pkexec pacman -R --noconfirm oldbar oldaur"),
+        "removals are batched into one escalated transaction: {:?}",
         sandbox.log()
     );
     // The wrapper really ran pacman: the underlying command is in the log.

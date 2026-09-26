@@ -268,15 +268,14 @@ fn switch_runs_the_locked_sequence_in_order() {
         [
             "pacman -S --noconfirm newbar",
             "yay -S --noconfirm newaur",
-            "pacman -R --noconfirm oldbar",
-            "pacman -R --noconfirm oldaur",
+            "pacman -R --noconfirm oldbar oldaur",
             "pkill waybar",
             "hyprctl reload",
             "ags",
         ],
-        "the locked sequence: install-first and plain -R while the old desktop \
-         can still authenticate, then stop A's services, hyprctl reload, start \
-         B's services"
+        "the locked sequence: batched installs, one batched plain -R while the \
+         old desktop can still authenticate, then stop A's services, hyprctl \
+         reload, start B's services"
     );
     assert!(
         sandbox
@@ -1096,10 +1095,9 @@ fn warnings_stream_inline_as_they_arrive_and_still_close_the_envelope() {
 
 /// Class: package scope. A first switch has no active profile, so the
 /// manifest-to-manifest diff reports every declared package as an install.
-/// Installing the ones the machine already has is not merely wasted: each
-/// `pkexec pacman -S` is its own polkit prompt, so a profile declaring 22
-/// present packages asks for the password 22 times and the switch ends looking
-/// like a credential failure. The machine is the other half of the question.
+/// Installing the ones the machine already has is not merely wasted: a
+/// 22-package batch that is already on disk is a doomed transaction and wasted
+/// work. The machine is the other half of the question.
 #[test]
 fn a_first_switch_installs_only_the_packages_the_machine_lacks() {
     let sandbox = Sandbox::new();
@@ -1730,5 +1728,91 @@ fn plan_names_the_removals_the_floor_will_decline() {
         data["remove_protected"],
         json!(["coreutils", "gcc-libs", "glibc"]),
         "the declines are named, not hidden"
+    );
+}
+
+/// Two absent packages against no active profile: one transaction for both.
+#[test]
+fn several_missing_official_packages_install_in_one_transaction() {
+    let sandbox = Sandbox::new();
+    fixture(&sandbox);
+    // Two beta official packages absent, one shared present — so only two
+    // install. No active profile, so the raw diff is "every beta official
+    // package", trimmed by the machine to what is actually missing.
+    let _ = fs::remove_file(sandbox.data_dir().join("current"));
+    sandbox.write_profile(
+        "beta",
+        &profile_toml(
+            "beta",
+            &["newbar", "extrabar", "shared"],
+            &["newaur"],
+            &[("ags", "ags", "pkill ags")],
+            &[".config/kitty"],
+        ),
+    );
+    sandbox.mark_installed("shared");
+    sandbox.mark_installed("newaur");
+    sandbox.clear_log();
+
+    let data = sandbox.run(&["switch", "beta"]).assert_ok();
+
+    assert_eq!(data["completed_steps"], json!(10));
+    assert!(
+        data["report"]["installed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "newbar")
+            && data["report"]["installed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "extrabar"),
+        "both missing packages are reported installed: {}",
+        data["report"]["installed"]
+    );
+    let installs: Vec<_> = locked_commands(&sandbox)
+        .into_iter()
+        .filter(|line| line.contains("-S --noconfirm") && line.contains("newbar"))
+        .collect();
+    assert_eq!(
+        installs.len(),
+        1,
+        "one batch for the two-package install, not two prompts: {installs:?}"
+    );
+    assert!(
+        installs[0].contains("extrabar"),
+        "the batch names both packages: {}",
+        installs[0]
+    );
+}
+
+/// Several removable packages go in one transaction, not one per package.
+#[test]
+fn several_removals_run_in_one_transaction() {
+    let sandbox = Sandbox::new();
+    fixture(&sandbox);
+    sandbox.clear_log();
+
+    let run = sandbox.run(&["switch", "beta"]);
+    let data = run.assert_ok();
+
+    assert_eq!(data["completed_steps"], json!(10));
+    assert_eq!(data["report"]["removed"], json!(["oldbar", "oldaur"]));
+    assert!(run.warnings().is_empty(), "{:?}", run.warnings());
+
+    let removes: Vec<_> = locked_commands(&sandbox)
+        .into_iter()
+        .filter(|line| line.contains("-R --noconfirm"))
+        .collect();
+    assert_eq!(
+        removes.len(),
+        1,
+        "one batch for the two-package removal, not two prompts: {removes:?}"
+    );
+    assert!(
+        removes[0].contains("oldbar") && removes[0].contains("oldaur"),
+        "the batch names both packages: {}",
+        removes[0]
     );
 }

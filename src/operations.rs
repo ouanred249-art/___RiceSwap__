@@ -882,19 +882,20 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
         };
     // The diff above is manifest-to-manifest, so with no active profile it
     // reports every declared package as an install — including the ones the
-    // machine already has. Installing those anyway is not merely wasteful: each
-    // `pkexec pacman -S` is its own polkit prompt, so a profile declaring 22
-    // present packages asks for the password 22 times and the switch dies
-    // looking like a credential failure. The machine is the other half of the
-    // question, and `plan` already asks it — the switch asks it too.
+    // machine already has. Installing those anyway is not merely wasteful: a
+    // 22-package batch that is already on disk is a doomed transaction and
+    // wasted work, and if the batch were absent, one's follow-up for the whole
+    // run. The machine is the other half of the question, and `plan` already
+    // asks it — the switch asks it too.
     let install_official = missing_from_machine(&install_official);
     let install_aur = missing_from_machine(&install_aur);
 
     // Removals are gated against the system-package floor, and it matters far
     // more than the install gate above. The diff is "packages the leaving
     // profile had that the arriving one does not", which on two real shells
-    // reads `glibc` as removable and raised a polkit prompt the user answered
-    // correctly — only for pacman to decline the *request*. Installing a present
+    // reads `glibc` as removable and raised one polkit prompt for the whole
+    // batch — a refusal over a single foundation package that would have held
+    // *every* removal with it if the batch had run. Installing a present
     // package is waste; attempting to remove a foundation package is a dead
     // machine, so it is never even asked for. What the floor withholds is
     // named here and in the report, so the decline is not silent.
@@ -1062,31 +1063,25 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
         }
     }
 
-    // Remove A-unique packages (plain -R, never -Rs/-Rdd). A removal that
-    // pacman declines — still needed, or a refusal of any kind — keeps the
-    // package and warns; it never aborts. A package left installed beside a
-    // finished switch is trivia; a switch that aborts on the way through is a
-    // desktop stranded mid-change.
-    for package in remove_official.iter().chain(&remove_aur) {
-        if conflict_removed.contains(package) {
-            continue; // Already removed during conflict resolution
-        }
-        match remove_package(package) {
-            Ok(true) => removed.push(package.clone()),
-            Ok(false) => {
-                kept.push(package.clone());
-                let note = format!("kept: {package} (still needed)");
-                emitter.warning(&note);
-                warnings.push(note);
-            }
-            Err(error) => {
-                kept.push(package.clone());
-                let note = format!("kept: {package} (removal declined: {error})");
-                emitter.warning(&note);
-                warnings.push(note);
-            }
-        }
-    }
+    // Remove A-unique packages in one batched transaction (plain -R, never
+    // -Rs/-Rdd) — one prompt for the whole removal phase, same reasoning as
+    // the batched install above. A removal that pacman declines — still
+    // needed, or a refusal of any kind — keeps the package and warns; it
+    // never aborts. A package left installed beside a finished switch is
+    // trivia; a switch that aborts on the way through is a desktop stranded
+    // mid-change.
+    let pending_removals: Vec<&String> = remove_official
+        .iter()
+        .chain(&remove_aur)
+        .filter(|package| !conflict_removed.contains(package)) // Already removed during conflict resolution
+        .collect();
+    remove_packages(
+        &pending_removals,
+        &mut emitter,
+        &mut kept,
+        &mut removed,
+        &mut warnings,
+    );
     completed_steps += 1;
 
     if cancelled.load(Ordering::Relaxed) {
@@ -1310,20 +1305,120 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
     envelope
 }
 
-/// Installs a batch of packages with `prefix -S --noconfirm <pkg>` — the
-/// prefix being the privilege path: `pkexec pacman` for official packages,
-/// the floating-terminal wrapper naming the AUR helper for AUR ones — handling
-/// the install-first conflict fallback: when the installer reports a conflict
-/// against a package still in the A-set, that conflicting A-package is removed
-/// with plain `pkexec pacman -R` first and the install retried — exactly the
-/// spec's locked sequence.
+/// Installs every package of one class — official or AUR — in a *single*
+/// transaction: `prefix -S --noconfirm pkg1 pkg2 …`, the prefix being the
+/// privilege path (`pkexec pacman` for official packages, the
+/// floating-terminal wrapper naming the AUR helper for AUR ones). One
+/// transaction is the point: every `pkexec` is its own polkit prompt, so a
+/// per-package loop asked the user for the password once per package — a
+/// switch costing ten. Batched, the whole install phase costs one.
+///
+/// The batch is an optimisation, not a bet: any outcome the batch cannot
+/// explain falls back to [`install_packages_one_by_one`], which preserves the
+/// old per-package behaviour — including the install-first conflict dance
+/// where the installer reports a conflict (exit 2) against a package still in
+/// the A-set: that conflicting package is removed with plain `-R` *on the
+/// same privilege path as the install* (pkexec for official, the wrapper's
+/// helper for AUR) and the transaction retried.
 ///
 /// Returns the stdout the transactions printed — the AUR helper's output the
-/// switch report carries. A polkit denial, a dead wrapper, or any refusal that
-/// is not the declared-conflict dance is an error naming the actor, the
-/// package, and what the transaction said: the failure model's "stop package
+/// switch report carries. A polkit denial, a dead wrapper, or any refusal the
+/// per-package fallback cannot resolve is an error naming the actor, the
+/// packages, and what the transaction said: the failure model's "stop package
 /// ops, report".
 fn install_packages(
+    prefix: &[&str],
+    actor: &str,
+    packages: &[String],
+    installed: &mut Vec<String>,
+    removed: &mut Vec<String>,
+    conflict_removed: &mut Vec<String>,
+) -> Result<Vec<String>, String> {
+    if packages.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args: Vec<&str> = vec!["-S", "--noconfirm"];
+    args.extend(packages.iter().map(String::as_str));
+    let output =
+        run_command(prefix, &args).map_err(|error| format!("cannot run {actor}: {error}"))?;
+    if output.status.code() == Some(2) {
+        // Conflict detected on the batch: name the culprit from its stderr,
+        // remove it — pacman is the removal authority either way, so plain
+        // `pkexec pacman -R`, never the helper — and retry the batch once.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let Some(conflicting) = extract_conflicting_package(&stderr) else {
+            // No culprit named — the batch says nothing a per-package run
+            // could not attribute better.
+            return install_packages_one_by_one(
+                prefix,
+                actor,
+                packages,
+                installed,
+                removed,
+                conflict_removed,
+            );
+        };
+        // Best-effort: if the removal cannot happen, the retry below reports
+        // the conflict that is still standing.
+        let _ = run_command(OFFICIAL, &["-R", "--noconfirm", &conflicting]);
+        conflict_removed.push(conflicting.clone());
+        removed.push(conflicting);
+        let retry =
+            run_command(prefix, &args).map_err(|error| format!("cannot run {actor}: {error}"))?;
+        if retry.status.success() {
+            installed.extend(packages.iter().cloned());
+            return Ok(stdout_lines(&retry.stdout));
+        }
+        // The retry failed for a reason the batch cannot attribute; the
+        // per-package fallback names the package that breaks.
+        return install_packages_one_by_one(
+            prefix,
+            actor,
+            packages,
+            installed,
+            removed,
+            conflict_removed,
+        );
+    }
+    if output.status.success() {
+        installed.extend(packages.iter().cloned());
+        return Ok(stdout_lines(&output.stdout));
+    }
+    // A declined authentication is one verdict the user gave deliberately;
+    // re-asking per package would pester them for the answer they already
+    // said no to. Report the refusal, naming the batch.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("Not authorized") {
+        return Err(format!(
+            "{actor} failed to install `{}`: {}",
+            packages.join(", "),
+            failure_detail(&output)
+        ));
+    }
+    // Any other batch failure may have left part of the transaction
+    // installed. The machine knows what actually landed — a read-only query,
+    // no prompt — and the fallback continues with only what is still missing,
+    // never re-running a package that already succeeded.
+    let still_missing = missing_from_machine(packages);
+    if still_missing.is_empty() {
+        return Ok(Vec::new());
+    }
+    install_packages_one_by_one(
+        prefix,
+        actor,
+        &still_missing,
+        installed,
+        removed,
+        conflict_removed,
+    )
+}
+
+/// The original per-package install loop, kept as the fallback that makes the
+/// batch safe: it attributes a failure to exactly one package and re-runs the
+/// conflict dance per package. `install_packages` only reaches it for what
+/// the machine says is still missing, so a package a failed batch already
+/// installed is never offered twice.
+fn install_packages_one_by_one(
     prefix: &[&str],
     actor: &str,
     packages: &[String],
@@ -1452,6 +1547,77 @@ fn partition_removals(removals: &[String]) -> (Vec<String>, Vec<String>) {
         }
     }
     (actionable, protected)
+}
+
+/// Removes the pending packages in one batched `pkexec pacman -R --noconfirm`
+/// transaction — one polkit prompt for the whole removal phase, where the
+/// old per-package loop cost one each. The batch is an optimisation, not a
+/// bet, and removals can never abort the switch (see [`remove_package`] for
+/// why):
+///
+/// - success: every package is gone, every package is reported removed;
+/// - a dependency refusal (one package is still needed by something the
+///   batch cannot see around): pacman refuses the *whole* transaction, so the
+///   outcome falls back to [`remove_package`]'s per-package loop, which keeps
+///   precisely the still-needed ones and removes the rest;
+/// - any other failure (a polkit denial, a dead wrapper): every package is
+///   kept with its own warning — the same per-package `kept:` notes the loop
+///   produced, just attributed to one declined transaction.
+fn remove_packages(
+    packages: &[&String],
+    emitter: &mut Emitter,
+    kept: &mut Vec<String>,
+    removed: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    if packages.is_empty() {
+        return;
+    }
+    let mut args: Vec<&str> = vec!["-R", "--noconfirm"];
+    args.extend(packages.iter().map(|package| package.as_str()));
+    let declined = match run_command(OFFICIAL, &args) {
+        Err(error) => Some(format!("cannot run pkexec pacman: {error}")),
+        Ok(output) if output.status.success() => {
+            removed.extend(packages.iter().map(|package| (*package).clone()));
+            return;
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("breaks dependency")
+                || stderr.contains("could not satisfy dependencies")
+            {
+                // One still-needed package holds the whole batch; per-package
+                // retries keep just that one and free the rest.
+                for package in packages {
+                    match remove_package(package) {
+                        Ok(true) => removed.push((*package).clone()),
+                        Ok(false) => {
+                            kept.push((*package).clone());
+                            let note = format!("kept: {package} (still needed)");
+                            emitter.warning(&note);
+                            warnings.push(note);
+                        }
+                        Err(error) => {
+                            kept.push((*package).clone());
+                            let note = format!("kept: {package} (removal declined: {error})");
+                            emitter.warning(&note);
+                            warnings.push(note);
+                        }
+                    }
+                }
+                return;
+            }
+            Some(failure_detail(&output))
+        }
+    };
+    // A declined batch is one verdict for every package it named.
+    let error = declined.expect("the non-success paths above return or set a reason");
+    for package in packages {
+        kept.push((*package).clone());
+        let note = format!("kept: {package} (removal declined: {error})");
+        emitter.warning(&note);
+        warnings.push(note);
+    }
 }
 
 /// Removes one package with plain `pkexec pacman -R` — never `-Rs`/`-Rdd` —
