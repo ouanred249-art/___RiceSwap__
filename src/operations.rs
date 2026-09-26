@@ -826,12 +826,21 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 
 /// The switch sequence's heart: verify the target, compute the plan, check for
 /// blocked paths and — when the plan installs AUR packages — a usable AUR
-/// helper, then run the fixed idempotent sequence: flip `current` → stop A's
-/// services → flip symlinks → install-first package ops (official via
-/// `pkexec pacman`, AUR via the detected helper inside the floating-terminal
-/// wrapper; on conflict remove the conflicting A-package and retry; then
-/// remove A-unique with plain `pkexec pacman -R`, logging "kept" when
-/// refused) → `hyprctl reload` → start B's services (failure = warning).
+/// helper, then run the fixed idempotent sequence: install-first package ops
+/// (official via `pkexec pacman`, AUR via the detected helper inside the
+/// floating-terminal wrapper; on conflict remove the conflicting A-package and
+/// retry; then remove A-unique with plain `pkexec pacman -R`, logging "kept"
+/// when refused) → flip `current` → stop A's services → flip symlinks →
+/// `hyprctl reload` → start B's services (failure = warning).
+///
+/// The package ops run before anything is touched, and the order is load-
+/// bearing, not cosmetic: the shell being switched away from hosts the polkit
+/// agent that renders the `pkexec` prompts (and the compositor the AUR
+/// terminal needs). Stop it first and every later authentication can only
+/// answer "Not authorized" — which is exactly how one switch aborted with a
+/// bare desktop. A declined removal is a kept package and a warning: a stray
+/// package is not a broken desktop, and nothing may abort the switch after
+/// the old shell is down.
 /// Failures produce `ok: false` with `completed_steps` + `resume_hint`.
 /// SIGTERM cancels at the next step boundary.
 ///
@@ -1011,7 +1020,88 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
     let mut shell_started = None;
     let mut reloaded = false;
 
-    // Step 3: flip `current` symlink
+    // Steps 3-4: install-first package ops — official through `pkexec pacman`,
+    // AUR through the detected helper inside the floating-terminal wrapper.
+    // They run here, while `current` still points at A and A's desktop (and
+    // with it the polkit agent that answers the prompts, and the compositor the
+    // AUR terminal needs) is still up. This is the whole reason the package
+    // steps lead: an authentication request raised after the shell is stopped
+    // has no agent left to render it and can only be denied.
+    context.progress(&mut emitter, "applying package changes");
+
+    // Install official packages. A refused or failed install is still fatal —
+    // but it is fatal before anything has been touched, so the switch that
+    // cannot get its packages simply stops and leaves the live desktop alone.
+    if let Err(error) = install_packages(
+        OFFICIAL,
+        "pkexec pacman",
+        &install_official,
+        &mut installed,
+        &mut removed,
+        &mut conflict_removed,
+    ) {
+        return package_failure(target, completed_steps, warnings, error);
+    }
+    completed_steps += 1;
+
+    // Install AUR packages — the helper was pinned or detected pre-flight.
+    let mut aur_output = Vec::new();
+    if let Some(helper) = &aur_helper {
+        let actor = format!("the AUR helper `{helper}` in the floating terminal");
+        let prefix = [Tool::FloatTerminal.name(), helper.as_str()];
+        match install_packages(
+            &prefix,
+            &actor,
+            &install_aur,
+            &mut installed,
+            &mut removed,
+            &mut conflict_removed,
+        ) {
+            Err(error) => return package_failure(target, completed_steps, warnings, error),
+            Ok(lines) => aur_output = lines,
+        }
+    }
+
+    // Remove A-unique packages (plain -R, never -Rs/-Rdd). A removal that
+    // pacman declines — still needed, or a refusal of any kind — keeps the
+    // package and warns; it never aborts. A package left installed beside a
+    // finished switch is trivia; a switch that aborts on the way through is a
+    // desktop stranded mid-change.
+    for package in remove_official.iter().chain(&remove_aur) {
+        if conflict_removed.contains(package) {
+            continue; // Already removed during conflict resolution
+        }
+        match remove_package(package) {
+            Ok(true) => removed.push(package.clone()),
+            Ok(false) => {
+                kept.push(package.clone());
+                let note = format!("kept: {package} (still needed)");
+                emitter.warning(&note);
+                warnings.push(note);
+            }
+            Err(error) => {
+                kept.push(package.clone());
+                let note = format!("kept: {package} (removal declined: {error})");
+                emitter.warning(&note);
+                warnings.push(note);
+            }
+        }
+    }
+    completed_steps += 1;
+
+    if cancelled.load(Ordering::Relaxed) {
+        return Envelope {
+            ok: false,
+            data: json!({
+                "error": "operation cancelled",
+                "completed_steps": completed_steps,
+                "resume_hint": format!("switch to `{target}` to restore"),
+            }),
+            warnings,
+        };
+    }
+
+    // Step 5: flip `current` symlink
     context.progress(&mut emitter, &format!("activating profile `{target}`"));
     if let Err(error) = context.store.flip(target) {
         return Envelope {
@@ -1038,7 +1128,10 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
         };
     }
 
-    // Step 4: stop A's services
+    // Step 6: stop A's services. The shell stops here too — and this is the
+    // point after which no authentication can be asked for, because the agent
+    // that answers dies with it. Everything before it was raised while the old
+    // desktop was still up.
     context.progress(&mut emitter, "stopping old services");
     if let Some(ref current) = active_manifest {
         for service in &current.services {
@@ -1070,7 +1163,7 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
         };
     }
 
-    // Step 5: flip symlinks
+    // Step 7: flip symlinks
     context.progress(&mut emitter, "linking managed config paths");
     // A path the old profile managed and the new one does not used to be
     // deleted. That is the one place the switch could still lose data: the
@@ -1116,73 +1209,6 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
         linked.push(relative.clone());
     }
     completed_steps += 1;
-
-    if cancelled.load(Ordering::Relaxed) {
-        return Envelope {
-            ok: false,
-            data: json!({
-                "error": "operation cancelled",
-                "completed_steps": completed_steps,
-                "resume_hint": format!("switch to `{target}` to restore"),
-            }),
-            warnings,
-        };
-    }
-
-    // Step 6-7: install-first package ops — official through `pkexec pacman`,
-    // AUR through the detected helper inside the floating-terminal wrapper.
-    context.progress(&mut emitter, "applying package changes");
-
-    // Install official packages
-    if let Err(error) = install_packages(
-        OFFICIAL,
-        "pkexec pacman",
-        &install_official,
-        &mut installed,
-        &mut removed,
-        &mut conflict_removed,
-    ) {
-        return package_failure(target, completed_steps, warnings, error);
-    }
-
-    // Install AUR packages — the helper was pinned or detected pre-flight.
-    let mut aur_output = Vec::new();
-    if let Some(helper) = &aur_helper {
-        let actor = format!("the AUR helper `{helper}` in the floating terminal");
-        let prefix = [Tool::FloatTerminal.name(), helper.as_str()];
-        match install_packages(
-            &prefix,
-            &actor,
-            &install_aur,
-            &mut installed,
-            &mut removed,
-            &mut conflict_removed,
-        ) {
-            Err(error) => return package_failure(target, completed_steps, warnings, error),
-            Ok(lines) => aur_output = lines,
-        }
-    }
-
-    // Remove A-unique packages (plain -R, never -Rs/-Rdd)
-    for package in remove_official.iter().chain(&remove_aur) {
-        if conflict_removed.contains(package) {
-            continue; // Already removed during conflict resolution
-        }
-        match remove_package(package) {
-            Ok(true) => removed.push(package.clone()),
-            // "still needed" refusal: kept, warned, the switch goes on.
-            Ok(false) => {
-                kept.push(package.clone());
-                let note = format!("kept: {package} (still needed)");
-                emitter.warning(&note);
-                warnings.push(note);
-            }
-            // A polkit denial or dead wrapper on the removal: stop the
-            // package ops and report, per the failure model.
-            Err(error) => return package_failure(target, completed_steps, warnings, error),
-        }
-    }
-    completed_steps += 2;
 
     if cancelled.load(Ordering::Relaxed) {
         return Envelope {

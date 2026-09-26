@@ -109,12 +109,16 @@ PanelView {
     //
     //   1 verify the target profile
     //   2 compute the switch plan
-    //   3 activate the profile (flip `current`)
-    //   4 stop the old services
-    //   5 link the managed config paths
-    //   6 apply the package changes (install-first, then remove)
+    //   3 apply the package changes (install-first, then remove)
+    //   4 activate the profile (flip `current`)
+    //   5 stop the old services
+    //   6 link the managed config paths
     //   7 reload Hyprland
     //   8 start the new services
+    //
+    // The package changes come before the flip on purpose: pkexec prompts are
+    // answered by the polkit agent running inside the old shell's desktop, so
+    // asking for them after the shell is stopped guarantees a denial.
     //
     // The GUI pre-runs steps 1–2 as the separate `plan` operation, so the
     // list starts at step 3; live progress lines map onto it directly.
@@ -122,10 +126,10 @@ PanelView {
     readonly property var switchSteps: [
         "Verify the target profile",
         "Compute the switch plan",
+        "Apply package changes",
         "Activate the profile",
         "Stop old services",
         "Link managed config paths",
-        "Apply package changes",
         "Reload Hyprland",
         "Start new services"
     ]

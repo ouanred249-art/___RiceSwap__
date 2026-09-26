@@ -218,10 +218,13 @@ fn plan_between_fixture_profiles_reports_the_diff_and_blocked_paths() {
 }
 
 /// Class: the switch sequence. Against stubbed pacman the switch executes the
-/// locked order — stop A's services, install B while A's packages are still
-/// present, remove A-unique with plain `pacman -R`, reload Hyprland, start
-/// B's services — verified through the stub log, and the report names what
-/// happened.
+/// locked order — install B while A's packages are still present, remove
+/// A-unique with plain `pacman -R`, only then stop A's services, flip
+/// symlinks, reload Hyprland, start B's services — verified through the stub
+/// log, and the report names what happened. The package ops lead because they
+/// authenticate through the still-running old desktop: its polkit agent is
+/// what answers a `pkexec` prompt, and a switch that stopped the shell first
+/// can only be denied.
 #[test]
 fn switch_runs_the_locked_sequence_in_order() {
     let sandbox = Sandbox::new();
@@ -263,16 +266,17 @@ fn switch_runs_the_locked_sequence_in_order() {
     assert_eq!(
         sequence,
         [
-            "pkill waybar",
             "pacman -S --noconfirm newbar",
             "yay -S --noconfirm newaur",
             "pacman -R --noconfirm oldbar",
             "pacman -R --noconfirm oldaur",
+            "pkill waybar",
             "hyprctl reload",
             "ags",
         ],
-        "the locked sequence: stop A's services, install-first, plain -R, \
-         hyprctl reload, start B's services"
+        "the locked sequence: install-first and plain -R while the old desktop \
+         can still authenticate, then stop A's services, hyprctl reload, start \
+         B's services"
     );
     assert!(
         sandbox
@@ -613,6 +617,46 @@ fn a_declared_package_conflict_removes_the_conflicting_package_and_retries() {
     assert_eq!(sandbox.state()["active_profile"], json!("beta"));
 }
 
+/// Class: a declined removal is trivia, not a verdict. A removal that fails
+/// outright — the shape a polkit denial has, and exactly how one real switch
+/// aborted with a bare desktop — keeps the package, warns, and the switch
+/// finishes all ten steps with the new desktop up. A stray installed package
+/// must never cost the user their shell.
+#[test]
+fn a_denied_removal_is_kept_and_the_switch_finishes() {
+    let sandbox = Sandbox::new();
+    fixture(&sandbox);
+    // Only removals through pkexec fail; installs authenticate fine.
+    sandbox.fail_on("pkexec", "-R");
+    sandbox.clear_log();
+
+    let run = sandbox.run(&["switch", "beta"]);
+    let data = run.assert_ok();
+
+    assert_eq!(data["completed_steps"], json!(10));
+    assert_eq!(
+        data["report"]["kept"],
+        json!(["oldbar", "oldaur"]),
+        "a package pacman would not remove is reported as kept"
+    );
+    assert_eq!(data["report"]["removed"], json!([]));
+    assert!(
+        run.warnings()
+            .iter()
+            .all(|warning| warning.contains("kept:")),
+        "the decline surfaces as kept-warnings, never an abort: {:?}",
+        run.warnings()
+    );
+    assert!(
+        sandbox.log_contains("hyprctl reload"),
+        "the switch went on to finish the desktop: {:?}",
+        sandbox.log()
+    );
+    assert_eq!(data["report"]["shell_started"], json!(null));
+    assert_eq!(data["report"]["services_started"], json!(["ags"]));
+    assert_eq!(sandbox.current_target(), Some(sandbox.profile_dir("beta")));
+}
+
 /// Class: kept packages. A "still needed" refusal is logged as kept, the
 /// switch continues, and removals never use `-Rs`/`-Rdd`.
 #[test]
@@ -798,8 +842,9 @@ fn sigterm_stops_at_the_next_step_boundary_and_a_reshwitch_recovers() {
     let data = &envelope["data"];
     assert_eq!(
         data["completed_steps"],
-        json!(7),
-        "steps 1-7 finished; nothing after the package step ran: {data}"
+        json!(4),
+        "verify, plan and both package steps finished; the switch stopped \
+         before the flip and touched nothing else: {data}"
     );
     assert_eq!(data["resume_hint"], json!("switch to `beta` to restore"));
     assert!(
@@ -819,12 +864,21 @@ fn sigterm_stops_at_the_next_step_boundary_and_a_reshwitch_recovers() {
         "the package step finished its removals: {log:?}"
     );
     assert!(
+        !log.iter().any(|line| line.contains("pkill waybar")),
+        "the cancellation came before the flip, so nothing was stopped: {log:?}"
+    );
+    assert!(
         !sandbox.log_contains("hyprctl reload"),
         "no step starts after cancellation: {log:?}"
     );
     assert!(
         !log.iter().any(|line| line.trim_end() == "ags"),
         "services are not started after cancellation: {log:?}"
+    );
+    assert_eq!(
+        sandbox.current_target(),
+        Some(sandbox.profile_dir("alpha")),
+        "cancelling after the package steps leaves `current` on the old profile"
     );
 
     // Re-switch is the recovery: the same switch completes the sequence.
@@ -987,7 +1041,7 @@ fn warnings_stream_inline_as_they_arrive_and_still_close_the_envelope() {
     assert_eq!(streamed[0]["operation"], json!("switch"));
     assert_eq!(
         streamed[0]["step"],
-        json!(6),
+        json!(3),
         "the kept note arrives on the package step: {streamed:?}"
     );
     assert!(

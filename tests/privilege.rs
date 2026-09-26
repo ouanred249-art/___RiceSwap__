@@ -113,17 +113,20 @@ fn a_polkit_denial_surfaces_as_a_clean_failed_envelope() {
     );
     assert_eq!(
         envelope["data"]["completed_steps"],
-        json!(5),
-        "verify, plan, flip, stop, link completed; the package step did not"
+        json!(2),
+        "verify and plan completed; the switch died at the package step, \
+         before the flip"
     );
     assert_eq!(
         envelope["data"]["resume_hint"],
         json!("switch to `beta` to restore")
     );
 
-    // The failure model: configs already point at B; nothing rolls back.
-    assert_eq!(sandbox.current_target(), Some(sandbox.profile_dir("beta")));
-    assert_eq!(sandbox.state()["active_profile"], json!("beta"));
+    // The failure model, package-first: a denied install stops the switch
+    // while `current` still points at A and the live desktop is untouched —
+    // nothing to roll back because nothing was reached.
+    assert_eq!(sandbox.current_target(), Some(sandbox.profile_dir("alpha")));
+    assert_eq!(sandbox.state()["active_profile"], json!("alpha"));
     assert_eq!(
         sandbox.state()["last_result"]["ok"],
         json!(false),
@@ -318,7 +321,11 @@ fn aur_helper_errors_flow_into_the_switch_report() {
         error.contains("scripted failure"),
         "the helper's own stderr reaches the envelope: {error}"
     );
-    assert_eq!(envelope["data"]["completed_steps"], json!(5));
+    assert_eq!(
+        envelope["data"]["completed_steps"],
+        json!(3),
+        "official installs finished before the helper failed"
+    );
     assert_eq!(
         envelope["data"]["resume_hint"],
         json!("switch to `beta` to restore")

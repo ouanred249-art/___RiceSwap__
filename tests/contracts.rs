@@ -176,10 +176,10 @@ fn switch_streams_the_step_messages_the_panel_renders() {
         [
             "verifying profile `demo`",
             "computing the switch plan",
+            "applying package changes",
             "activating profile `demo`",
             "stopping old services",
             "linking managed config paths",
-            "applying package changes",
             "reloading Hyprland",
             "starting new services",
         ],
@@ -219,8 +219,8 @@ fn state_json_names_the_running_switch_and_its_step_while_it_runs() {
     assert_eq!(operation["target"], json!("demo"));
     assert_eq!(
         operation["step"],
-        json!(6),
-        "the sixth streamed step — the package step — is the visible one"
+        json!(3),
+        "the third streamed step — the package step — is the visible one"
     );
     assert!(
         operation["started_at"].as_u64().is_some_and(|at| at > 0),
