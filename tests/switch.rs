@@ -254,13 +254,14 @@ fn switch_runs_the_locked_sequence_in_order() {
     let sequence: Vec<String> = locked_commands(&sandbox)
         .into_iter()
         .filter(|line| {
-            // `pacman -Qq` is the read-only "what is already installed" query
-            // that sizes the install list; like the probes it is not part of
-            // the locked sequence.
+            // `pacman -Qq` (what is already installed) and `pacman -Qi`
+            // (still-needed pre-filter) are read-only queries; like the probes
+            // they are not part of the locked sequence.
             !(line.ends_with("--version")
                 || line.ends_with("-h")
                 || line.ends_with(" version")
-                || line == "pacman -Qq")
+                || line == "pacman -Qq"
+                || line.starts_with("pacman -Qi "))
         })
         .collect();
     assert_eq!(
@@ -1814,5 +1815,94 @@ fn several_removals_run_in_one_transaction() {
         removes[0].contains("oldbar") && removes[0].contains("oldaur"),
         "the batch names both packages: {}",
         removes[0]
+    );
+}
+
+/// A leaving profile whose removals are *all* still needed by the machine —
+/// the shape of the real caelestia manifest, where ~twenty packages each had
+/// a dependent. The old code raised one `pkexec` per package after the batch
+/// died on the first refusal: twenty password prompts for a switch. The
+/// `pacman -Qi` pre-filter must keep every one of them without raising a
+/// removal transaction at all.
+#[test]
+fn every_removal_still_needed_raises_no_transaction() {
+    let sandbox = Sandbox::new();
+    let alpha = profile_toml(
+        "alpha",
+        &[
+            "oldbar",
+            "oldbaz",
+            "oldqux",
+            "legacydep",
+            "fuzzel",
+            "cava",
+            "songrec",
+            "neovim",
+        ],
+        &["oldaur", "legacyaur"],
+        &[],
+        &[".config/kitty"],
+    );
+    fixture_with(&sandbox, &alpha);
+    for package in [
+        "oldbar",
+        "oldbaz",
+        "oldqux",
+        "legacydep",
+        "fuzzel",
+        "cava",
+        "songrec",
+        "neovim",
+        "oldaur",
+        "legacyaur",
+    ] {
+        sandbox.declare_still_needed(package);
+    }
+    sandbox.clear_log();
+
+    let run = sandbox.run(&["switch", "beta"]);
+    let data = run.assert_ok();
+
+    assert_eq!(
+        data["report"]["removed"],
+        json!([]),
+        "nothing is removed — every package is still needed: {data}"
+    );
+    assert_eq!(
+        data["report"]["kept"],
+        json!([
+            "oldbar",
+            "oldbaz",
+            "oldqux",
+            "legacydep",
+            "fuzzel",
+            "cava",
+            "songrec",
+            "neovim",
+            "oldaur",
+            "legacyaur"
+        ]),
+        "each kept package is named in the report"
+    );
+    assert!(
+        run.warnings()
+            .iter()
+            .all(|warning| warning.contains("kept:")),
+        "the declines surface as kept notes, never as failures: {:?}",
+        run.warnings()
+    );
+
+    let log = sandbox.log();
+    assert!(
+        log.iter().all(|line| !line.contains("-R")),
+        "no removal transaction of any kind is raised — the whole storm is \
+         pre-filtered out: {log:?}"
+    );
+    assert!(
+        log.iter()
+            .filter(|line| line.starts_with("pacman -Qi "))
+            .count()
+            >= 10,
+        "the pre-filter actually ran per candidate: {log:?}"
     );
 }

@@ -149,6 +149,19 @@ if [ "$mode" = "ok" ]; then
     fi
     exit 0
   fi
+  if [ "$name" = "pacman" ] && [ "$1" = "-Qi" ]; then
+    package=$2
+    # Simulated `pacman -Qi`: packages listed in STUB_NEEDED are still
+    # required, everything else is removable. This is the read-only query
+    # `is_still_needed` uses to pre-filter removals without a prompt.
+    if [ -n "$RICESWAP_STUB_NEEDED" ] && [ -f "$RICESWAP_STUB_NEEDED" ] \
+      && grep -Fxq "$package" "$RICESWAP_STUB_NEEDED"; then
+      printf 'Name            : %s\nVersion         : 1.0.0-1\nRequired By     : dependent\n' "$package"
+    else
+      printf 'Name            : %s\nVersion         : 1.0.0-1\nRequired By     : None\n' "$package"
+    fi
+    exit 0
+  fi
   if [ "$name" = "pacman" ] && [ "$1" = "-Qm" ]; then
     if [ -r "$RICESWAP_STUB_OWNERS" ]; then
       while read -r binary package origin; do

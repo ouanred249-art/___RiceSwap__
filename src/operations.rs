@@ -1549,20 +1549,53 @@ fn partition_removals(removals: &[String]) -> (Vec<String>, Vec<String>) {
     (actionable, protected)
 }
 
-/// Removes the pending packages in one batched `pkexec pacman -R --noconfirm`
-/// transaction — one polkit prompt for the whole removal phase, where the
-/// old per-package loop cost one each. The batch is an optimisation, not a
-/// bet, and removals can never abort the switch (see [`remove_package`] for
-/// why):
+/// Whether `package` is still required by another installed package, per
+/// `pacman -Qi`. This is a read-only query — no privilege, no prompt —
+/// so it can be used to trim the removal set before any `pkexec` is raised.
+/// A package that is still required will never be removed, so asking for it
+/// only costs a password and a refusal.
+fn is_still_needed(package: &str) -> bool {
+    let Ok(output) = Command::new(Tool::Pacman.name())
+        .arg("-Qi")
+        .arg(package)
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        // Not installed or pacman cannot answer — nothing requires it.
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("Required By") {
+            // Format: "Required By     : foo bar"  or  "Required By     : None"
+            let Some(value) = rest.split(':').nth(1) else {
+                continue;
+            };
+            let value = value.trim();
+            return !(value.is_empty() || value == "None");
+        }
+    }
+    false
+}
+
+/// Removes the pending packages — one polkit prompt, never twenty.
 ///
-/// - success: every package is gone, every package is reported removed;
-/// - a dependency refusal (one package is still needed by something the
-///   batch cannot see around): pacman refuses the *whole* transaction, so the
-///   outcome falls back to [`remove_package`]'s per-package loop, which keeps
-///   precisely the still-needed ones and removes the rest;
-/// - any other failure (a polkit denial, a dead wrapper): every package is
-///   kept with its own warning — the same per-package `kept:` notes the loop
-///   produced, just attributed to one declined transaction.
+/// The old shape batched `pkexec pacman -R a b c…` and, when any one entry
+/// was still needed, pacman's refusal killed the *whole* batch and the code
+/// retried one `pkexec` per package. Each of those is its own polkit prompt,
+/// so a switch that merely wanted to leave a few dependencies behind asked the
+/// user for their password twenty times — exactly the storm you reported
+/// (`ii → caelestia` removes ~20 packages, most still required).
+///
+/// This version screens the set first with a non-privileged `pacman -Qi`
+/// `Required By` check: packages that are still needed are kept with a
+/// warning *without ever raising a prompt*. Only the truly removable tail
+/// enters the single `pkexec pacman -R` batch. A dependency refusal that
+/// still slips through (racy install, undeclared dependency) falls back to
+/// per-package retries only over that tail — the pre-filter already removed
+/// the bulk, so the fallback at worst costs one extra batch, not twenty.
 fn remove_packages(
     packages: &[&String],
     emitter: &mut Emitter,
@@ -1573,12 +1606,27 @@ fn remove_packages(
     if packages.is_empty() {
         return;
     }
+    // Non-privileged pre-filter: keep still-needed packages without a prompt.
+    let mut to_remove: Vec<&String> = Vec::new();
+    for package in packages {
+        if is_still_needed(package) {
+            kept.push((*package).clone());
+            let note = format!("kept: {package} (still needed)");
+            emitter.warning(&note);
+            warnings.push(note);
+        } else {
+            to_remove.push(*package);
+        }
+    }
+    if to_remove.is_empty() {
+        return;
+    }
     let mut args: Vec<&str> = vec!["-R", "--noconfirm"];
-    args.extend(packages.iter().map(|package| package.as_str()));
+    args.extend(to_remove.iter().map(|package| package.as_str()));
     let declined = match run_command(OFFICIAL, &args) {
         Err(error) => Some(format!("cannot run pkexec pacman: {error}")),
         Ok(output) if output.status.success() => {
-            removed.extend(packages.iter().map(|package| (*package).clone()));
+            removed.extend(to_remove.iter().map(|package| (*package).clone()));
             return;
         }
         Ok(output) => {
@@ -1586,9 +1634,10 @@ fn remove_packages(
             if stderr.contains("breaks dependency")
                 || stderr.contains("could not satisfy dependencies")
             {
-                // One still-needed package holds the whole batch; per-package
-                // retries keep just that one and free the rest.
-                for package in packages {
+                // One still-needed package held the whole batch; per-package
+                // retries keep just that one and free the rest. The pre-filter
+                // already removed the majority, so this loop is the rare tail.
+                for package in &to_remove {
                     match remove_package(package) {
                         Ok(true) => removed.push((*package).clone()),
                         Ok(false) => {
@@ -1612,7 +1661,7 @@ fn remove_packages(
     };
     // A declined batch is one verdict for every package it named.
     let error = declined.expect("the non-success paths above return or set a reason");
-    for package in packages {
+    for package in &to_remove {
         kept.push((*package).clone());
         let note = format!("kept: {package} (removal declined: {error})");
         emitter.warning(&note);
