@@ -47,6 +47,19 @@ const PACKAGE_MANAGERS: &[Tool] = &[Tool::Pacman, Tool::Yay, Tool::Paru];
 /// where the helper is known.
 const OFFICIAL: &[&str] = &[Tool::PkExec.name(), Tool::Pacman.name()];
 
+/// What a refused escalation says on its stderr — including when the refusal
+/// comes not from the user but from a dead polkit agent, which answers every
+/// password with `Not authorized`. That is the one failure a switch can undo
+/// by itself, by escalating the same transaction through `sudo`, whose prompt
+/// lives on the terminal and needs no session service. The fallback fires on
+/// this marker alone, so a deliberate "no" stays one answer, never two.
+const AUTH_REFUSAL: &str = "Not authorized";
+
+/// Whether the sudo fallback has already failed this process. One working
+/// escalation or none — after a second refusal there is nothing left to ask,
+/// and later transactions must not pay a fresh prompt for a dead one.
+static SUDO_EXHAUSTED: AtomicBool = AtomicBool::new(false);
+
 /// The tools a snapshot reports on: the package managers behind the
 /// binary-reference scan and the package split, and `grim` behind the
 /// profile screenshot.
@@ -1340,7 +1353,7 @@ fn install_packages(
     let mut args: Vec<&str> = vec!["-S", "--noconfirm"];
     args.extend(packages.iter().map(String::as_str));
     let output =
-        run_command(prefix, &args).map_err(|error| format!("cannot run {actor}: {error}"))?;
+        run_privileged(prefix, &args).map_err(|error| format!("cannot run {actor}: {error}"))?;
     if output.status.code() == Some(2) {
         // Conflict detected on the batch: name the culprit from its stderr,
         // remove it — pacman is the removal authority either way, so plain
@@ -1360,11 +1373,11 @@ fn install_packages(
         };
         // Best-effort: if the removal cannot happen, the retry below reports
         // the conflict that is still standing.
-        let _ = run_command(OFFICIAL, &["-R", "--noconfirm", &conflicting]);
+        let _ = run_privileged(OFFICIAL, &["-R", "--noconfirm", &conflicting]);
         conflict_removed.push(conflicting.clone());
         removed.push(conflicting);
-        let retry =
-            run_command(prefix, &args).map_err(|error| format!("cannot run {actor}: {error}"))?;
+        let retry = run_privileged(prefix, &args)
+            .map_err(|error| format!("cannot run {actor}: {error}"))?;
         if retry.status.success() {
             installed.extend(packages.iter().cloned());
             return Ok(stdout_lines(&retry.stdout));
@@ -1428,7 +1441,7 @@ fn install_packages_one_by_one(
 ) -> Result<Vec<String>, String> {
     let mut output_lines = Vec::new();
     for package in packages {
-        let output = run_command(prefix, &["-S", "--noconfirm", package])
+        let output = run_privileged(prefix, &["-S", "--noconfirm", package])
             .map_err(|error| format!("cannot run {actor}: {error}"))?;
         if output.status.code() == Some(2) {
             // Conflict detected: remove conflicting package and retry
@@ -1441,10 +1454,10 @@ fn install_packages_one_by_one(
             };
             // Best-effort: if the removal cannot happen, the retry below
             // reports the conflict that is still standing.
-            let _ = run_command(OFFICIAL, &["-R", "--noconfirm", &conflicting]);
+            let _ = run_privileged(OFFICIAL, &["-R", "--noconfirm", &conflicting]);
             conflict_removed.push(conflicting.clone());
             removed.push(conflicting);
-            let retry = run_command(prefix, &["-S", "--noconfirm", package])
+            let retry = run_privileged(prefix, &["-S", "--noconfirm", package])
                 .map_err(|error| format!("cannot run {actor}: {error}"))?;
             if retry.status.success() {
                 installed.push(package.clone());
@@ -1623,7 +1636,7 @@ fn remove_packages(
     }
     let mut args: Vec<&str> = vec!["-R", "--noconfirm"];
     args.extend(to_remove.iter().map(|package| package.as_str()));
-    let declined = match run_command(OFFICIAL, &args) {
+    let declined = match run_privileged(OFFICIAL, &args) {
         Err(error) => Some(format!("cannot run pkexec pacman: {error}")),
         Ok(output) if output.status.success() => {
             removed.extend(to_remove.iter().map(|package| (*package).clone()));
@@ -1675,7 +1688,7 @@ fn remove_packages(
 /// anything else (a polkit denial, a spawn failure) is an error, so a denial
 /// on a removal surfaces exactly like one on an install.
 fn remove_package(package: &str) -> Result<bool, String> {
-    let output = run_command(OFFICIAL, &["-R", "--noconfirm", package])
+    let output = run_privileged(OFFICIAL, &["-R", "--noconfirm", package])
         .map_err(|error| format!("cannot run pkexec pacman: {error}"))?;
     if output.status.success() {
         return Ok(true);
@@ -1697,6 +1710,61 @@ fn run_command(prefix: &[&str], args: &[&str]) -> std::io::Result<Output> {
         .split_first()
         .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "empty command prefix"))?;
     Command::new(program).args(escalated).args(args).output()
+}
+
+/// Runs one privileged transaction, and when polkit itself refuses, asks the
+/// terminal instead.
+///
+/// `Not authorized` on stderr comes in two shapes. The user typed "no" at a
+/// live dialog — one verdict, honoured once. Or there is no agent to talk to
+/// at all: a broken desktop (a shell that died, an agent that was never
+/// started) makes polkit fail the *authentication itself* — every password
+/// answered becomes a refusal — and the switch that stops there strands the
+/// desktop mid-change and blames the user's typing. Both said the same words
+/// on the switch that should have installed one package.
+///
+/// So a `pkexec` refusal is retried through `sudo`, which prompts straight on
+/// the controlling terminal and needs no session service. The user's own
+/// terminal answers even when the desktop cannot. The retry happens at most
+/// once per process — if sudo refuses too, the machine has no working
+/// escalation and the remaining transactions must not stack prompts — and a
+/// prefix that is not `pkexec` (the AUR wrapper escalates through its own
+/// terminal) or a failure that is not the auth marker (a pacman dependency
+/// refusal) runs exactly once, as before.
+fn run_privileged(prefix: &[&str], args: &[&str]) -> std::io::Result<Output> {
+    let output = run_command(prefix, args)?;
+    let via_polkit = prefix.first() == Some(&Tool::PkExec.name());
+    if !via_polkit
+        || output.status.success()
+        || !String::from_utf8_lossy(&output.stderr).contains(AUTH_REFUSAL)
+    {
+        return Ok(output);
+    }
+    if SUDO_EXHAUSTED.load(Ordering::Relaxed) {
+        return Ok(output);
+    }
+    let mut fallback: Vec<&str> = vec!["sudo"];
+    fallback.extend(prefix.iter().skip(1).copied());
+    fallback.extend(args.iter().copied());
+    match run_command(&fallback, &[]) {
+        Ok(retried) if retried.status.success() => {
+            // sudo's credential cache keeps this the only terminal prompt of
+            // the switch, however many transactions polkit refused.
+            eprintln!(
+                "warning: polkit refused the transaction (is an authentication agent \
+                 running?); retried through sudo"
+            );
+            Ok(retried)
+        }
+        // Refused or missing: remember it. Both elevators failed, so the
+        // original polkit verdict is the more honest one to surface, and no
+        // later transaction pays a second round of prompts for the same dead
+        // escalation.
+        _ => {
+            SUDO_EXHAUSTED.store(true, Ordering::Relaxed);
+            Ok(output)
+        }
+    }
 }
 
 /// What a failed transaction said — or how it died when it said nothing — so

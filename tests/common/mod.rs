@@ -31,6 +31,12 @@ pub const STUB_TOOLS: &[&str] = &[
     "riceswap-float",
 ];
 
+/// Escalation helpers the sandbox provides but `detect` does not probe: not
+/// `Tool` variants, so they carry no version contract. `sudo` is the switch's
+/// fallback path when a `pkexec` transaction is refused; a test scripts its
+/// mode to make that path succeed (`Ok`, the default) or fail (`Denied`).
+pub const FALLBACK_STUBS: &[&str] = &["sudo"];
+
 /// Service commands the fixture manifests run (`start`/`stop`), stubbed on
 /// `PATH` beside [`STUB_TOOLS`] so a switch can stop and start services
 /// end-to-end. Not probed by `detect`: they are fixtures, not tools. `qs` is
@@ -47,6 +53,11 @@ pub enum Mode {
     Fail,
     /// Exit 2 with a conflict on stderr.
     Conflict,
+    /// Exit 1 with pkexec's own refusal words — the answer a dead polkit
+    /// agent gives every password, `Not authorized`. The `--version` probe
+    /// still answers, so the tool is detected and then refused in its real
+    /// transaction, which is exactly how the live incident went.
+    Denied,
 }
 
 impl Mode {
@@ -55,6 +66,7 @@ impl Mode {
             Mode::Ok => "ok",
             Mode::Fail => "fail",
             Mode::Conflict => "conflict",
+            Mode::Denied => "denied",
         }
     }
 }
@@ -73,11 +85,13 @@ impl Mode {
 ///   present, which is what `plan`'s `install_missing` is computed against;
 /// - `grim <path>` writes the screenshot file it was pointed at (its version
 ///   probe is `grim -h`, which falls through to the generic answer);
-/// - `pkexec` and `riceswap-float` answer `--version` like any other tool,
-///   then run the command they were pointed at — `pkexec pacman ...` executes
-///   pacman, `riceswap-float <helper> ...` runs the AUR helper — so the
-///   fixtures underneath decide the outcome; a scripted failure mode is the
-///   polkit denial / dead floating terminal;
+/// - `pkexec`, `sudo` and `riceswap-float` answer `--version` like any other
+///   tool, then run the command they were pointed at — `pkexec pacman ...`
+///   executes pacman, `sudo pacman ...` executes pacman, `riceswap-float
+///   <helper> ...` runs the AUR helper — so the fixtures underneath decide
+///   the outcome; a scripted `Denied` mode on `pkexec` is the dead polkit
+///   agent (real refusal words), a scripted failure elsewhere the dead
+///   floating terminal;
 /// - a rule in `RICESWAP_STUB_FAIL_DIR/<tool>` fails just the invocations
 ///   whose arguments contain the pattern (see `fail_on`), leaving
 ///   `--version` probes answerable — a helper that detects cleanly and then
@@ -121,7 +135,7 @@ if [ "$mode" = "ok" ]; then
   # executing pacman, the floating-terminal wrapper running the AUR helper —
   # but still answer their own version probe.
   case "$name" in
-    pkexec|riceswap-float)
+    pkexec|sudo|riceswap-float)
       if [ "$1" != "--version" ]; then
         wrapped=$1
         shift
@@ -226,6 +240,15 @@ fi
 case "$mode" in
   ok) printf '%s 1.0.0-stub\n' "$name"; exit 0 ;;
   conflict) printf '%s: stub conflict: conflicting package stub-conflict\n' "$name" >&2; exit 2 ;;
+  denied)
+    if [ "$1" = "--version" ]; then printf '%s 1.0.0-stub\n' "$name"; exit 0; fi
+    # pkexec's refusal lines, the ones a dead polkit agent leaves behind
+    # after the user has typed their password into nothing.
+    printf '==== AUTHENTICATING FOR org.freedesktop.policykit.exec ====\n' >&2
+    printf '==== AUTHENTICATION FAILED ====\n' >&2
+    printf 'Error executing command as another user: Not authorized\n\n' >&2
+    printf 'This incident has been reported.\n' >&2
+    exit 1 ;;
   *) printf '%s: stub failure (%s)\n' "$name" "$mode" >&2; exit 1 ;;
 esac
 "##;
@@ -263,7 +286,7 @@ impl Sandbox {
         for dir in [&home, &bin, &modes, &states, &delays, &fails] {
             fs::create_dir_all(dir).expect("create sandbox directory");
         }
-        for tool in STUB_TOOLS.iter().chain(SERVICE_STUBS) {
+        for tool in STUB_TOOLS.iter().chain(FALLBACK_STUBS).chain(SERVICE_STUBS) {
             write_stub(&bin, tool);
         }
         fs::write(&stub_log, "").expect("create stub log");
@@ -290,7 +313,9 @@ impl Sandbox {
     /// Scripts a stub's next answer. Sticky until scripted again.
     pub fn script(&self, tool: &str, mode: Mode) {
         assert!(
-            STUB_TOOLS.contains(&tool) || SERVICE_STUBS.contains(&tool),
+            STUB_TOOLS.contains(&tool)
+                || FALLBACK_STUBS.contains(&tool)
+                || SERVICE_STUBS.contains(&tool),
             "unknown stub tool {tool}"
         );
         fs::write(self.modes.join(tool), format!("{}\n", mode.as_str())).expect("script stub mode");
@@ -337,7 +362,9 @@ impl Sandbox {
     /// — the window a test sends SIGTERM into mid-step.
     pub fn delay_on(&self, tool: &str, pattern: &str, seconds: u64) {
         assert!(
-            STUB_TOOLS.contains(&tool) || SERVICE_STUBS.contains(&tool),
+            STUB_TOOLS.contains(&tool)
+                || FALLBACK_STUBS.contains(&tool)
+                || SERVICE_STUBS.contains(&tool),
             "unknown stub tool {tool}"
         );
         let path = self.delays.join(tool);
@@ -352,7 +379,9 @@ impl Sandbox {
     /// Sticky until cleared by re-scripting the tool's mode.
     pub fn fail_on(&self, tool: &str, pattern: &str) {
         assert!(
-            STUB_TOOLS.contains(&tool) || SERVICE_STUBS.contains(&tool),
+            STUB_TOOLS.contains(&tool)
+                || FALLBACK_STUBS.contains(&tool)
+                || SERVICE_STUBS.contains(&tool),
             "unknown stub tool {tool}"
         );
         let path = self.fails.join(tool);

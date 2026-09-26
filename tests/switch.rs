@@ -657,8 +657,93 @@ fn a_denied_removal_is_kept_and_the_switch_finishes() {
     assert_eq!(sandbox.current_target(), Some(sandbox.profile_dir("beta")));
 }
 
-/// Class: kept packages. A "still needed" refusal is logged as kept, the
-/// switch continues, and removals never use `-Rs`/`-Rdd`.
+/// Class: a dead polkit agent must not strand the switch. Every password
+/// typed into a dialog no agent listens to comes back `Not authorized` —
+/// exactly how one real switch died at step 3 over a single `neovim`, while
+/// the user's terminal was the one place the same password still works. A
+/// refused `pkexec` transaction is therefore retried through `sudo`; the
+/// switch completes, and the retry says so on stderr.
+#[test]
+fn a_refused_pkexec_transaction_falls_back_to_sudo_and_the_switch_finishes() {
+    let sandbox = Sandbox::new();
+    fixture(&sandbox);
+    // The dead agent: pkexec answers its version probe (the tool is
+    // detected) and refuses every transaction with polkit's own words.
+    sandbox.script("pkexec", Mode::Denied);
+    sandbox.clear_log();
+
+    let run = sandbox.run(&["switch", "beta"]);
+    let data = run.assert_ok();
+
+    assert_eq!(data["completed_steps"], json!(10));
+    assert_eq!(
+        data["report"]["installed"],
+        json!(["newbar", "newaur"]),
+        "the refused official install landed through the terminal path: {data}"
+    );
+
+    let log = sandbox.log();
+    assert!(
+        log.iter()
+            .any(|line| line.trim_start().starts_with("pkexec pacman -S")),
+        "polkit was asked first, as always: {log:?}"
+    );
+    assert!(
+        log.iter()
+            .any(|line| line.trim_start().starts_with("sudo pacman -S")),
+        "the refusal was retried through sudo, not fatal: {log:?}"
+    );
+    assert!(
+        run.stderr.contains("polkit refused") && run.stderr.contains("sudo"),
+        "the fallback is announced where the terminal user sees it: {:?}",
+        run.stderr
+    );
+    assert_eq!(sandbox.current_target(), Some(sandbox.profile_dir("beta")));
+}
+
+/// The fallback is one chance, not a habit. When sudo is refused too — both
+/// elevators dead — the switch stops package ops exactly where it used to,
+/// and every later transaction is spared a prompt that cannot land: the
+/// password storm was the original complaint, and a double refusal must not
+/// re-raise it one prompt per package.
+#[test]
+fn a_double_refusal_stops_package_ops_without_repeated_prompts() {
+    let sandbox = Sandbox::new();
+    fixture(&sandbox);
+    sandbox.script("pkexec", Mode::Denied);
+    sandbox.script("sudo", Mode::Denied);
+    sandbox.clear_log();
+
+    let run = sandbox.run(&["switch", "beta"]);
+    let error = run.assert_failed();
+
+    assert!(
+        error.contains("Not authorized"),
+        "the original polkit verdict is what the failure names: {error}"
+    );
+    let pkexec_installs = sandbox
+        .log()
+        .iter()
+        .filter(|line| line.trim_start().starts_with("pkexec pacman -S"))
+        .count();
+    let sudo_installs = sandbox
+        .log()
+        .iter()
+        .filter(|line| line.trim_start().starts_with("sudo pacman -S"))
+        .count();
+    assert!(
+        sudo_installs <= 1,
+        "one sudo attempt, remembered as failed — never a prompt per package: \
+         {:?}",
+        sandbox.log()
+    );
+    assert!(
+        pkexec_installs <= 1,
+        "and polkit is not re-asked once both paths are known dead either: \
+         {:?}",
+        sandbox.log()
+    );
+}
 #[test]
 fn a_still_needed_refusal_is_kept_and_removals_are_plain_r() {
     let sandbox = Sandbox::new();
