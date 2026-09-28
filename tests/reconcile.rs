@@ -177,7 +177,8 @@ fn switching_into_a_donor_graft_repairs_the_names_the_new_shell_registers() {
     assert_eq!(reconciled["scanned_files"], json!(2));
     assert_eq!(
         reconciled["files_written"],
-        json!([".config/hypr/hypridle.conf"])
+        json!([".config/hypr/hypridle.conf", ".config/hypr/custom/env.lua"]),
+        "the config the engine repaired, and the env block the caelestia recipe materializes"
     );
     assert_eq!(reconciled["backups"].as_array().map(Vec::len), Some(1));
     assert_eq!(
@@ -201,6 +202,39 @@ fn switching_into_a_donor_graft_repairs_the_names_the_new_shell_registers() {
         read(&live.join("hypridle.conf")),
         profile_idle,
         "the live path the switch installed carries the repair"
+    );
+
+    // The recipe layer is part of the same pass, and the report says it spoke:
+    // this profile's shell has a built-in codebook, even though nothing in this
+    // fixture is a shape that codebook can answer.
+    assert_eq!(reconciled["layers"], json!(["builtin"]));
+    assert_eq!(
+        reconciled["foreign_entries"],
+        json!(["quickshell:riceswap-toggle"]),
+        "the keep set the pass ran with, built-in guard and recipe's own together"
+    );
+    assert_eq!(
+        reconciled["resolutions"],
+        json!([]),
+        "this shell's QML registers one shortcut, so every target the codebook names is a \
+         target it does not have: {reconciled:?}"
+    );
+    assert_eq!(
+        reconciled["dirs_created"],
+        json!(["Wallpapers"]),
+        "the wallpaper directory the caelestia recipe guarantees"
+    );
+    assert_eq!(
+        reconciled["env"],
+        json!({
+            "file": ".config/hypr/custom/env.lua",
+            "entries": [["CAELESTIA_WALLPAPERS_DIR", "~/Wallpapers"]],
+            "written": true,
+        }),
+    );
+    assert!(
+        sandbox.home().join("Wallpapers").is_dir(),
+        "and it exists outside the profile, which is the only place this layer writes"
     );
 
     // The names with no counterpart are left exactly as they were, and
@@ -301,9 +335,10 @@ fn a_second_switch_over_a_repaired_profile_writes_nothing_and_still_reports() {
 
     assert_eq!(
         facts(&first)["files_written"],
-        json!([".config/hypr/hypridle.conf"]),
-        "the first switch has real work to do"
+        json!([".config/hypr/hypridle.conf", ".config/hypr/custom/env.lua"]),
+        "the first switch has real work to do: a repair and a managed env block"
     );
+    assert_eq!(facts(&first)["dirs_created"], json!(["Wallpapers"]));
     let reconciled = facts(&second);
     assert_eq!(
         reconciled["files_written"],
@@ -314,6 +349,16 @@ fn a_second_switch_over_a_repaired_profile_writes_nothing_and_still_reports() {
         reconciled["backups"],
         json!([]),
         "and takes no second backup: {reconciled:?}"
+    );
+    assert_eq!(
+        reconciled["dirs_created"],
+        json!([]),
+        "and re-guarantees nothing: {reconciled:?}"
+    );
+    assert_eq!(
+        reconciled["env"]["written"],
+        json!(false),
+        "the env block is settled, so the file is not rewritten: {reconciled:?}"
     );
     assert_eq!(
         reconciled["dead_names"],
@@ -350,6 +395,18 @@ fn switching_onto_a_profile_that_matches_its_shell_writes_nothing() {
     assert_eq!(reconciled["backups"], json!([]));
     assert_eq!(reconciled["dead_names"], json!([]));
     assert_eq!(reconciled["proposals"], json!([]));
+    assert_eq!(
+        reconciled["layers"],
+        json!(["builtin"]),
+        "the built-in codebook was consulted and had nothing to say — ii dispatches its own \
+         live vocabulary, and declares no env or dirs"
+    );
+    assert_eq!(
+        reconciled["env"],
+        Value::Null,
+        "so no env block exists: {reconciled:?}"
+    );
+    assert_eq!(reconciled["dirs_created"], json!([]));
     assert_eq!(
         before,
         stamp(&profile),
@@ -443,4 +500,191 @@ fn reconciliation_shells_out_to_nothing() {
         ["hyprctl reload", "hyprctl version"],
         "the engine is pure text: {traffic:?}"
     );
+}
+
+/// A profile whose shell is a shell RiceSwap ships a codebook for, with a
+/// registry rich enough that the codebook's answers are provable: the
+/// shortcuts the real caelestia QML registers, and keybinds still dispatching
+/// the donor's vocabulary.
+///
+/// This is the shape a user's second profile is actually in, and the one the
+/// built-in recipe exists for: everything the codebook says has a counterpart
+/// here, so every decision it declares is applied — on the switch, into the
+/// profile, and through the link the switch installs.
+fn grafted_codebook(sandbox: &Sandbox, profile: &str) {
+    sandbox.write_profile(
+        profile,
+        &profile_toml_with_shell(
+            profile,
+            &[],
+            &[],
+            &[],
+            &[".config/hypr", ".config/quickshell/caelestia"],
+            ("caelestia", "qs -c caelestia", "pkill qs"),
+        ),
+    );
+    sandbox.write_profile_file(
+        profile,
+        ".config/quickshell/caelestia/components/misc/CustomShortcut.qml",
+        "import Quickshell.Hyprland\n\nGlobalShortcut {\n    appid: \"caelestia\"\n}\n",
+    );
+    sandbox.write_profile_file(
+        profile,
+        ".config/quickshell/caelestia/modules/Shortcuts.qml",
+        concat!(
+            "import QtQuick\n\nScope {\n",
+            "    GlobalShortcut { name: \"launcher\" onPressed: {} }\n",
+            "    GlobalShortcut { name: \"sidebar\" onPressed: {} }\n",
+            "    GlobalShortcut { name: \"utilities\" onPressed: {} }\n",
+            "    GlobalShortcut { name: \"showall\" onPressed: {} }\n",
+            "    GlobalShortcut { name: \"screenshotClip\" onPressed: {} }\n",
+            "}\n",
+        ),
+    );
+    sandbox.write_profile_file(
+        profile,
+        ".config/hypr/hyprland/keybinds.lua",
+        concat!(
+            "hl.bind(\"SUPER + SPACE\", hl.dsp.global(\"quickshell:searchToggleRelease\"))\n",
+            "hl.bind(\"SUPER + SHIFT + S\", hl.dsp.global(\"quickshell:regionScreenshot\"), ",
+            "{ description = \"Screen snip\" })\n",
+            "hl.bind(\"SUPER + V\", hl.dsp.global(\"quickshell:overviewClipboardToggle\"))\n",
+            "hl.bind(\"SUPER + J\", hl.dsp.global(\"quickshell:barToggle\"), ",
+            "{ description = \"Toggle bar\" })\n",
+            "hl.bind(\"SUPER + R\", hl.dsp.global(\"quickshell:riceswap-toggle\"))\n",
+        ),
+    );
+}
+
+/// The codebook is applied on the switch, not on some later repair: the binds
+/// that reach the profile are the ones the live path serves, the environment the
+/// recipe declares is materialized and the directory guaranteed, and the second
+/// switch over the result writes nothing at all.
+#[test]
+fn switching_into_a_grafted_codebook_applies_the_built_in_recipe() {
+    let sandbox = Sandbox::new();
+    grafted_codebook(&sandbox, "grafted");
+    let live = sandbox.home().join(".config/hypr");
+    fs::create_dir_all(&live).expect("live config");
+
+    let run = sandbox.run(&["switch", "grafted"]);
+    let data = run.assert_ok();
+    let reconciled = facts(&data);
+
+    // One decision per kind, in the report, each naming the tier that made it.
+    assert_eq!(reconciled["layers"], json!(["builtin"]));
+    assert_eq!(reconciled["dead_names"], json!([]), "{reconciled:?}");
+    let applied = |name: &str| {
+        reconciled["resolutions"]
+            .as_array()
+            .expect("resolutions")
+            .iter()
+            .find(|applied| applied["dispatched"] == name)
+            .unwrap_or_else(|| panic!("{name} must be resolved: {reconciled:?}"))
+            .clone()
+    };
+    assert_eq!(
+        applied("quickshell:searchToggleRelease"),
+        json!({
+            "dispatched": "quickshell:searchToggleRelease",
+            "kind": "to",
+            "to": "caelestia:launcher",
+            "exec": null,
+            "layer": "builtin",
+            "sites": [{
+                "file": ".config/hypr/hyprland/keybinds.lua",
+                "line": 1,
+            }],
+        }),
+    );
+    assert_eq!(applied("quickshell:regionScreenshot")["kind"], json!("to"));
+    assert_eq!(
+        applied("quickshell:regionScreenshot")["to"],
+        json!("caelestia:screenshotClip")
+    );
+    assert_eq!(
+        applied("quickshell:overviewClipboardToggle")["exec"],
+        json!("pkill fuzzel || caelestia clipboard")
+    );
+    assert_eq!(applied("quickshell:barToggle")["kind"], json!("drop"));
+
+    // And the file the switch links is the repaired one, in every dialect.
+    let repaired = read(
+        &sandbox
+            .profile_dir("grafted")
+            .join(".config/hypr/hyprland/keybinds.lua"),
+    );
+    assert!(
+        repaired.contains(
+            "hl.bind(\"SUPER + SPACE\", hl.dsp.global(\"caelestia:launcher\"), \
+             { release = true })"
+        ),
+        "{repaired}"
+    );
+    assert!(
+        repaired.contains(r#"hl.dsp.global("caelestia:screenshotClip")"#),
+        "{repaired}"
+    );
+    assert!(
+        repaired.contains("hl.dsp.exec_cmd(\"pkill fuzzel || caelestia clipboard\")"),
+        "{repaired}"
+    );
+    assert!(
+        !repaired.contains("barToggle"),
+        "the dropped bind is gone: {repaired}"
+    );
+    assert!(
+        repaired.contains(r#"hl.dsp.global("quickshell:riceswap-toggle")"#),
+        "and RiceSwap's own hotkey is still there: {repaired}"
+    );
+    assert_eq!(
+        read(&live.join("hyprland/keybinds.lua")),
+        repaired,
+        "the live path the switch installed is the repaired file, so the reload picks it up"
+    );
+
+    // The environment and the directory, materialized once.
+    let env = read(
+        &sandbox
+            .profile_dir("grafted")
+            .join(".config/hypr/custom/env.lua"),
+    );
+    assert!(
+        env.contains(
+            "hl.env(\"CAELESTIA_WALLPAPERS_DIR\", os.getenv(\"HOME\") .. \"/Wallpapers\")"
+        ),
+        "{env}"
+    );
+    assert!(env.contains("# >>> riceswap:adapt >>>"), "{env}");
+    assert!(sandbox.home().join("Wallpapers").is_dir());
+
+    // The user is told, inline and in the envelope, about all three.
+    let warnings = run.warnings();
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("custom/env.lua")
+                && warning.contains("CAELESTIA_WALLPAPERS_DIR")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("guaranteed the path `Wallpapers`")),
+        "{warnings:?}"
+    );
+    assert_eq!(
+        data["completed_steps"],
+        json!(10),
+        "the switch is still ten steps"
+    );
+
+    // And a second switch over the settled profile is a no-op.
+    let profile = sandbox.profile_dir("grafted");
+    let after_first = stamp(&profile);
+    let second = sandbox.run(&["switch", "grafted"]).assert_ok();
+    assert_eq!(facts(&second)["files_written"], json!([]), "{second:?}");
+    assert_eq!(facts(&second)["dirs_created"], json!([]));
+    assert_eq!(facts(&second)["env"]["written"], json!(false));
+    assert_eq!(after_first, stamp(&profile), "not one byte moved");
 }

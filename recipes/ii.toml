@@ -1,0 +1,21 @@
+# RiceSwap recipe — ii (issue #36).
+#
+# ii is the donor rice the codebook was extracted from, so it needs no
+# resolutions: its configs dispatch `quickshell:*` and ii's own QML registers
+# those very names, which is why the engine leaves the whole tree alone. What it
+# does need is the guard, named explicitly so the file reads on its own, and the
+# `[shell]` pin that lets a later drift check say what ii is supposed to
+# register under.
+#
+# No `[env]` and no `[[dirs]]`: ii's wallpaper path is internal to its QML
+# config, and the launcher-vs-CLI divergence the env value fixes is a caelestia
+# fact.
+
+schema_version = 1
+
+[shell]
+name = "ii"
+appid = "quickshell"
+
+[foreign]
+entries = ["quickshell:riceswap-toggle"]

@@ -1,0 +1,170 @@
+# RiceSwap recipe — caelestia (issue #36).
+#
+# The codebook for one rice: what a donor shortcut *meant*, what the activating
+# shell calls it, and what to do about the intents it registers nothing for.
+# Everything here is the recorded hand-fix (docs/research/recipe-schema-draft.md,
+# FC-3 and FC-4, and the diff of the two keybinds files), so a profile captured
+# while another shell ran converges on every switch instead of being adapted once
+# by hand.
+#
+# The same schema is the human tier's: a profile's own `adapt.toml` speaks it,
+# and `<data-dir>/recipes/<shell>.toml` will (a later ticket writes it; this
+# build only reads it). When two layers speak for the same dispatched name,
+# `adapt.toml` wins over this file, which wins over the user tier.
+
+schema_version = 1
+
+# The shell this recipe is about. `appid` is a *pin*: the namespace the recipe
+# was authored against, recorded so a later run can report drift. It is never
+# a source of truth — the registry derived from the activating profile's own QML
+# always wins for what actually exists, and a pin that disagrees is reported,
+# not obeyed.
+[shell]
+name = "caelestia"
+appid = "caelestia"
+
+# FC-5: caelestia's launcher resolves `env || GlobalConfig.paths.wallpaperDir`
+# and its CLI `env || $XDG_PICTURES_DIR/Wallpapers`, so with the variable unset
+# the two disagree about where the wallpapers are. The value is this machine's
+# collection; `~` is expanded when the managed block is written.
+[env]
+CAELESTIA_WALLPAPERS_DIR = "~/Wallpapers"
+
+# The one path this recipe is allowed to guarantee outside the profile. It is
+# where the env value above points, so the shell and the CLI cannot fall apart.
+[[dirs]]
+path = "~/Wallpapers"
+
+# FC-4: a second live shell both profiles launch from `execs.lua` (`qs -c
+# riceswap`). Named explicitly even though the engine's built-in guard already
+# holds it — a recipe that says so is a recipe that can be read on its own.
+[foreign]
+entries = ["quickshell:riceswap-toggle"]
+
+# --- FC-3: intents that DO have a counterpart ---------------------------
+#
+# `to` names the target shortcut; an unprefixed name is joined with the
+# activating shell's derived appid, and a prefixed one is taken as written and
+# checked against the derived registry either way. `bind_options` are added to
+# the bind's option table when the line does not already set them.
+
+# caelestia has no separate release variant, so the donor's two-name trick
+# collapses into one shortcut plus the `release` option.
+[[resolution]]
+dispatched = "quickshell:searchToggleRelease"
+to = "launcher"
+bind_options = ["release"]
+
+[[resolution]]
+dispatched = "quickshell:overviewWorkspacesToggle"
+to = "showall"
+
+# The donor's left/right sidebar split collapses into caelestia's one sidebar;
+# the right sidebar is re-pointed at the utilities panel, which is what the
+# hand-fix did with it.
+[[resolution]]
+dispatched = "quickshell:sidebarLeftToggle"
+to = "sidebar"
+
+[[resolution]]
+dispatched = "quickshell:sidebarRightToggle"
+to = "utilities"
+
+[[resolution]]
+dispatched = "quickshell:sessionToggle"
+to = "session"
+
+[[resolution]]
+dispatched = "quickshell:regionScreenshot"
+to = "screenshotClip"
+
+# `quickshell:lock` is deliberately absent: caelestia registers a shortcut of
+# the same name, so the engine's exact-name move already rewrites it, and
+# derivation is what wins for what exists.
+
+# --- FC-4: intents caelestia registers nothing for -----------------------
+#
+# The UI selectors are dropped outright, the rest fall back to a command. Each
+# `exec` below is the command as a shell reads it; the pass renders it into the
+# syntax dialect of the file it lands in.
+
+[[resolution]]
+dispatched = "quickshell:workspaceNumber"
+drop = true
+
+[[resolution]]
+dispatched = "quickshell:cheatsheetToggle"
+drop = true
+
+[[resolution]]
+dispatched = "quickshell:oskToggle"
+drop = true
+
+[[resolution]]
+dispatched = "quickshell:mediaControlsToggle"
+drop = true
+
+[[resolution]]
+dispatched = "quickshell:overlayToggle"
+drop = true
+
+[[resolution]]
+dispatched = "quickshell:barToggle"
+drop = true
+
+[[resolution]]
+dispatched = "quickshell:panelFamilyCycle"
+drop = true
+
+[[resolution]]
+dispatched = "quickshell:wallpaperSelectorToggle"
+drop = true
+
+[[resolution]]
+dispatched = "quickshell:sidebarLeftToggleDetach"
+drop = true
+
+[[resolution]]
+dispatched = "quickshell:screenTranslate"
+drop = true
+
+# Fallback to the shell's own CLI. The `pkill fuzzel` the donor put first is
+# kept: it is what closes a picker that a second press opened, and that
+# behaviour belongs to the shell's UI rather than to the donor's IPC.
+[[resolution]]
+dispatched = "quickshell:overviewClipboardToggle"
+exec = "pkill fuzzel || caelestia clipboard"
+
+[[resolution]]
+dispatched = "quickshell:overviewEmojiToggle"
+exec = "pkill fuzzel || caelestia emoji -p"
+
+[[resolution]]
+dispatched = "quickshell:wallpaperSelectorRandom"
+exec = "caelestia wallpaper -r"
+
+[[resolution]]
+dispatched = "quickshell:regionRecord"
+exec = "caelestia record -r"
+
+# FC-8: `caelestia scheme get|set -m` replaces the donor's toggle overlay.
+[[resolution]]
+dispatched = "quickshell:toggleLightDark"
+exec = 'caelestia scheme get | grep -q "Mode: dark" && caelestia scheme set -m light || caelestia scheme set -m dark'
+
+# Fallback to the donor's surviving scripts. The `qsIsAlive` IPC guard the donor
+# wrapped these in is a donor-shell fact (FC-4) and is deliberately not carried
+# over: under caelestia there is no `qs -c $qsConfig` to probe. The path is the
+# one the donor's own `hyprScripts` local names.
+[[resolution]]
+dispatched = "quickshell:regionSearch"
+exec = "pidof slurp || $HOME/.config/hypr/hyprland/scripts/snip_to_search.sh"
+
+# Same grim + slurp + tesseract pipeline, verbatim.
+[[resolution]]
+dispatched = "quickshell:regionOcr"
+exec = '''pidof slurp || grim -g "$(slurp $SLURP_ARGS)" "/tmp/ocr_image.png" && tesseract "/tmp/ocr_image.png" stdout -l $(tesseract --list-langs | awk 'NR>1{print $1}' | tr '\\n' '+' | sed 's/\\+$/\\n/') | wl-copy && rm "/tmp/ocr_image.png"'''
+
+# `quickshell:lockFocus` is deliberately absent too, and stays a proposal: the
+# hand-fix for it is a composite (wake the detached shell, *then* lock it, in
+# hypridle's `after_sleep_cmd`), which no single dispatch resolution describes.

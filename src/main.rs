@@ -10,6 +10,7 @@ mod detection;
 mod envelope;
 mod operations;
 mod profile;
+mod recipe;
 mod reconcile;
 mod state;
 mod tools;

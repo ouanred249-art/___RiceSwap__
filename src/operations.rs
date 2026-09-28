@@ -1194,8 +1194,13 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
     // half-finished one has no state to resume from, and counting it would move
     // the resume contract the envelope's `completed_steps` is frozen on. Its
     // facts ride the envelope; anything worth saying streams as a warning.
+    //
+    // The pass takes the switch's own `$HOME` and data directory, so a declared
+    // path is expanded and bounded against the home the user actually has, and
+    // the user tier's recipes are read from the store this switch writes to.
     let reconcile_report = reconcile::reconcile(
         &profile_dir,
+        &reconcile::Context::new(&context.home, &context.store.data_dir()),
         target_manifest
             .shell
             .as_ref()
@@ -1206,7 +1211,43 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
         emitter.warning(warning);
         warnings.push(warning.clone());
     }
+    for drift in &reconcile_report.appid_drift {
+        let note = format!("this profile's shell recipe disagrees with its own QML: {drift}");
+        emitter.warning(&note);
+        warnings.push(note);
+    }
+    // The env block is a materialized fact, not a repair of a dead name, so it
+    // is announced as itself rather than swept into the rewrite note below.
+    if let Some(block) = &reconcile_report.env
+        && block.written
+    {
+        let names = block
+            .entries
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<&str>>()
+            .join(", ");
+        let note = format!(
+            "materialized this profile's recipe environment in `{}` ({names}), inside the \
+             block RiceSwap owns",
+            block.file
+        );
+        emitter.warning(&note);
+        warnings.push(note);
+    }
+    for created in &reconcile_report.dirs_created {
+        let note = format!("guaranteed the path `{created}` this profile's recipe declares");
+        emitter.warning(&note);
+        warnings.push(note);
+    }
     for rewritten in &reconcile_report.files_written {
+        if reconcile_report
+            .env
+            .as_ref()
+            .is_some_and(|block| block.file == *rewritten)
+        {
+            continue; // Already announced as the managed env block.
+        }
         let note = format!(
             "repaired the dispatcher names in `{rewritten}`: this profile's shell does not \
              register what it was dispatching"

@@ -41,3 +41,24 @@ live vocabulary, and a correct engine writes nothing here at all.
 * `.config/quickshell/riceswap/` is deliberately absent: the RiceSwap panel is a
   *second* shell in its own tree, and `quickshell:riceswap-toggle` surviving
   reconciliation is what the engine's built-in foreign set exists for.
+
+## `reference/` — what the hand-fix left (issue #36)
+
+The caelestia profile's own configs **after** the manual adaptation, copied
+verbatim from `~/.local/share/riceswap/profiles/caelestia/.config/hypr`. Nothing
+here is ever edited or written: it is the other side of the convergence
+comparison the built-in `caelestia` recipe exists to pass, so the recipe's
+entries can be checked against a human's own work rather than against itself.
+
+* `.config/hypr/hyprland/keybinds.lua`, `.config/hypr/custom/keybinds.lua`,
+  `.config/hypr/hypridle.conf`, `.config/hypr/custom/env.lua` — the four files
+  the hand-fix rewrote, and the only ones with a dispatcher name in them.
+* `custom/general.lua` is deliberately *not* copied. The two 4-finger gestures
+  in the donor's copy did dispatch `quickshell:overviewWorkspacesToggle`, but
+  the file on the machine is a wholesale HyprGlass tuning rewrite that has
+  nothing to do with dispatcher names, so comparing against it would prove
+  nothing. The test says so where it matters.
+* The two differences that are *not* dispatch rewrites — the human's comment
+  blocks, and the `after_sleep_cmd` composite FC-7 records — are named in
+  `src/reconcile.rs`'s convergence tests, each with the reason no `[[resolution]]`
+  can express it.
