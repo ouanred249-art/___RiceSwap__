@@ -25,6 +25,7 @@ use crate::profile::{
     CURRENT_MANIFEST_VERSION, FileEntry, Manifest, Packages, ProfileInfo, RiceInfo, Service, Shell,
     Store,
 };
+use crate::reconcile;
 use crate::state::StateStore;
 use crate::tools::{self, Tool};
 use serde_json::{Value, json};
@@ -1172,6 +1173,59 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
     }
 
     // Step 7: flip symlinks
+    //
+    // The arriving profile's dispatcher names are reconciled first, and against
+    // the *profile's own* files rather than the live ones. Two reasons, and both
+    // are about ordering.
+    //
+    // The links this step makes point into the profile directory, and the
+    // reload that follows reads through them — so a repair made before the link
+    // is a repair the very next `hyprctl reload` installs. Repairing the live
+    // path instead would write through a link that is about to be re-pointed, or
+    // into a real directory that is about to be replaced by one.
+    //
+    // And it is the right moment in the sequence for the same reason the link
+    // step is: the user's own files at the managed paths were already preserved
+    // above, so the only bytes this can touch are the profile's, and the shell
+    // that has to read them has not started yet.
+    //
+    // The pass is deliberately not a numbered step of its own. It is a pure
+    // re-derivation — the next switch performs it again from scratch — so a
+    // half-finished one has no state to resume from, and counting it would move
+    // the resume contract the envelope's `completed_steps` is frozen on. Its
+    // facts ride the envelope; anything worth saying streams as a warning.
+    let reconcile_report = reconcile::reconcile(
+        &profile_dir,
+        target_manifest
+            .shell
+            .as_ref()
+            .map(|shell| shell.name.as_str()),
+        &BTreeSet::new(),
+    );
+    for warning in &reconcile_report.warnings {
+        emitter.warning(warning);
+        warnings.push(warning.clone());
+    }
+    for rewritten in &reconcile_report.files_written {
+        let note = format!(
+            "repaired the dispatcher names in `{rewritten}`: this profile's shell does not \
+             register what it was dispatching"
+        );
+        emitter.warning(&note);
+        warnings.push(note);
+    }
+    for dead in &reconcile_report.dead_names {
+        let note = format!(
+            "`{dead}` is dispatched in this profile but its shell registers no such shortcut; \
+             left as it was"
+        );
+        emitter.warning(&note);
+        warnings.push(note);
+    }
+    // A pass that had nothing to reconcile says nothing out loud: a profile
+    // naming no shell, or one whose QML tree is not there, is an ordinary
+    // profile, not something to warn a user about on every switch. The reason
+    // rides the envelope, where the panel can show it.
     context.progress(&mut emitter, "linking managed config paths");
     // A path the old profile managed and the new one does not used to be
     // deleted. That is the one place the switch could still lose data: the
@@ -1311,6 +1365,7 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
             "shell_stopped": shell_stopped,
             "shell_started": shell_started,
             "reloaded": reloaded,
+            "reconcile": reconcile_report,
         },
     }));
     envelope.warnings = warnings;
