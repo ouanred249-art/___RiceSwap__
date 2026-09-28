@@ -20,7 +20,10 @@ use tempfile::TempDir;
 /// Executables the backend shells out to, stubbed on `PATH` for every test.
 /// `pkexec` and `riceswap-float` are the privilege-flow wrappers of ticket
 /// #16: every official package op runs `pkexec pacman`, every AUR helper run
-/// goes through the floating-terminal wrapper.
+/// goes through the floating-terminal wrapper. `git` and `pi` are the
+/// acquisition and research tools of the installer (ticket #34): probed like
+/// every other tool, so a machine missing either is visible before any real
+/// work starts.
 pub const STUB_TOOLS: &[&str] = &[
     "pacman",
     "yay",
@@ -29,13 +32,18 @@ pub const STUB_TOOLS: &[&str] = &[
     "grim",
     "pkexec",
     "riceswap-float",
+    "git",
+    "pi",
 ];
 
-/// Escalation helpers the sandbox provides but `detect` does not probe: not
-/// `Tool` variants, so they carry no version contract. `sudo` is the switch's
+/// Tools the sandbox provides but `detect` does not probe: not `Tool`
+/// variants, so they carry no version contract. `sudo` is the switch's
 /// fallback path when a `pkexec` transaction is refused; a test scripts its
 /// mode to make that path succeed (`Ok`, the default) or fail (`Denied`).
-pub const FALLBACK_STUBS: &[&str] = &["sudo"];
+/// `ydotool` is the synthetic-input tool the verification tier drives: no
+/// backend command shells out to it yet, so it is installed as a seam for
+/// the tickets that will — scriptable now, unprobed until then.
+pub const FALLBACK_STUBS: &[&str] = &["sudo", "ydotool"];
 
 /// Service commands the fixture manifests run (`start`/`stop`), stubbed on
 /// `PATH` beside [`STUB_TOOLS`] so a switch can stop and start services

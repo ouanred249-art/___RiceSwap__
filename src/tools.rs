@@ -22,6 +22,13 @@ pub enum Tool {
     /// The floating-terminal wrapper the AUR helper is spawned inside, so its
     /// password prompt works without a terminal of our own.
     FloatTerminal,
+    /// System `git`, which clones a dotfiles repo the user hands the installer.
+    Git,
+    /// The user's `pi` CLI agent, consulted to research a rice no recipe
+    /// covers. Probed like any other tool even though it is optional: an
+    /// absent or unusable `pi` only costs the research tier, and a silent
+    /// downgrade is a downgrade nobody was told about.
+    Pi,
 }
 
 impl Tool {
@@ -34,6 +41,8 @@ impl Tool {
         Tool::Grim,
         Tool::PkExec,
         Tool::FloatTerminal,
+        Tool::Git,
+        Tool::Pi,
     ];
 
     /// The executable name looked up on `PATH`.
@@ -46,6 +55,8 @@ impl Tool {
             Tool::Grim => "grim",
             Tool::PkExec => "pkexec",
             Tool::FloatTerminal => "riceswap-float",
+            Tool::Git => "git",
+            Tool::Pi => "pi",
         }
     }
 
@@ -56,7 +67,9 @@ impl Tool {
     /// subcommand with exit 0. Probing every tool with `--version` made a
     /// perfectly usable machine look broken — which is exactly what the
     /// pre-flight warning is supposed to detect, so the probe must match
-    /// each tool's real interface.
+    /// each tool's real interface. `git` and `pi` both answer `--version`
+    /// with exit 0 (git prints `git version 2.x.y`, pi its bare semver), so
+    /// they take the default arm.
     pub const fn version_args(self) -> &'static [&'static str] {
         match self {
             Tool::Grim => &["-h"],
