@@ -158,6 +158,21 @@ impl Context {
         self.store.hardware_file()
     }
 
+    /// The fake-or-real `$HOME` every operation resolves paths against.
+    pub(crate) fn home(&self) -> &Path {
+        &self.home
+    }
+
+    /// The profile store this operation writes into.
+    pub(crate) fn store(&self) -> &Store {
+        &self.store
+    }
+
+    /// The state document, for the operations that mark themselves unfinished.
+    pub(crate) fn state(&mut self) -> &mut StateStore {
+        &mut self.state
+    }
+
     /// `~/.config/hypr/hyprland.conf`, the live Hyprland config `init` lifts
     /// hardware configuration out of.
     fn hyprland_config(&self) -> PathBuf {
@@ -184,7 +199,7 @@ impl Context {
 
     /// Emits a progress line and mirrors the step into `state.json`, so a panel
     /// reopened mid-operation still renders where the backend is.
-    fn progress(&mut self, emitter: &mut Emitter, message: &str) {
+    pub(crate) fn progress(&mut self, emitter: &mut Emitter, message: &str) {
         emitter.progress(message);
         self.state.set_step(emitter.step());
         self.state.write();
@@ -225,6 +240,9 @@ fn dispatch(invocation: &Invocation, context: &mut Context) -> Envelope {
         }
         Invocation::Plan { target } => plan(context, target),
         Invocation::Switch { target, aur_helper } => switch(context, target, aur_helper.as_deref()),
+        Invocation::Install { source, shell } => {
+            crate::install::install(context, source, shell.as_deref())
+        }
         Invocation::List => list(context),
         Invocation::Info { name } => info(context, name),
         Invocation::Delete { name, force } => delete(context, name, *force),
@@ -480,18 +498,7 @@ fn snapshot(context: &mut Context, name: &str, force: bool, only: Option<&[Strin
     if let Some(warning) = active.warning {
         warnings.push(warning);
     }
-    let mut stack = Vec::new();
-    let mut mirrored = Vec::new();
-    for relative in &selected {
-        match mirror_into(&context.home, relative, &profile, &mut stack) {
-            Ok(true) => mirrored.push(relative.clone()),
-            // The selection vanished between scan and copy: nothing to mirror.
-            Ok(false) => {}
-            // One unreadable path must not take the capture down with it; the
-            // envelope says what did not make it in.
-            Err(error) => warnings.push(error),
-        }
-    }
+    let mirrored = mirror_selection(&context.home, &selected, &profile, &mut warnings);
 
     let captured = profile.join(".config").join("hypr").join("hyprland.conf");
     if captured.is_file() {
@@ -545,7 +552,7 @@ fn snapshot(context: &mut Context, name: &str, force: bool, only: Option<&[Strin
 /// The collision rule: an existing profile directory refuses unless `force`
 /// clears it first — the name and the directory stay, everything under them
 /// is the new capture's to write. A missing profile is simply `Ok`.
-fn clear_for_overwrite(profile: &Path, force: bool) -> Result<(), String> {
+pub(crate) fn clear_for_overwrite(profile: &Path, force: bool) -> Result<(), String> {
     match std::fs::symlink_metadata(profile) {
         Ok(_) if !force => Err(format!(
             "a profile already exists at {}; snapshot with --force to overwrite it",
@@ -581,7 +588,7 @@ fn clear_for_overwrite(profile: &Path, force: bool) -> Result<(), String> {
 ///
 /// `stack` holds the directories currently being copied, by canonical path,
 /// so a symlink back up the tree ends the recursion instead of chasing it.
-fn mirror_into(
+pub(crate) fn mirror_into(
     home: &Path,
     relative: &str,
     profile: &Path,
@@ -615,6 +622,30 @@ fn mirror_into(
                 destination.display()
             )
         })
+}
+
+/// Mirrors a scanned selection into a profile, collecting what made it in.
+///
+/// Both `snapshot` and `install` run exactly this: the same walk, the same
+/// symlink-dereferencing copy, the same tolerance — a selection that vanished
+/// between the scan and the copy contributes nothing, and one unreadable path
+/// is a warning on the envelope, never a failure that takes the operation down.
+pub(crate) fn mirror_selection(
+    root: &Path,
+    selected: &[String],
+    profile: &Path,
+    warnings: &mut Vec<String>,
+) -> Vec<String> {
+    let mut stack = Vec::new();
+    let mut mirrored = Vec::new();
+    for relative in selected {
+        match mirror_into(root, relative, profile, &mut stack) {
+            Ok(true) => mirrored.push(relative.clone()),
+            Ok(false) => {}
+            Err(error) => warnings.push(error),
+        }
+    }
+    mirrored
 }
 
 /// Mirrors one directory tree, guarding the recursion against symlinks that
@@ -668,7 +699,7 @@ fn copy_entries(source: &Path, destination: &Path, stack: &mut Vec<PathBuf>) -> 
 /// into — is left verbatim, so a forced re-snapshot can never duplicate the
 /// line. Switch time never comes back here: profiles are written once, at
 /// snapshot time.
-fn inject_hardware_source(captured: &Path) -> Result<(), String> {
+pub(crate) fn inject_hardware_source(captured: &Path) -> Result<(), String> {
     let content = std::fs::read_to_string(captured)
         .map_err(|error| format!("cannot read {}: {error}", captured.display()))?;
     if content.lines().any(sources_hardware) {
@@ -727,12 +758,42 @@ fn build_manifest(
     packages: &PackageScan,
     services: Vec<Service>,
 ) -> Manifest {
+    build_manifest_from(
+        name,
+        has_screenshot,
+        files,
+        packages,
+        services,
+        ManifestOrigin::default(),
+    )
+}
+
+/// What an `install` knows that a `snapshot` does not: where the rice came from,
+/// and the shell it names. Default is the snapshot's shape — no source, no
+/// shell, no description, and a screenshot only when one was taken.
+#[derive(Default)]
+pub(crate) struct ManifestOrigin {
+    pub description: String,
+    pub source_url: Option<String>,
+    pub source_commit: Option<String>,
+    pub shell: Option<Shell>,
+}
+
+/// The one place a `profile.toml` is built, shared by `snapshot` and `install`.
+pub(crate) fn build_manifest_from(
+    name: &str,
+    has_screenshot: bool,
+    files: &[String],
+    packages: &PackageScan,
+    services: Vec<Service>,
+    origin: ManifestOrigin,
+) -> Manifest {
     let now = now_rfc3339();
     Manifest {
         manifest_version: CURRENT_MANIFEST_VERSION,
         profile: ProfileInfo {
             name: name.to_string(),
-            description: String::new(),
+            description: origin.description,
             created_at: now.clone(),
             updated_at: now,
             screenshot: if has_screenshot {
@@ -740,8 +801,8 @@ fn build_manifest(
             } else {
                 String::new()
             },
-            source_url: None,
-            source_commit: None,
+            source_url: origin.source_url,
+            source_commit: origin.source_commit,
         },
         packages: Packages {
             official: packages.official.clone(),
@@ -751,7 +812,7 @@ fn build_manifest(
         // A snapshot records the shell it found running, so a later switch can
         // recognise it and end it. `detect` reads it off the environment the
         // same way it reads the services out of `exec-once`.
-        shell: None,
+        shell: origin.shell,
         files: files
             .iter()
             .map(|path| FileEntry {
@@ -767,7 +828,7 @@ fn build_manifest(
 /// terminal, and color scheme that showed up among the captured paths and
 /// packages. Nothing detected means no key — the GUI renders the table as it
 /// finds it.
-fn auto_rice_info(files: &[String], packages: &PackageScan) -> RiceInfo {
+pub(crate) fn auto_rice_info(files: &[String], packages: &PackageScan) -> RiceInfo {
     const BARS: &[&str] = &["waybar", "ags", "quickshell"];
     const TERMINALS: &[&str] = &["kitty", "foot", "fish", "alacritty", "wezterm", "ghostty"];
     const COLOR_SCHEMES: &[&str] = &["matugen", "pywal"];
@@ -804,7 +865,7 @@ fn auto_rice_info(files: &[String], packages: &PackageScan) -> RiceInfo {
 
 /// The current instant as an RFC 3339 UTC timestamp — the manifest's
 /// `created_at`/`updated_at` format, with no date crate to get there.
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
@@ -860,7 +921,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 ///
 /// `aur_helper` is the `--aur-helper` override: it pins the helper instead of
 /// runtime detection (yay before paru).
-fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Envelope {
+pub(crate) fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Envelope {
     let mut emitter = Emitter::new("switch");
 
     // Set up SIGTERM handler
@@ -1207,66 +1268,7 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
             .map(|shell| shell.name.as_str()),
         &BTreeSet::new(),
     );
-    for warning in &reconcile_report.warnings {
-        emitter.warning(warning);
-        warnings.push(warning.clone());
-    }
-    for drift in &reconcile_report.appid_drift {
-        let note = format!("this profile's shell recipe disagrees with its own QML: {drift}");
-        emitter.warning(&note);
-        warnings.push(note);
-    }
-    // The env block is a materialized fact, not a repair of a dead name, so it
-    // is announced as itself rather than swept into the rewrite note below.
-    if let Some(block) = &reconcile_report.env
-        && block.written
-    {
-        let names = block
-            .entries
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect::<Vec<&str>>()
-            .join(", ");
-        let note = format!(
-            "materialized this profile's recipe environment in `{}` ({names}), inside the \
-             block RiceSwap owns",
-            block.file
-        );
-        emitter.warning(&note);
-        warnings.push(note);
-    }
-    for created in &reconcile_report.dirs_created {
-        let note = format!("guaranteed the path `{created}` this profile's recipe declares");
-        emitter.warning(&note);
-        warnings.push(note);
-    }
-    for rewritten in &reconcile_report.files_written {
-        if reconcile_report
-            .env
-            .as_ref()
-            .is_some_and(|block| block.file == *rewritten)
-        {
-            continue; // Already announced as the managed env block.
-        }
-        let note = format!(
-            "repaired the dispatcher names in `{rewritten}`: this profile's shell does not \
-             register what it was dispatching"
-        );
-        emitter.warning(&note);
-        warnings.push(note);
-    }
-    for dead in &reconcile_report.dead_names {
-        let note = format!(
-            "`{dead}` is dispatched in this profile but its shell registers no such shortcut; \
-             left as it was"
-        );
-        emitter.warning(&note);
-        warnings.push(note);
-    }
-    // A pass that had nothing to reconcile says nothing out loud: a profile
-    // naming no shell, or one whose QML tree is not there, is an ordinary
-    // profile, not something to warn a user about on every switch. The reason
-    // rides the envelope, where the panel can show it.
+    announce_reconcile(&mut emitter, &reconcile_report, &mut warnings);
     context.progress(&mut emitter, "linking managed config paths");
     // A path the old profile managed and the new one does not used to be
     // deleted. That is the one place the switch could still lose data: the
@@ -1412,6 +1414,81 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
     envelope.warnings = warnings;
     with_tools(&mut envelope, Tool::ALL);
     envelope
+}
+
+/// Says what a reconciliation pass found, out loud and into `warnings`.
+///
+/// Both passes that run the engine speak through here — the switch's own and the
+/// install's install-adapt — so a repair reads the same whether it was made on
+/// the way in or on the way across. Order is the engine's report order: findings
+/// first, then the appid drift, the materialized env block, the guaranteed
+/// paths, the rewritten files, and what stayed dead.
+///
+/// A pass that had nothing to reconcile says nothing out loud: a profile naming
+/// no shell, or one whose QML tree is not there, is an ordinary profile, not
+/// something to warn a user about on every switch. The reason rides the
+/// envelope, where the panel can show it.
+pub(crate) fn announce_reconcile(
+    emitter: &mut Emitter,
+    report: &reconcile::Report,
+    warnings: &mut Vec<String>,
+) {
+    for warning in &report.warnings {
+        emitter.warning(warning);
+        warnings.push(warning.clone());
+    }
+    for drift in &report.appid_drift {
+        let note = format!("this profile's shell recipe disagrees with its own QML: {drift}");
+        emitter.warning(&note);
+        warnings.push(note);
+    }
+    // The env block is a materialized fact, not a repair of a dead name, so it
+    // is announced as itself rather than swept into the rewrite note below.
+    if let Some(block) = &report.env
+        && block.written
+    {
+        let names = block
+            .entries
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<&str>>()
+            .join(", ");
+        let note = format!(
+            "materialized this profile's recipe environment in `{}` ({names}), inside the \
+             block RiceSwap owns",
+            block.file
+        );
+        emitter.warning(&note);
+        warnings.push(note);
+    }
+    for created in &report.dirs_created {
+        let note = format!("guaranteed the path `{created}` this profile's recipe declares");
+        emitter.warning(&note);
+        warnings.push(note);
+    }
+    for rewritten in &report.files_written {
+        if report
+            .env
+            .as_ref()
+            .is_some_and(|block| block.file == *rewritten)
+        {
+            continue; // Already announced as the managed env block.
+        }
+        let note = format!(
+            "repaired the dispatcher names in `{rewritten}`: this profile's shell does not \
+             register what it was dispatching"
+        );
+        emitter.warning(&note);
+        warnings.push(note);
+    }
+    for dead in &report.dead_names {
+        let note = format!(
+            "`{dead}` is dispatched in this profile but its shell registers no such shortcut; \
+             left as it was"
+        );
+        emitter.warning(&note);
+        warnings.push(note);
+    }
 }
 
 /// Installs every package of one class — official or AUR — in a *single*
@@ -2226,7 +2303,7 @@ fn wallpaper_import(context: &mut Context, path: &str) -> Envelope {
 
 /// Verifies `source` is an existing, readable image file. Every failure is a
 /// message naming the path, so the refusal explains itself.
-fn validate_image(source: &Path) -> Result<(), String> {
+pub(crate) fn validate_image(source: &Path) -> Result<(), String> {
     let metadata = std::fs::metadata(source).map_err(|error| match error.kind() {
         ErrorKind::NotFound => format!(
             "{} does not exist; wallpaper-import needs a path to an image file",
@@ -2308,7 +2385,7 @@ fn has_image_signature(header: &[u8]) -> bool {
 /// Where the image should land: its own file name when free (or already the
 /// same image, so the move is a no-op overwrite), otherwise a numbered name —
 /// importing must never destroy a wallpaper already in the layer.
-fn available_destination(wallpapers: &Path, source: &Path, name: &OsStr) -> PathBuf {
+pub(crate) fn available_destination(wallpapers: &Path, source: &Path, name: &OsStr) -> PathBuf {
     let destination = wallpapers.join(name);
     if !destination.exists() || same_contents(source, &destination) {
         return destination;
@@ -3151,7 +3228,7 @@ fn staged_link_path(link: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-fn describe(status: &tools::ToolStatus) -> String {
+pub(crate) fn describe(status: &tools::ToolStatus) -> String {
     match (&status.error, status.exit_code) {
         (Some(error), _) if !status.available => error.clone(),
         (Some(error), Some(code)) => format!("exited {code}: {error}"),

@@ -8,6 +8,7 @@
 mod cli;
 mod detection;
 mod envelope;
+mod install;
 mod operations;
 mod profile;
 mod recipe;

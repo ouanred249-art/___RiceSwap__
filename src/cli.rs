@@ -1,4 +1,4 @@
-//! Argument parsing for the ten operations.
+//! Argument parsing for the operations.
 //!
 //! The GUI spawns one subprocess per operation, so the only interface here is
 //! argv. Anything unrecognized becomes a message, never a panic.
@@ -8,6 +8,7 @@ use std::fmt;
 /// The full operation surface, for error messages.
 pub const USAGE: &str = "expected one of: \
      detect, snapshot <name> [--force] [--only <paths>], plan <target>, switch <target> [--aur-helper <helper>], \
+     install <source> [--shell <name>], \
      list, info <name>, delete <name> [--force], diff <a> <b>, wallpaper-import <path>, init";
 
 /// One parsed operation invocation.
@@ -30,6 +31,14 @@ pub enum Invocation {
     Switch {
         target: String,
         aur_helper: Option<String>,
+    },
+    /// `install <source> [--shell <name>]` — acquire a foreign rice (a git URL
+    /// or a local directory), identify its shell, materialize it as a profile
+    /// and switch to it. `--shell` picks between the shells a tree carries when
+    /// more than one is there; the profile is then named after the shell.
+    Install {
+        source: String,
+        shell: Option<String>,
     },
     List,
     Info {
@@ -58,6 +67,7 @@ impl Invocation {
             Invocation::Snapshot { .. } => "snapshot",
             Invocation::Plan { .. } => "plan",
             Invocation::Switch { .. } => "switch",
+            Invocation::Install { .. } => "install",
             Invocation::List => "list",
             Invocation::Info { .. } => "info",
             Invocation::Delete { .. } => "delete",
@@ -75,7 +85,14 @@ impl Invocation {
             Invocation::Delete { name, .. } => Some(name.clone()),
             Invocation::Diff { a, .. } => Some(a.clone()),
             Invocation::WallpaperImport { path } => Some(path.clone()),
-            Invocation::Detect | Invocation::List | Invocation::Init => None,
+            // `install` names no profile at parse time: which shell the rice
+            // carries is only known once the acquired tree has been read, and
+            // the operation claims the profile the moment it knows — so the
+            // running operation starts with no target and gains one.
+            Invocation::Detect
+            | Invocation::List
+            | Invocation::Init
+            | Invocation::Install { .. } => None,
         }
     }
 }
@@ -112,6 +129,11 @@ pub fn parse(args: &[String]) -> Result<Invocation, ArgumentError> {
             let (aur_helper, positional) = split_aur_helper(operation, rest)?;
             let target = exactly_one(operation, "<target>", positional)?;
             Ok(Invocation::Switch { target, aur_helper })
+        }
+        "install" => {
+            let (shell, positional) = split_shell(operation, rest)?;
+            let source = exactly_one(operation, "<source>", positional)?;
+            Ok(Invocation::Install { source, shell })
         }
         "info" => Ok(Invocation::Info {
             name: one_positional(operation, "<name>", rest)?,
@@ -311,6 +333,44 @@ fn split_aur_helper<'a>(
         }
     }
     Ok((helper, positional))
+}
+
+/// Pulls `--shell <name>` out of `install`'s argument list wherever it appears,
+/// rejecting every other flag. The override picks between the Quickshell shells
+/// a tree carries when it carries more than one; without it an ambiguous tree is
+/// refused rather than guessed at.
+fn split_shell<'a>(
+    operation: &str,
+    rest: &'a [String],
+) -> Result<(Option<String>, Vec<&'a str>), ArgumentError> {
+    let mut shell = None;
+    let mut positional = Vec::new();
+    let mut arguments = rest.iter();
+    while let Some(argument) = arguments.next() {
+        if argument == "--shell" {
+            let usage = format!(
+                "`{operation}` needs a shell name after `--shell`; \
+                 usage: {operation} <source> --shell <name>"
+            );
+            let Some(name) = arguments.next() else {
+                return Err(ArgumentError(usage));
+            };
+            if name.starts_with("--") {
+                return Err(ArgumentError(usage));
+            }
+            if shell.is_some() {
+                return Err(ArgumentError(format!(
+                    "`{operation}` was given `--shell` more than once"
+                )));
+            }
+            shell = Some(name.clone());
+        } else if argument.starts_with("--") {
+            return Err(unknown_flag(operation, argument));
+        } else {
+            positional.push(argument.as_str());
+        }
+    }
+    Ok((shell, positional))
 }
 
 fn unknown_flag(operation: &str, flag: &str) -> ArgumentError {

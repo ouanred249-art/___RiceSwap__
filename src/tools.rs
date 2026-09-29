@@ -110,7 +110,11 @@ pub fn probe_all(tools: &[Tool]) -> ToolReport {
         .collect()
 }
 
-fn probe(tool: Tool) -> ToolStatus {
+/// Probes one tool and answers with what came back, for the operations that
+/// need to know before they start: an `install` that shells out to `git` asks
+/// whether there is a `git` first, so a machine without one is refused instead
+/// of half-way through a clone.
+pub fn probe(tool: Tool) -> ToolStatus {
     match Command::new(tool.name()).args(tool.version_args()).output() {
         Err(error) => ToolStatus {
             available: false,

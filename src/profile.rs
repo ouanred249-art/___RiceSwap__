@@ -75,6 +75,13 @@ impl Store {
         self.data_dir().join("profiles")
     }
 
+    /// `~/.local/share/riceswap/sources`, the acquisition cache: one full
+    /// clone per repo, under `<slug>/<commit-sha>/`, which is what an
+    /// `install` from a git URL reads instead of the network.
+    pub fn sources_dir(&self) -> PathBuf {
+        self.data_dir().join("sources")
+    }
+
     /// `~/.local/share/riceswap/wallpapers`, the shared wallpaper layer every
     /// profile draws on.
     pub fn wallpapers_dir(&self) -> PathBuf {
@@ -329,8 +336,10 @@ impl Store {
 }
 
 /// A profile name is a directory name: no separators, no hidden directories, and
-/// nothing that could reach outside the store.
-fn valid_name(name: &str) -> bool {
+/// nothing that could reach outside the store. The acquisition cache reuses it
+/// for the directory name it derives from a repo URL's last path segment, so the
+/// same rules keep a slug from reaching outside `sources/`.
+pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty() && !name.starts_with('.') && !name.contains('/') && !name.contains('\0')
 }
 

@@ -100,6 +100,15 @@ impl Mode {
 ///   the outcome; a scripted `Denied` mode on `pkexec` is the dead polkit
 ///   agent (real refusal words), a scripted failure elsewhere the dead
 ///   floating terminal;
+/// - `git` is the acquisition seam, and the only stub that has to *do*
+///   something rather than answer a version: `git clone <url> <dest>` copies
+///   the tree named by `RICESWAP_STUB_GIT_SOURCE` into the destination and
+///   leaves a `.git` behind (a clone is a checkout), and `git -C <dir>
+///   rev-parse HEAD` prints the sha in `RICESWAP_STUB_GIT_SHA` when `<dir>`
+///   carries that `.git` and fails the way git does when it does not — a clone
+///   that copied nothing would leave the install nothing to read, and a
+///   rev-parse that answered for any directory would put a commit in the
+///   manifest of a tree that has none;
 /// - a rule in `RICESWAP_STUB_FAIL_DIR/<tool>` fails just the invocations
 ///   whose arguments contain the pattern (see `fail_on`), leaving
 ///   `--version` probes answerable — a helper that detects cleanly and then
@@ -151,6 +160,39 @@ if [ "$mode" = "ok" ]; then
       fi
       ;;
   esac
+  if [ "$name" = "git" ]; then
+    case "$1" in
+      clone)
+        destination=
+        for argument in "$@"; do destination=$argument; done
+        if [ ! -d "$destination" ]; then
+          mkdir -p "$destination" || exit 1
+        fi
+        if [ -r "$RICESWAP_STUB_GIT_SOURCE" ]; then
+          read -r origin < "$RICESWAP_STUB_GIT_SOURCE"
+          if [ -n "$origin" ] && [ -d "$origin" ]; then
+            cp -R "$origin/." "$destination/" || exit 1
+          fi
+        fi
+        # A clone is a checkout: it leaves a `.git` behind, which is what makes
+        # the very next `rev-parse` answer for this directory and not for some
+        # unrelated one. A clone without it is not a tree the installer could
+        # pin a commit to.
+        mkdir -p "$destination/.git" || exit 1
+        printf 'ref: refs/heads/stub\n' > "$destination/.git/HEAD" || exit 1
+        exit 0 ;;
+      -C)
+        if [ -e "$2/.git" ]; then
+          sha=
+          if [ -r "$RICESWAP_STUB_GIT_SHA" ]; then read -r sha < "$RICESWAP_STUB_GIT_SHA"; fi
+          [ -n "$sha" ] || sha=0000000000000000000000000000000000000000
+          printf '%s\n' "$sha"
+          exit 0
+        fi
+        printf 'fatal: not a git repository (or any of the parent directories): .git\n' >&2
+        exit 128 ;;
+    esac
+  fi
   if [ "$name" = "pacman" ] && [ "$1" = "-Qo" ]; then
     query=$2
     base=${query##*/}
@@ -275,6 +317,8 @@ pub struct Sandbox {
     packages: PathBuf,
     delays: PathBuf,
     fails: PathBuf,
+    git_source: PathBuf,
+    git_sha: PathBuf,
 }
 
 impl Sandbox {
@@ -291,6 +335,8 @@ impl Sandbox {
         let packages = root.path().join("installed-packages.txt");
         let delays = root.path().join("delays");
         let fails = root.path().join("fail-on");
+        let git_source = root.path().join("git-source.txt");
+        let git_sha = root.path().join("git-sha.txt");
         for dir in [&home, &bin, &modes, &states, &delays, &fails] {
             fs::create_dir_all(dir).expect("create sandbox directory");
         }
@@ -302,6 +348,9 @@ impl Sandbox {
         fs::write(&conflicts, "").expect("create package conflict fixture");
         fs::write(&needed, "").expect("create still-needed fixture");
         fs::write(&packages, "").expect("create installed-package state");
+        fs::write(&git_source, "").expect("create git clone-source fixture");
+        fs::write(&git_sha, "1a2b3c4d5e6f70819a2b3c4d5e6f70819a2b3c4d\n")
+            .expect("create git sha fixture");
         Sandbox {
             _root: root,
             home,
@@ -315,6 +364,8 @@ impl Sandbox {
             packages,
             delays,
             fails,
+            git_source,
+            git_sha,
         }
     }
 
@@ -414,6 +465,25 @@ impl Sandbox {
         fs::write(&self.owners, owners).expect("write owner fixture");
     }
 
+    /// Points the `git` stub's clone at `tree`: the bytes a
+    /// `git clone <url> <dest>` produces. Re-pointable, so one sandbox can
+    /// serve a repo that changes between two installs.
+    pub fn clone_from(&self, tree: &Path) {
+        fs::write(&self.git_source, format!("{}\n", tree.display())).expect("write clone source");
+    }
+
+    /// The sha the `git` stub answers `rev-parse HEAD` with, for the checkouts
+    /// it is told about.
+    pub fn git_reports_commit(&self, sha: &str) {
+        fs::write(&self.git_sha, format!("{sha}\n")).expect("write git sha fixture");
+    }
+
+    /// A path beside the fake `$HOME`, for fixtures that must not live inside
+    /// it: an acquired rice a user hands the installer in, for instance.
+    pub fn outside_home(&self, relative: &str) -> PathBuf {
+        self._root.path().join(relative)
+    }
+
     /// The configured subprocess: clean environment, sandboxed `$HOME` and
     /// `PATH`, stub fixtures wired in. `run` and `spawn` both start here, so
     /// a spawned operation sees exactly what a blocking one sees.
@@ -431,7 +501,9 @@ impl Sandbox {
             .env("RICESWAP_STUB_NEEDED", &self.needed)
             .env("RICESWAP_STUB_PACKAGES", &self.packages)
             .env("RICESWAP_STUB_DELAY_DIR", &self.delays)
-            .env("RICESWAP_STUB_FAIL_DIR", &self.fails);
+            .env("RICESWAP_STUB_FAIL_DIR", &self.fails)
+            .env("RICESWAP_STUB_GIT_SOURCE", &self.git_source)
+            .env("RICESWAP_STUB_GIT_SHA", &self.git_sha);
         command
     }
 
@@ -462,6 +534,8 @@ impl Sandbox {
             .env("RICESWAP_STUB_PACKAGES", &self.packages)
             .env("RICESWAP_STUB_DELAY_DIR", &self.delays)
             .env("RICESWAP_STUB_FAIL_DIR", &self.fails)
+            .env("RICESWAP_STUB_GIT_SOURCE", &self.git_source)
+            .env("RICESWAP_STUB_GIT_SHA", &self.git_sha)
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

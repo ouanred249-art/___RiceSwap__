@@ -16,18 +16,33 @@
 //! Every key is always present; `null` means idle. `started_at` is Unix epoch
 //! seconds. The file is rewritten after every state change, via a temp file and
 //! a rename so the watcher never reads a half-written document.
+//!
+//! The `operation` entry carries one more field, `source`, which only `install`
+//! fills in. An install's steps are idempotent and it has a fatal half — a
+//! missing AUR helper, a profile that cannot be written — so "run the same
+//! command again" is how a user resumes it; the marker that tells a *half*
+//! install apart from a *finished* one has to name both what was being installed
+//! and where it was being installed to. A finished install clears the entry like
+//! every other operation, so a plain re-run of a complete install is refused
+//! instead of re-materializing a profile that is already live. See
+//! [`StateStore::claim`].
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The operation currently running.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct OperationState {
     pub name: String,
     pub target: Option<String>,
     pub started_at: u64,
     pub step: u32,
+    /// The source an `install` is installing — the git URL, or the `file://`
+    /// form of the local directory. `null` for every other operation, and for
+    /// an install that has not resolved its source yet.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// The outcome of the last finished operation.
@@ -50,15 +65,33 @@ pub struct State {
 pub struct StateStore {
     path: PathBuf,
     state: State,
+    /// The operation that was already on disk when this process loaded the
+    /// document — the one that never reached its own `finish`, because the
+    /// process died. Read *before* [`StateStore::begin`] overwrites it, and
+    /// only `install` has anything to say about one (see
+    /// [`StateStore::interrupted`]).
+    interrupted: Option<OperationState>,
+    /// Whether this operation claimed a profile and must stay marked in
+    /// `state.json` when it fails — set by [`StateStore::claim`], consumed by
+    /// [`StateStore::finish`].
+    holding: bool,
 }
 
 impl StateStore {
     /// Loads the document at `path`, falling back to a fresh one when the file
     /// is missing or unreadable — a corrupt state file must not stop the backend.
+    ///
+    /// The running operation is deliberately *not* carried into the new state: a
+    /// backend that starts while another one is running shows no operation of
+    /// its own. What is kept is the entry that was already on disk, for the one
+    /// operation that has to reason about a predecessor.
     pub fn load(path: PathBuf) -> StateStore {
-        let state = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        let raw = std::fs::read_to_string(&path).ok();
+        let parsed = raw
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+        let state = parsed
+            .as_ref()
             .map(|value| State {
                 initialized: value["initialized"].as_bool().unwrap_or(false),
                 active_profile: value["active_profile"].as_str().map(str::to_string),
@@ -71,7 +104,23 @@ impl StateStore {
                 operation: None,
                 last_result: None,
             });
-        StateStore { path, state }
+        // An entry this build cannot read is no marker: a state file written by
+        // a future build, or a hand-edited one, must not make a profile look
+        // half-installed.
+        let interrupted = parsed.as_ref().and_then(|value| {
+            serde_json::from_value::<OperationState>(value["operation"].clone()).ok()
+        });
+        StateStore {
+            path,
+            state,
+            interrupted,
+            holding: false,
+        }
+    }
+
+    /// The operation this process found already on disk, if one was there.
+    pub fn interrupted(&self) -> Option<&OperationState> {
+        self.interrupted.as_ref()
     }
 
     /// Records the operation that is starting.
@@ -81,7 +130,25 @@ impl StateStore {
             target,
             started_at: now(),
             step: 0,
+            source: None,
         });
+    }
+
+    /// Points the running operation at the profile it has just claimed, under
+    /// the source it resolved that profile from, and marks the entry as one that
+    /// has to survive a failure.
+    ///
+    /// This is what makes a half-finished install resumable by plain
+    /// re-invocation: the next run reads [`StateStore::interrupted`], sees an
+    /// `install` of the *same* source that had claimed the *same* profile, and
+    /// is allowed to clear and re-make it instead of refusing. A `switch` of the
+    /// same profile records nothing here, so it never confers that permission.
+    pub fn claim(&mut self, target: &str, source: &str) {
+        if let Some(operation) = &mut self.state.operation {
+            operation.target = Some(target.to_string());
+            operation.source = Some(source.to_string());
+        }
+        self.holding = true;
     }
 
     /// Advances the visible step, so a panel reopened mid-operation still
@@ -93,8 +160,16 @@ impl StateStore {
     }
 
     /// Records the outcome and clears the running operation.
+    ///
+    /// An operation that claimed a profile and then failed keeps its entry: its
+    /// steps are idempotent and the next run of the same command is the resume.
+    /// `last_result` still says the operation failed, and the panel that
+    /// watched it stream knows it is over — the entry is the record a *later*
+    /// invocation reads to tell a half-made profile from a finished one.
     pub fn finish(&mut self, ok: bool, warnings: Vec<String>) {
-        self.state.operation = None;
+        if ok || !self.holding {
+            self.state.operation = None;
+        }
         self.state.last_result = Some(LastResult { ok, warnings });
     }
 
