@@ -78,7 +78,7 @@
 //! outside them is the user's and is never read into a decision or written, and
 //! a pass that would leave the file identical writes nothing at all.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -107,7 +107,13 @@ pub const BUILT_IN: &[(&str, &str)] = &[
 /// One recipe document. Every tier parses this and nothing else — the human file
 /// and the machine recipe are the same artifact type, so a resolution that
 /// works in one works in the others.
-#[derive(Debug, Default, Deserialize)]
+///
+/// It also *renders*, which is what the research tier's write-back needs (#38):
+/// a recipe produced by a model has to be the same artifact as one written by
+/// hand, and the only way to know that is to render this type and parse it back
+/// with the same code that reads a hand-written file. `deny_unknown_fields`
+/// stays on both sides, which is what makes that round trip a real proof.
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Recipe {
     /// The format marker. Optional so a bare `adapt.toml` needs no ceremony, and
@@ -115,7 +121,7 @@ pub struct Recipe {
     pub schema_version: Option<u32>,
     /// Which shell this recipe is about, and the namespace it was authored
     /// against.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<Shell>,
     /// Variables to guarantee in the profile's managed env block.
     #[serde(default)]
@@ -134,7 +140,7 @@ pub struct Recipe {
 }
 
 /// The `[shell]` table.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Shell {
     /// The Quickshell config the recipe is about. A built-in recipe must name
@@ -147,15 +153,16 @@ pub struct Shell {
 
 /// One `[[dirs]]` entry: a path to guarantee, and where a symlink at it should
 /// point. With no `symlink_to` the path is guaranteed to be a directory.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Dir {
     pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub symlink_to: Option<String>,
 }
 
 /// The `[foreign]` table: names the engine must treat as another live shell's.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Foreign {
     #[serde(default)]
@@ -165,17 +172,20 @@ pub struct Foreign {
 /// One `[[resolution]]` entry, exactly as declared. The trilemma — one of `to`,
 /// `exec`, `drop` — is settled by [`Declared::decide`], so an entry that names
 /// two sides is a *finding*, not a silent preference.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Declared {
     /// The join key: `ns:name` for one namespace, or the bare name to answer
     /// whichever namespace the dead name was dispatched under.
     pub dispatched: String,
     /// The target shortcut, with or without the appid.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
     /// The command to run instead of dispatching.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub exec: Option<String>,
     /// `true` to remove the statement that dispatches it.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub drop: Option<bool>,
     /// Options to add to the bind's own option table, alongside `to`.
     #[serde(default)]

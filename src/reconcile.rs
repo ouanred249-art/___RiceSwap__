@@ -477,6 +477,113 @@ pub fn reconcile(
     report
 }
 
+/// What a read-only look at a tree found, in the shape the research brief reads.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Survey {
+    /// The appid the shell's tree declares, when the parse could establish one.
+    /// `null` when the tree is missing or its appid is ambiguous — the two cases
+    /// where naming one would be a guess.
+    pub appid: Option<String>,
+    /// How many registrations the parse proved.
+    pub registered: usize,
+    /// Every dispatched name nothing in the tree answers to, with the file and
+    /// line it is on. These are the engine's proposal vocabulary for a tree that
+    /// has not been installed yet, and the questions a research brief is built
+    /// from: a name on four binds is four lines to look at.
+    pub dead: Vec<SurveySite>,
+    /// Everything the parse could not settle — the same findings the pass
+    /// reports, so a brief and a report never disagree about what is uncertain.
+    pub uncertain: Vec<String>,
+    /// Set instead of surveying, naming why: a tree with no QML for this shell,
+    /// or no Hyprland config to dispatch anything from.
+    pub skipped: Option<String>,
+}
+
+/// One dispatched name a survey found dead.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct SurveySite {
+    /// The dead entry as the config dispatched it, `ns:name`.
+    pub dispatched: String,
+    /// The config file, `$HOME`-relative when the tree sits under one.
+    pub file: String,
+    /// The 1-based line the dispatch is on.
+    pub line: usize,
+}
+
+/// Reads a tree and says what the engine could prove about it — without
+/// rewriting anything, because the tree being surveyed is the *source*: a
+/// clone this tool made, or the user's own directory, and an install must not
+/// take bytes out of either.
+///
+/// This is [`reconcile`] with the writes removed, and it exists because the
+/// research tier has to ask its question at a point where no profile has been
+/// materialized yet: the brief is built from dead names and parse findings, and
+/// both are facts the engine already computes. Deriving them twice — once here
+/// for the brief, once in the real pass after the write-back — is the price of
+/// asking before the profile exists, and it is the price worth paying: the
+/// write-back has to land *before* the pass that consumes it reads the layers.
+pub fn survey(tree: &Path, shell: &str) -> Survey {
+    let mut survey = Survey {
+        appid: None,
+        registered: 0,
+        dead: Vec::new(),
+        uncertain: Vec::new(),
+        skipped: None,
+    };
+    let registry = Registry::derive(tree, shell);
+    if let Some(reason) = &registry.skipped {
+        survey.skipped = Some(reason.clone());
+        return survey;
+    }
+    survey.appid = Some(registry.appid.clone());
+    survey.registered = registry.entries.len();
+    survey.uncertain = registry.uncertain.clone();
+
+    let hypr = tree.join(".config").join("hypr");
+    if !hypr.is_dir() {
+        survey.skipped = Some(format!(
+            "{} holds no Hyprland config, so it dispatches nothing",
+            tree.display()
+        ));
+        return survey;
+    }
+    // Only the built-in foreign guard, because there is nothing else yet: no
+    // profile means no `adapt.toml`, and a research run has not written the user
+    // tier yet. The pass that runs afterwards re-derives the same dead set with
+    // every layer loaded, and the recipe this brief produces is an input to it.
+    let keep: BTreeSet<String> = FOREIGN.iter().map(|entry| entry.to_string()).collect();
+    for path in configs_in_scope(&hypr) {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            survey
+                .uncertain
+                .push(format!("{}: could not be read", relative(&path)));
+            continue;
+        };
+        let scan = scan(&text);
+        for dynamic in &scan.dynamic {
+            survey.uncertain.push(format!(
+                "{}: `{}` builds its dispatcher name at runtime, so it cannot be resolved",
+                relative(&path),
+                dynamic
+            ));
+        }
+        for site in &scan.sites {
+            let entry = site.entry();
+            if keep.contains(&entry) || registry.holds(&site.appid, &site.name) {
+                continue;
+            }
+            survey.dead.push(SurveySite {
+                dispatched: entry,
+                file: relative(&path),
+                line: site.line,
+            });
+        }
+    }
+    survey.dead.sort();
+    survey.dead.dedup();
+    survey
+}
+
 /// Keeps the pre-change bytes, then writes the new ones — the one place a
 /// config is ever replaced, so the "compare first" discipline has a single name.
 ///

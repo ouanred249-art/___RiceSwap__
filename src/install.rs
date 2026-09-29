@@ -21,13 +21,25 @@
 //!    the wrong desktop; none at all is refused outright, whatever else the tree
 //!    carries. `--shell` picks the winner when the tree offers a choice.
 //!
+//! 1b. **Research, for a shell nothing here knows.** Only a rice no built-in
+//!    recipe covers and no `adapt.toml` answers for, and only when the static
+//!    parse of its own QML could not prove the registry: one `pi` run, offline,
+//!    tool-stripped, against the acquired tree, and its validated answer saved
+//!    as a *user-tier* recipe at `<data-dir>/recipes/<shell>.toml`. It runs
+//!    here, before the profile exists, because the recipe has to be on disk
+//!    before the adapt pass below loads the layers — and it can never fail the
+//!    install: no `pi`, a hung run, a provider refusal, a model that will not
+//!    answer in JSON are all a warning and the engine + declarations floor
+//!    ([`crate::research`]).
+//!
 //! 2. **Materialize.** The same machinery `snapshot` uses, pointed at the
 //!    acquired tree instead of `$HOME`: the detected config dirs and assets are
 //!    mirrored into a new profile, the shared-hardware `source =` line is
 //!    injected into the captured Hyprland config, wallpapers are imported into
 //!    the shared layer, and the manifest is written with the real `source_url` /
 //!    `source_commit`, a `[shell]` table naming the shell that was identified,
-//!    and no screenshot — an acquired tree is not running.
+//!    the packages the research answer named merged into `[packages]`, and no
+//!    screenshot — an acquired tree is not running.
 //!
 //! 3. **Adapt and switch.** The reconciliation engine runs over the new profile
 //!    before anything goes live (the install-adapt trigger of #35), so the
@@ -60,6 +72,7 @@ use crate::envelope::{Emitter, Envelope};
 use crate::operations::{self, Context};
 use crate::profile::{Manifest, Service, Shell};
 use crate::reconcile;
+use crate::research::{self, Findings};
 use crate::tools::{self, Tool};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -156,8 +169,38 @@ pub fn install(context: &mut Context, source: &str, shell: Option<&str>) -> Enve
         );
     }
 
+    let data_dir = context.store().data_dir();
+
+    // ---- step 1b: the research tier, for a shell nothing here knows.
+    //
+    // It sits between identity and materialization for one reason: the recipe it
+    // writes lives in the *user tier* (`<data-dir>/recipes/<shell>.toml`), and
+    // the adapt pass in step 3a is the first thing that reads the layers. Write
+    // the recipe after that pass and it would be read by the switch's own
+    // re-run instead — one reconcile late, and the bind that made the install
+    // worth running stays dead for one switch. The write-back is proven to
+    // parse before it lands, so what step 3a loads is a recipe, not a file.
+    context.progress(&mut emitter, &format!("researching the `{name}` shell"));
+    let subject = research::Subject {
+        home: context.home(),
+        data: &data_dir,
+        profile: &profile,
+        tree: &acquired.tree,
+        shell: &name,
+    };
+    let mut researched = research::run(&subject);
+    researched.announce(&mut emitter, &mut warnings);
+    researched.write_back(&subject, &mut emitter, &mut warnings);
+
     // ---- step 2: the profile itself.
-    let materialized = match materialize(context, &name, &acquired, claim, &mut warnings) {
+    let materialized = match materialize(
+        context,
+        &name,
+        &acquired,
+        claim,
+        &mut warnings,
+        researched.answer().map(|answer| &answer.findings),
+    ) {
         Ok(materialized) => materialized,
         Err(refusal) => return refusal.into_envelope(),
     };
@@ -169,7 +212,6 @@ pub fn install(context: &mut Context, source: &str, shell: Option<&str>) -> Enve
         &mut emitter,
         &format!("reconciling the dispatcher names in `{name}`"),
     );
-    let data_dir = context.store().data_dir();
     let report = reconcile::reconcile(
         &profile,
         &reconcile::Context::new(context.home(), &data_dir),
@@ -189,6 +231,7 @@ pub fn install(context: &mut Context, source: &str, shell: Option<&str>) -> Enve
         claim,
         &report,
         Some(switched.data.clone()),
+        &researched,
     );
     for warning in switched.warnings {
         warnings.push(warning);
@@ -785,6 +828,7 @@ fn materialize(
     acquired: &Acquired,
     claim: Claim,
     warnings: &mut Vec<String>,
+    researched: Option<&Findings>,
 ) -> Result<Materialized, Refusal> {
     let profile = context.store().profile_dir(name);
     // The collision rule is the snapshot's own: an existing profile refuses
@@ -806,7 +850,19 @@ fn materialize(
 
     let tree = &acquired.tree;
     let config = detection::scan_config(tree);
-    let packages = detection::scan_packages(tree, &config.dirs);
+    let mut packages = detection::scan_packages(tree, &config.dirs);
+    // The research answer's packages join the scan's own, before the manifest
+    // is written, so the switch that follows plans against the union: a shell
+    // that needs a package nothing in its configs names (`quickshell` itself is
+    // the usual one) is exactly the case a static scan cannot see and a brief
+    // that asks "which packages does it need" can.
+    if let Some(findings) = researched {
+        for package in research::merge_packages(&mut packages, findings) {
+            warnings.push(format!(
+                "the research answer for `{name}` named a package: {package}"
+            ));
+        }
+    }
     let mut selected = config.dirs.clone();
     selected.extend(detection::scan_assets(tree));
     selected.sort();
@@ -962,6 +1018,7 @@ fn payload(
     claim: Claim,
     report: &reconcile::Report,
     switch: Option<Value>,
+    researched: &research::Research,
 ) -> Value {
     let clone = acquired.clone.as_ref().map(|clone| {
         json!({
@@ -987,6 +1044,7 @@ fn payload(
             "hypr": identity.hypr,
             "quickshell_configs_without_marker": identity.unmarked,
         },
+        "research": researched.payload(),
         "manifest_written": true,
         "checked_paths": materialized.mirrored,
         "checked_packages": {

@@ -10,6 +10,8 @@
 
 use assert_cmd::Command;
 use serde_json::Value;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -109,6 +111,18 @@ impl Mode {
 ///   that copied nothing would leave the install nothing to read, and a
 ///   rev-parse that answered for any directory would put a commit in the
 ///   manifest of a tree that has none;
+/// - `pi` is the research seam (ticket #38). Its version probe answers like
+///   any other tool; `pi auth check …` answers from
+///   `RICESWAP_STUB_PI_AUTH`; and every other invocation is a *research run*,
+///   which appends its working directory and its flags — everything before the
+///   `--` that ends the brief — to `RICESWAP_STUB_PI_LOG`, one line per
+///   invocation, which is how a test counts invocations and asserts that the
+///   repair pass ran without `--tools`. The run then writes the stream named by
+///   `RICESWAP_STUB_PI_STREAM` to stdout and exits with the code in
+///   `RICESWAP_STUB_PI_EXIT`. The stream is whatever JSONL the test wants: a
+///   good answer, a refusal inside a well-formed stream, prose, or nothing at
+///   all. No test in this file reaches a network, and the real `pi` is never on
+///   the sandbox `PATH`;
 /// - a rule in `RICESWAP_STUB_FAIL_DIR/<tool>` fails just the invocations
 ///   whose arguments contain the pattern (see `fail_on`), leaving
 ///   `--version` probes answerable — a helper that detects cleanly and then
@@ -127,6 +141,63 @@ name=${0##*/}
 printf '%s %s\n' "$name" "$*" >> "$RICESWAP_STUB_LOG"
 if [ -n "$RICESWAP_STUB_STATE_DIR" ] && [ -f "$HOME/.local/share/riceswap/state.json" ]; then
   cp "$HOME/.local/share/riceswap/state.json" "$RICESWAP_STUB_STATE_DIR/$name.json"
+fi
+if [ "$name" = "pi" ]; then
+  # The research seam (ticket #38). Three kinds of invocation, three answers:
+  # the version probe, the advisory auth check, and the research run itself.
+  # A scripted mode still wins, so `pi` can be made unusable the way every other
+  # tool can — which is how the "no pi here" path is exercised.
+  pimode=ok
+  if [ -r "$RICESWAP_STUB_MODE_DIR/$name" ]; then read -r pimode < "$RICESWAP_STUB_MODE_DIR/$name"; fi
+  case "$1" in
+    --version)
+      if [ "$pimode" = "ok" ]; then printf '0.87.1\n'; exit 0; fi ;;
+    auth)
+      if [ "$pimode" = "ok" ]; then
+        [ -r "$RICESWAP_STUB_PI_AUTH" ] && cat "$RICESWAP_STUB_PI_AUTH"
+        exit 0
+      fi ;;
+  esac
+  if [ "$pimode" != "ok" ]; then
+    printf '%s: stub failure (%s)\n' "$name" "$pimode" >&2
+    exit 1
+  fi
+  # The record a research-tier test reads: the directory the run happened in,
+  # and the flags it was given. The brief is deliberately not recorded — it is
+  # a paragraph long, and a log line a test cannot read is a log line nobody
+  # reads.
+  flags=
+  for argument in "$@"; do
+    [ "$argument" = "--" ] && break
+    flags="$flags $argument"
+  done
+  printf 'cwd=%s flags:%s\n' "$PWD" "$flags" >> "$RICESWAP_STUB_PI_LOG"
+  # The part of the stream a run emits before it stalls: printed first, so a
+  # test can script a stream that opens and then goes quiet — the mid-stream arm
+  # of the budget, as distinct from a run that never says anything.
+  [ -r "$RICESWAP_STUB_PI_PREAMBLE" ] && cat "$RICESWAP_STUB_PI_PREAMBLE"
+  if [ -n "$RICESWAP_STUB_DELAY_DIR" ] && [ -f "$RICESWAP_STUB_DELAY_DIR/pi" ]; then
+    while read -r pattern seconds; do
+      case "$flags" in
+        *"$pattern"*) sleep "$seconds"; break ;;
+      esac
+    done < "$RICESWAP_STUB_DELAY_DIR/pi"
+  fi
+  [ -r "$RICESWAP_STUB_PI_STREAM" ] && cat "$RICESWAP_STUB_PI_STREAM"
+  # A second delay rule, in its own file, hangs a run *after* its whole stream
+  # is written: the process prints everything and then never exits, which is the
+  # shape a consumer has to finish on `agent_settled` rather than on EOF.
+  if [ -n "$RICESWAP_STUB_DELAY_DIR" ] && [ -f "$RICESWAP_STUB_DELAY_DIR/pi-settle" ]; then
+    while read -r pattern seconds; do
+      case "$flags" in
+        *"$pattern"*) sleep "$seconds"; break ;;
+      esac
+    done < "$RICESWAP_STUB_DELAY_DIR/pi-settle"
+  fi
+  [ -r "$RICESWAP_STUB_PI_STDERR" ] && cat "$RICESWAP_STUB_PI_STDERR" >&2
+  piexit=0
+  [ -r "$RICESWAP_STUB_PI_EXIT" ] && read -r piexit < "$RICESWAP_STUB_PI_EXIT"
+  exit "$piexit"
 fi
 if [ -n "$RICESWAP_STUB_DELAY_DIR" ] && [ -f "$RICESWAP_STUB_DELAY_DIR/$name" ]; then
   while read -r pattern seconds; do
@@ -319,6 +390,21 @@ pub struct Sandbox {
     fails: PathBuf,
     git_source: PathBuf,
     git_sha: PathBuf,
+    /// One line per `pi` research run: the directory it ran in and its flags.
+    pi_log: PathBuf,
+    /// The JSONL stream the `pi` stub writes for a research run.
+    pi_stream: PathBuf,
+    /// What `pi auth check` answers, when a test wants an answer.
+    pi_auth: PathBuf,
+    /// The exit code the `pi` stub returns for a research run.
+    pi_exit: PathBuf,
+    /// What a `pi` research run prints on stderr, for the startup-failure arm.
+    pi_stderr: PathBuf,
+    /// What a `pi` research run writes to stdout before a scripted stall.
+    pi_preamble: PathBuf,
+    /// Environment variables a test adds for one operation, on top of the
+    /// fixtures: the knobs with no fixture file behind them.
+    extra_env: RefCell<BTreeMap<String, String>>,
 }
 
 impl Sandbox {
@@ -337,6 +423,12 @@ impl Sandbox {
         let fails = root.path().join("fail-on");
         let git_source = root.path().join("git-source.txt");
         let git_sha = root.path().join("git-sha.txt");
+        let pi_log = root.path().join("pi-invocations.log");
+        let pi_stream = root.path().join("pi-stream.jsonl");
+        let pi_auth = root.path().join("pi-auth.json");
+        let pi_exit = root.path().join("pi-exit");
+        let pi_stderr = root.path().join("pi-stderr.txt");
+        let pi_preamble = root.path().join("pi-preamble.jsonl");
         for dir in [&home, &bin, &modes, &states, &delays, &fails] {
             fs::create_dir_all(dir).expect("create sandbox directory");
         }
@@ -351,6 +443,12 @@ impl Sandbox {
         fs::write(&git_source, "").expect("create git clone-source fixture");
         fs::write(&git_sha, "1a2b3c4d5e6f70819a2b3c4d5e6f70819a2b3c4d\n")
             .expect("create git sha fixture");
+        fs::write(&pi_log, "").expect("create pi invocation log");
+        fs::write(&pi_stream, "").expect("create pi stream fixture");
+        fs::write(&pi_auth, "").expect("create pi auth fixture");
+        fs::write(&pi_exit, "0\n").expect("create pi exit fixture");
+        fs::write(&pi_stderr, "").expect("create pi stderr fixture");
+        fs::write(&pi_preamble, "").expect("create pi preamble fixture");
         Sandbox {
             _root: root,
             home,
@@ -366,6 +464,13 @@ impl Sandbox {
             fails,
             git_source,
             git_sha,
+            pi_log,
+            pi_stream,
+            pi_auth,
+            pi_exit,
+            pi_stderr,
+            pi_preamble,
+            extra_env: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -415,6 +520,21 @@ impl Sandbox {
             .lines()
             .map(str::to_string)
             .collect()
+    }
+
+    /// Makes a `pi` research run hang for `seconds` *after* it has written its
+    /// whole stream and before it exits.
+    ///
+    /// This is the arm the `agent_settled` record exists for: a run that has
+    /// said everything it is going to say and then lingers has to be finished on
+    /// that record, not waited out to the process's exit or the stall budget.
+    /// Matched on the flags as `delay_on` does, so a test can scope it to one
+    /// kind of run.
+    pub fn delay_after(&self, pattern: &str, seconds: u64) {
+        let path = self.delays.join("pi-settle");
+        let mut delays = fs::read_to_string(&path).unwrap_or_default();
+        delays.push_str(&format!("{pattern} {seconds}\n"));
+        fs::write(&path, delays).expect("write the settle-delay fixture");
     }
 
     /// Makes `tool` sleep `seconds` whenever its arguments contain `pattern`
@@ -484,6 +604,105 @@ impl Sandbox {
         self._root.path().join(relative)
     }
 
+    // ---------------------------------------------------- the research seam
+
+    /// Scripts what `pi auth check --json` answers. An empty fixture — the
+    /// default — makes the stub print nothing, which the backend reads as
+    /// "unreadable, carry on" rather than as a refusal.
+    pub fn pi_auth_says(&self, answer: &str) {
+        fs::write(&self.pi_auth, answer).expect("write pi auth fixture");
+    }
+
+    /// Scripts the JSONL stream a `pi` research run writes to stdout.
+    ///
+    /// Every line must be a complete record: the stub is a `cat`, not a
+    /// simulator of pi's streaming behaviour, because what a test needs to
+    /// control is the *content* of the stream, not how it arrives.
+    pub fn pi_stream(&self, stream: &str) {
+        fs::write(&self.pi_stream, stream).expect("write pi stream fixture");
+    }
+
+    /// The exit code a `pi` research run returns — the arm of the contract's
+    /// trap that is a startup failure (exit 1, empty stdout, `Error: Model …`
+    /// on stderr) rather than a refusal inside the stream.
+    pub fn pi_exits(&self, code: i32) {
+        fs::write(&self.pi_exit, format!("{code}\n")).expect("write pi exit fixture");
+    }
+
+    /// Makes a `pi` research run print `text` on stderr before exiting — the
+    /// channel pi's own startup failures use.
+    pub fn pi_says(&self, text: &str) {
+        fs::write(&self.pi_stderr, text).expect("write pi stderr fixture");
+    }
+
+    /// The records a `pi` research run writes to stdout *before* a scripted
+    /// stall, so a test can open a stream and then let it go quiet.
+    pub fn pi_preamble(&self, records: &str) {
+        fs::write(&self.pi_preamble, records).expect("write pi preamble fixture");
+    }
+
+    /// Every `pi` research run, in order, as `cwd` plus the flags it was given.
+    pub fn pi_runs(&self) -> Vec<String> {
+        fs::read_to_string(&self.pi_log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Whether any `pi` research run was given `needle` among its flags.
+    pub fn pi_saw(&self, needle: &str) -> bool {
+        self.pi_runs().iter().any(|run| run.contains(needle))
+    }
+
+    /// Shrinks the research budgets so the timeout path is milliseconds rather
+    /// than minutes.
+    ///
+    /// The variables are the ones the tier documents, which is the point: a
+    /// test that wants the first-byte arm shrinks `first_byte` and leaves
+    /// `total` alone, and the production defaults are untouched by anything
+    /// here.
+    pub fn research_budget(&self, first_byte: u64, total: u64) -> &Sandbox {
+        self.set_env("RICESWAP_PI_FIRST_BYTE_SECONDS", &first_byte.to_string());
+        self.set_env("RICESWAP_PI_TOTAL_SECONDS", &total.to_string());
+        self
+    }
+
+    /// Sets one extra environment variable for the operations this sandbox runs,
+    /// for the knobs a test has to reach that have no fixture file.
+    pub fn set_env(&self, name: &str, value: &str) {
+        self.extra_env
+            .borrow_mut()
+            .insert(name.to_string(), value.to_string());
+    }
+
+    /// Every fixture variable the stubs read, in one place.
+    ///
+    /// `run` and `spawn` both start here, so a spawned operation sees exactly
+    /// what a blocking one sees — and a fixture added in one place cannot be
+    /// forgotten in the other.
+    fn envs(&self) -> Vec<(&'static str, &Path)> {
+        vec![
+            ("RICESWAP_STUB_LOG", &self.stub_log),
+            ("RICESWAP_STUB_MODE_DIR", &self.modes),
+            ("RICESWAP_STUB_STATE_DIR", &self.states),
+            ("RICESWAP_STUB_OWNERS", &self.owners),
+            ("RICESWAP_STUB_CONFLICTS", &self.conflicts),
+            ("RICESWAP_STUB_NEEDED", &self.needed),
+            ("RICESWAP_STUB_PACKAGES", &self.packages),
+            ("RICESWAP_STUB_DELAY_DIR", &self.delays),
+            ("RICESWAP_STUB_FAIL_DIR", &self.fails),
+            ("RICESWAP_STUB_GIT_SOURCE", &self.git_source),
+            ("RICESWAP_STUB_GIT_SHA", &self.git_sha),
+            ("RICESWAP_STUB_PI_LOG", &self.pi_log),
+            ("RICESWAP_STUB_PI_STREAM", &self.pi_stream),
+            ("RICESWAP_STUB_PI_AUTH", &self.pi_auth),
+            ("RICESWAP_STUB_PI_EXIT", &self.pi_exit),
+            ("RICESWAP_STUB_PI_STDERR", &self.pi_stderr),
+            ("RICESWAP_STUB_PI_PREAMBLE", &self.pi_preamble),
+        ]
+    }
+
     /// The configured subprocess: clean environment, sandboxed `$HOME` and
     /// `PATH`, stub fixtures wired in. `run` and `spawn` both start here, so
     /// a spawned operation sees exactly what a blocking one sees.
@@ -492,18 +711,13 @@ impl Sandbox {
         command
             .env_clear()
             .env("HOME", &self.home)
-            .env("PATH", self.path_env())
-            .env("RICESWAP_STUB_LOG", &self.stub_log)
-            .env("RICESWAP_STUB_MODE_DIR", &self.modes)
-            .env("RICESWAP_STUB_STATE_DIR", &self.states)
-            .env("RICESWAP_STUB_OWNERS", &self.owners)
-            .env("RICESWAP_STUB_CONFLICTS", &self.conflicts)
-            .env("RICESWAP_STUB_NEEDED", &self.needed)
-            .env("RICESWAP_STUB_PACKAGES", &self.packages)
-            .env("RICESWAP_STUB_DELAY_DIR", &self.delays)
-            .env("RICESWAP_STUB_FAIL_DIR", &self.fails)
-            .env("RICESWAP_STUB_GIT_SOURCE", &self.git_source)
-            .env("RICESWAP_STUB_GIT_SHA", &self.git_sha);
+            .env("PATH", self.path_env());
+        for (name, path) in self.envs() {
+            command.env(name, path);
+        }
+        for (name, value) in self.extra_env.borrow().iter() {
+            command.env(name, value);
+        }
         command
     }
 
@@ -521,21 +735,18 @@ impl Sandbox {
     /// because `assert_cmd` doesn't expose `.stdout()` / `.spawn()`.
     pub fn spawn<S: AsRef<OsStr>>(&self, args: &[S]) -> Child {
         let bin = assert_cmd::cargo::cargo_bin("riceswap");
-        std::process::Command::new(bin)
+        let mut command = std::process::Command::new(bin);
+        command
             .env_clear()
             .env("HOME", &self.home)
-            .env("PATH", self.path_env())
-            .env("RICESWAP_STUB_LOG", &self.stub_log)
-            .env("RICESWAP_STUB_MODE_DIR", &self.modes)
-            .env("RICESWAP_STUB_STATE_DIR", &self.states)
-            .env("RICESWAP_STUB_OWNERS", &self.owners)
-            .env("RICESWAP_STUB_CONFLICTS", &self.conflicts)
-            .env("RICESWAP_STUB_NEEDED", &self.needed)
-            .env("RICESWAP_STUB_PACKAGES", &self.packages)
-            .env("RICESWAP_STUB_DELAY_DIR", &self.delays)
-            .env("RICESWAP_STUB_FAIL_DIR", &self.fails)
-            .env("RICESWAP_STUB_GIT_SOURCE", &self.git_source)
-            .env("RICESWAP_STUB_GIT_SHA", &self.git_sha)
+            .env("PATH", self.path_env());
+        for (name, path) in self.envs() {
+            command.env(name, path);
+        }
+        for (name, value) in self.extra_env.borrow().iter() {
+            command.env(name, value);
+        }
+        command
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

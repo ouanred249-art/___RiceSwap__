@@ -13,6 +13,7 @@ mod operations;
 mod profile;
 mod recipe;
 mod reconcile;
+mod research;
 mod state;
 mod tools;
 
