@@ -20,13 +20,27 @@ BIN="${RICESWAP_BIN:-./target/debug/riceswap}"
 
 FH="$(mktemp -d)"
 TREE="$(mktemp -d)"
-trap 'rm -rf "$FH" "$TREE"' EXIT
+STUBBIN="$(mktemp -d)"
+trap 'rm -rf "$FH" "$TREE" "$STUBBIN"' EXIT
 
-run() { # <label> <args...> — HOME-scoped call; envelope -> evidence/<label>.json
+# Session isolation, not just file isolation: a drive that inherits the
+# driver's HYPRLAND_INSTANCE_SIGNATURE/WAYLAND_DISPLAY reloads the USER'S
+# LIVE desktop at step 8, and a fake profile shell attaches to the real
+# compositor. Scrub the seat env on every call.
+printf '#!/bin/sh\necho "harness stub: pi absent" >&2\nexit 127\n' > "$STUBBIN/pi"
+chmod +x "$STUBBIN/pi"
+# The stub must PRECEDE the real PATH, and stand in for pi itself: the
+# research tier skips only when pi is unusable or a recipe exists — an
+# unstubbed drive makes a real, networked, authenticated LLM call with the
+# user's key (see features/install.md).
+SCRUB_ENV=(env -u HYPRLAND_INSTANCE_SIGNATURE -u WAYLAND_DISPLAY -u DISPLAY
+           -u XDG_SEAT -u XDG_SESSION_TYPE -u DBUS_SESSION_BUS_ADDRESS)
+
+run() { # <label> <args...> — HOME+seat-scoped call; envelope -> evidence/<label>.ndjson
   local label="$1"; shift
   echo "── $label: riceswap $*"
   local out
-  out="$(HOME="$FH" "$BIN" "$@" || true)"
+  out="$(HOME="$FH" PATH="$STUBBIN:$PATH" "${SCRUB_ENV[@]}" "$BIN" "$@" || true)"
   printf '%s\n' "$out" > "$EVIDENCE/$label.ndjson"
   printf '%s\n' "$out" | tail -1 | python3 -c 'import json,sys; d=json.load(sys.stdin); print("  ok:",d.get("ok")); print("  warnings:",d.get("warnings")); print("  keys:",list((d.get("data") or {}).keys())[:12])'
 }

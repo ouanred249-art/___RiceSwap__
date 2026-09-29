@@ -17,8 +17,16 @@ FH=$(mktemp -d)            # scratch $HOME — the instance is fully isolated by
 
 - Two instances side by side: yes — one per scratch HOME; they never collide.
 - The **real** `$HOME` is off-limits: never run `switch`, `install`, or `init` with the user's actual HOME. `snapshot` on a real HOME is READ-mostly but writes a profile; treat it the same — scratch HOME only.
-- A scratch HOME has no Hyprland session, so `switch` will fail at the `hyprctl reload` / shell-start steps *on purpose* — the envelope still reports the earlier phases. That is valid evidence; it is not a broken app.
-- `install` against a git URL in tests must use the sandbox `git` stub or a local-path fixture; never let a verification run hit the network.
+- **A scratch HOME isolates FILES, not the SEAT.** The tool addresses the compositor through inherited env (`HYPRLAND_INSTANCE_SIGNATURE`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`): a scratch `switch` with them set will `hyprctl reload` the USER'S LIVE desktop, and a fake profile shell (`qs -c <name>`) will connect to the real compositor as a client. Every drive must scrub them:
+
+  ```bash
+  HOME=$FH env -u HYPRLAND_INSTANCE_SIGNATURE -u WAYLAND_DISPLAY \
+           -u DISPLAY -u DBUS_SESSION_BUS_ADDRESS $BIN <op> ...
+  ```
+
+  Scrubbed, the machine is honestly headless: `hyprctl`/`grim` steps degrade as warnings, `switch` lands `verified-core`, pkexec never prompts on the live seat. This is now *proven* behavior, not paranoia — unscrubbed drives were observed touching the host session during the 2026-09-29 maintenance run.
+- A scrubbed scratch HOME has no Hyprland session, so `switch` degrades at the `hyprctl reload` / shell-start steps *on purpose* — the envelope still reports the earlier phases. That is valid evidence; it is not a broken app. One exception the map must keep honest: a profile that DECLARES a `[shell]` whose start fails now **fails verification and rolls back** (`shell-not-alive`) — see `features/switch.md`.
+- `install` against a git URL in tests must use the sandbox `git` stub or a local-path fixture; never let a verification run hit the network. Same for the **research tier**: an unknown shell with no recipe makes a real `pi` (LLM, network) call — stub `pi` (a script exiting 127 on a PATH prefix) and the install continues on the engine's proposals with `data.research.failure` as the evidence.
 
 ## Launch
 
@@ -33,13 +41,15 @@ Ready check: `$BIN list` prints an `{"ok":true,…}` envelope line. Teardown: no
 
 ## Doctor
 
-One read-only run that answers "is this instance worth driving?":
+One health run that answers "is this instance worth driving?" — it writes
+`state.json` (see `features/bootstrap.md`: every invocation does), but touches
+nothing else of consequence:
 
 ```bash
-FH=$(mktemp -d); HOME=$FH cargo run --quiet -- detect
+FH=$(mktemp -d); HOME=$FH env -u HYPRLAND_INSTANCE_SIGNATURE -u WAYLAND_DISPLAY cargo run --quiet -- detect
 ```
 
-Healthy = final envelope `"ok":true` and a `data.tools` map where `hyprctl`/`grim`/`pkexec` statuses reflect the *host* (in CI they fail; that is expected and is itself the degrade path under test). Run this first whenever behavior looks off.
+Healthy = final envelope `"ok":true` and a `data.tools` map covering the nine probed tools (pacman, yay, paru, hyprctl, grim, pkexec, riceswap-float, **git, pi**). With the seat env scrubbed, compositor tools fail *as warnings* — that IS the degrade path under test; on an unscrubbed drive their success means your live desktop is in scope, and you should re-run scrubbed. Run this first whenever behavior looks off.
 
 ## Drive
 
