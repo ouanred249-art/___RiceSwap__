@@ -78,11 +78,18 @@ cleanup() {
   set +e
   phase "Cleanup"
 
-  # Stop the VT session
+  # Stop the VT session. The driver pid is only the openvt wrapper: the
+  # Hyprland it launched lives under su -l, so kill by user as well, and
+  # hand the console back to the driver's VT (openvt -s stole the screen).
   if [[ -n "$VT_PID" ]] && kill -0 "$VT_PID" 2>/dev/null; then
     info "Stopping Hyprland session (PID $VT_PID)"
     kill "$VT_PID" 2>/dev/null
     wait "$VT_PID" 2>/dev/null || true
+  fi
+  sudo pkill -u "${TEST_UID:-0}" -x Hyprland 2>/dev/null || true
+  if [[ -n "$DRIVER_VT" ]]; then
+    info "Returning console to tty$DRIVER_VT"
+    sudo chvt "$DRIVER_VT"
   fi
 
   # Remove sudoers drop-in
@@ -281,8 +288,12 @@ sudo mkdir -p "$RUNTIME_DIR"
 sudo chown "$USER_NAME:$USER_NAME" "$RUNTIME_DIR"
 sudo chmod 0700 "$RUNTIME_DIR"
 
-# Write a minimal Hyprland config for the test user
-sudo -u "$USER_NAME" mkdir -p "/home/$USER_NAME/.config/hypr"
+# Write a minimal Hyprland config for the test user. The .local/share bit
+# is for Hyprland itself: its crash-report dir mkdir fails (and the session
+# dies) if the parent does not exist, which useradd's skeleton does not
+# create.
+sudo -u "$USER_NAME" mkdir -p "/home/$USER_NAME/.config/hypr" \
+  "/home/$USER_NAME/.local/share"
 sudo -u "$USER_NAME" tee "/home/$USER_NAME/.config/hypr/hyprland.conf" >/dev/null <<'HYPRCONF'
 # Minimal config for the acceptance test session.
 # This is the session RiceSwap will install INTO, replacing it with the
@@ -293,75 +304,83 @@ HYPRCONF
 
 # Launch Hyprland on the spare VT, as the test user.
 #
-# Two mechanisms, tried in order:
-#  • seatd-launch — the right one when seatd owns seat allocation (the socket
-#    is group-`seat` and the test user was added to that group). seatd opens
-#    the VT and becomes DRM master on the client's behalf, so the client
-#    never needs tty access of its own.
-#  • a bare launch — the fallback for a logind-only machine, where a systemd
-#    scope on the spare VT provides the seat.
-# The first attempt that produces a Hyprland socket wins; the session log
-# ($ARTIFACTS/hyprland.log) keeps whichever answers, so a failure here says
-# why rather than just timing out.
-info "Starting Hyprland on tty$FREE_VT (via seatd-launch)"
+# A compositor is not a daemon: it must own a VT. Launching it detached —
+# `sudo -u ... setsid Hyprland` — leaves it with no controlling terminal, no
+# logind session, and nothing for a seat provider to attach to, and it dies
+# in CBackend::create() with no GPU it is allowed to become DRM master of.
+# The process therefore has to be *born on the VT*: openvt allocates the
+# spare tty and makes it the command's controlling terminal; the privilege
+# drop happens inside it with `su -l`, so the test user owns the session.
+#
+# Two seat mechanisms, tried in order:
+#  - seatd-launch — correct on a seatd machine (socket root:seat, test user
+#    in group seat): seatd activates the VT and opens DRM on the client's
+#    behalf.
+#  - start-hyprland — the wrapper this machine's own session uses (check the
+#    live process tree); it probes logind first and falls back to seatd, and
+#    Hyprland itself warns against launching without it.
+# The screen visibly switches to the test session (seat isolation is the
+# point of #31); cleanup chvt's back to the driver's VT.
 HYPRLAND_LOG="$ARTIFACTS/hyprland.log"
-sudo -u "$USER_NAME" \
-  env HOME="/home/$USER_NAME" \
-      XDG_RUNTIME_DIR="$RUNTIME_DIR" \
-      LD_PRELOAD="${LD_PRELOAD:-}" \
-  setsid \
-  seatd-launch -- Hyprland --config "/home/$USER_NAME/.config/hypr/hyprland.conf" \
-  </dev/null >"$HYPRLAND_LOG" 2>&1 &
-VT_PID=$!
+DRIVER_VT="$(sudo fgconsole)"
 
-# Wait for the Hyprland socket to appear
-info "Waiting for Hyprland to come up..."
-HYPR_INSTANCE=""
-for i in $(seq 1 30); do
-  # Look for a Hyprland socket owned by the test user
-  for sock in "$RUNTIME_DIR"/hypr/*/; do
-    if [[ -d "$sock" ]]; then
-      HYPR_INSTANCE="$(basename "$sock")"
-      break 2
-    fi
-  done
-  # A dead launcher will never produce one — stop waiting early and say so.
-  if ! kill -0 "$VT_PID" 2>/dev/null; then
-    break
-  fi
-  sleep 1
-done
-
-if [[ -z "$HYPR_INSTANCE" ]]; then
-  # The first attempt produced no socket — whether it hung (still running)
-  # or died (seatd refused, config error). Give the bare launch one chance
-  # before declaring failure, so the log ends up with both answers.
-  warn "seatd-launch produced no socket — trying a bare VT launch"
-  kill -0 "$VT_PID" 2>/dev/null && sudo kill "$VT_PID" 2>/dev/null
-  wait "$VT_PID" 2>/dev/null || true
-  sudo -u "$USER_NAME" \
-    env HOME="/home/$USER_NAME" \
-        XDG_RUNTIME_DIR="$RUNTIME_DIR" \
-    setsid \
-    Hyprland --config "/home/$USER_NAME/.config/hypr/hyprland.conf" \
-    </dev/null >>"$HYPRLAND_LOG" 2>&1 &
-  VT_PID=$!
-  for i in $(seq 1 15); do
+wait_for_socket() { # <seconds>
+  local end="${1:-30}" i sock
+  HYPR_INSTANCE=""
+  for i in $(seq 1 "$end"); do
     for sock in "$RUNTIME_DIR"/hypr/*/; do
       if [[ -d "$sock" ]]; then
         HYPR_INSTANCE="$(basename "$sock")"
-        break 2
+        return 0
       fi
     done
+    # A dead launcher will never produce a socket — stop waiting early.
     kill -0 "$VT_PID" 2>/dev/null || break
     sleep 1
   done
+  return 1
+}
+
+# Two seat mechanisms, tried in order:
+#  - LD_PRELOAD of libseat with LIBSEAT_BACKEND=seatd, against the SYSTEM
+#    seatd already running here (/run/seatd.sock, group seat — the test user
+#    was added to it). This keeps XDG_RUNTIME_DIR exactly where the script
+#    set it, so the Hyprland socket lands where the wait loop and every
+#    later riceswap call look for it.
+#  - start-hyprland — the wrapper this machine's own session runs under
+#    (confirmed in its process tree); it probes logind and seatd itself.
+#    seatd-launch was deliberately NOT used: it spawns a private seatd and
+#    repoints XDG_RUNTIME_DIR at a temp dir, which would hide the socket
+#    from everything downstream.
+info "Starting Hyprland on tty$FREE_VT (openvt + libseat/seatd preload)"
+sudo openvt -c "$FREE_VT" -s -- \
+  su -l "$USER_NAME" -c \
+  "XDG_RUNTIME_DIR='$RUNTIME_DIR' LD_PRELOAD=/usr/lib/libseat.so LIBSEAT_BACKEND=seatd \
+   exec Hyprland --config '/home/$USER_NAME/.config/hypr/hyprland.conf'" \
+  </dev/null >"$HYPRLAND_LOG" 2>&1 &
+VT_PID=$!
+
+info "Waiting for Hyprland to come up..."
+if ! wait_for_socket 30; then
+  # No socket from the first attempt — kill whatever is left and let
+  # start-hyprland decide the seat backend itself.
+  kill -0 "$VT_PID" 2>/dev/null && sudo kill "$VT_PID" 2>/dev/null
+  sudo pkill -u "$USER_NAME" -x Hyprland 2>/dev/null || true
+  wait "$VT_PID" 2>/dev/null || true
+  warn "libseat preload produced no socket — retrying via start-hyprland"
+  sudo openvt -c "$FREE_VT" -s -- \
+    su -l "$USER_NAME" -c \
+    "XDG_RUNTIME_DIR='$RUNTIME_DIR' exec start-hyprland Hyprland \
+     --config '/home/$USER_NAME/.config/hypr/hyprland.conf'" \
+    </dev/null >>"$HYPRLAND_LOG" 2>&1 &
+  VT_PID=$!
+  wait_for_socket 30 || true
 fi
 
 if [[ -z "$HYPR_INSTANCE" ]]; then
   fail "Hyprland did not start (see $HYPRLAND_LOG)"
-  echo "──── last lines of the session log ────" >&2
-  tail -30 "$HYPRLAND_LOG" >&2 || true
+  echo "---- last lines of the session log ----" >&2
+  tail -40 "$HYPRLAND_LOG" >&2 || true
   exit 1
 fi
 ok "Hyprland running (instance: $HYPR_INSTANCE)"
