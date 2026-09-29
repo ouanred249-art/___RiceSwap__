@@ -202,8 +202,8 @@ ok "Binary ready"
 
 # ── Phase 2: Create throwaway user ────────────────────────────────────────
 phase "2: Create throwaway user ($USER_NAME)"
-sudo useradd -m -s /bin/bash "$USER_NAME"
-ok "User $USER_NAME created"
+sudo useradd -m -s /bin/bash -G seat,video,input "$USER_NAME"
+ok "User $USER_NAME created (groups: seat,video,input)"
 
 # Copy the binary and built-in recipes to a location the test user can read
 sudo mkdir -p "/home/$USER_NAME/.local/bin"
@@ -246,6 +246,10 @@ fi
 mkdir -p "$FIXTURE_DIR/Wallpapers"
 cp assets/wallpapers/*.png "$FIXTURE_DIR/Wallpapers/" 2>/dev/null || true
 
+# The install runs AS the test user, who must be able to read the tree —
+# mktemp gives it 0700 owned by the driver, which the test user cannot read.
+chmod -R a+rX "$FIXTURE_DIR"
+
 ok "Donor-graft fixture assembled ($(find "$FIXTURE_DIR" -type f | wc -l) files)"
 
 # Hash the fixture tree before any install touches it
@@ -287,14 +291,27 @@ monitor=,preferred,auto,1
 exec-once = sleep infinity
 HYPRCONF
 
-# Launch Hyprland on the spare VT, as the test user
-info "Starting Hyprland on tty$FREE_VT"
+# Launch Hyprland on the spare VT, as the test user.
+#
+# Two mechanisms, tried in order:
+#  • seatd-launch — the right one when seatd owns seat allocation (the socket
+#    is group-`seat` and the test user was added to that group). seatd opens
+#    the VT and becomes DRM master on the client's behalf, so the client
+#    never needs tty access of its own.
+#  • a bare launch — the fallback for a logind-only machine, where a systemd
+#    scope on the spare VT provides the seat.
+# The first attempt that produces a Hyprland socket wins; the session log
+# ($ARTIFACTS/hyprland.log) keeps whichever answers, so a failure here says
+# why rather than just timing out.
+info "Starting Hyprland on tty$FREE_VT (via seatd-launch)"
+HYPRLAND_LOG="$ARTIFACTS/hyprland.log"
 sudo -u "$USER_NAME" \
   env HOME="/home/$USER_NAME" \
       XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+      LD_PRELOAD="${LD_PRELOAD:-}" \
   setsid \
-  Hyprland --config "/home/$USER_NAME/.config/hypr/hyprland.conf" \
-  </dev/null >/dev/null 2>&1 &
+  seatd-launch -- Hyprland --config "/home/$USER_NAME/.config/hypr/hyprland.conf" \
+  </dev/null >"$HYPRLAND_LOG" 2>&1 &
 VT_PID=$!
 
 # Wait for the Hyprland socket to appear
@@ -308,11 +325,43 @@ for i in $(seq 1 30); do
       break 2
     fi
   done
+  # A dead launcher will never produce one — stop waiting early and say so.
+  if ! kill -0 "$VT_PID" 2>/dev/null; then
+    break
+  fi
   sleep 1
 done
 
 if [[ -z "$HYPR_INSTANCE" ]]; then
-  fail "Hyprland did not start within 30s"
+  # The first attempt produced no socket — whether it hung (still running)
+  # or died (seatd refused, config error). Give the bare launch one chance
+  # before declaring failure, so the log ends up with both answers.
+  warn "seatd-launch produced no socket — trying a bare VT launch"
+  kill -0 "$VT_PID" 2>/dev/null && sudo kill "$VT_PID" 2>/dev/null
+  wait "$VT_PID" 2>/dev/null || true
+  sudo -u "$USER_NAME" \
+    env HOME="/home/$USER_NAME" \
+        XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    setsid \
+    Hyprland --config "/home/$USER_NAME/.config/hypr/hyprland.conf" \
+    </dev/null >>"$HYPRLAND_LOG" 2>&1 &
+  VT_PID=$!
+  for i in $(seq 1 15); do
+    for sock in "$RUNTIME_DIR"/hypr/*/; do
+      if [[ -d "$sock" ]]; then
+        HYPR_INSTANCE="$(basename "$sock")"
+        break 2
+      fi
+    done
+    kill -0 "$VT_PID" 2>/dev/null || break
+    sleep 1
+  done
+fi
+
+if [[ -z "$HYPR_INSTANCE" ]]; then
+  fail "Hyprland did not start (see $HYPRLAND_LOG)"
+  echo "──── last lines of the session log ────" >&2
+  tail -30 "$HYPRLAND_LOG" >&2 || true
   exit 1
 fi
 ok "Hyprland running (instance: $HYPR_INSTANCE)"
