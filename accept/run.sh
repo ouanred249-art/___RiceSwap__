@@ -147,6 +147,7 @@ run_as() {
     env HOME="/home/$USER_NAME" \
         XDG_RUNTIME_DIR="/run/user/$(id -u "$USER_NAME")" \
         HYPRLAND_INSTANCE_SIGNATURE="${HYPR_INSTANCE:-}" \
+        WAYLAND_DISPLAY="${TEST_WAYLAND_DISPLAY:-wayland-1}" \
     "$BIN" "$@" 2>&1 || true)"
   printf '%s\n' "$out" > "$ARTIFACTS/$label.ndjson"
   # Parse the last line as the envelope
@@ -359,8 +360,14 @@ wait_for_socket() { # <seconds>
 #    seatd-launch was deliberately NOT used: it spawns a private seatd and
 #    repoints XDG_RUNTIME_DIR at a temp dir, which would hide the socket
 #    from everything downstream.
+# `-f` because openvt's in-use guard reads the kernel's VT_GETSTATE bitmask
+# — "VT ever opened by anyone" — and systemd-logind keeps the console VTs
+# allocated on a running machine, so on any systemd box every VT 1-6 reads
+# "in use" and openvt refuses without force. The guard we actually need is
+# the one above: `sudo fuser` proved no *process* holds this VT, and it is
+# never the driver's own. `-w` waits for the switch to land before exec'ing.
 info "Starting Hyprland on tty$FREE_VT (openvt + libseat/seatd preload)"
-sudo openvt -c "$FREE_VT" -s -- \
+sudo openvt -f -w -c "$FREE_VT" -s -- \
   su -l "$USER_NAME" -c \
   "XDG_RUNTIME_DIR='$RUNTIME_DIR' LD_PRELOAD=/usr/lib/libseat.so LIBSEAT_BACKEND=seatd \
    exec Hyprland --config '/home/$USER_NAME/.config/hypr/hyprland.conf'" \
@@ -375,7 +382,7 @@ if ! wait_for_socket 30; then
   sudo pkill -u "$USER_NAME" -x Hyprland 2>/dev/null || true
   wait "$VT_PID" 2>/dev/null || true
   warn "libseat preload produced no socket — retrying via start-hyprland"
-  sudo openvt -c "$FREE_VT" -s -- \
+  sudo openvt -f -w -c "$FREE_VT" -s -- \
     su -l "$USER_NAME" -c \
     "XDG_RUNTIME_DIR='$RUNTIME_DIR' exec start-hyprland Hyprland \
      --config '/home/$USER_NAME/.config/hypr/hyprland.conf'" \
@@ -390,7 +397,11 @@ if [[ -z "$HYPR_INSTANCE" ]]; then
   tail -40 "$HYPRLAND_LOG" >&2 || true
   exit 1
 fi
-ok "Hyprland running (instance: $HYPR_INSTANCE)"
+# The Wayland socket this session created — grim/ydotool find the composer
+# through it. Not the driver shell's WAYLAND_DISPLAY: same name, different
+# runtime dir, different session.
+TEST_WAYLAND_DISPLAY="$(basename "$(ls -1 "$RUNTIME_DIR"/wayland-* 2>/dev/null | head -1)" 2>/dev/null || true)"
+ok "Hyprland running (instance: $HYPR_INSTANCE, display: ${TEST_WAYLAND_DISPLAY:-unknown})"
 
 # Override the binary path for run_as — use the one in the test user's home
 BIN="/home/$USER_NAME/.local/bin/riceswap"
