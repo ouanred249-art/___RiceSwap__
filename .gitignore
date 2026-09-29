@@ -4,3 +4,6 @@
 # Rust
 /target
 .scratch/
+
+# Acceptance test evidence (generated per-run, never committed)
+accept/artifacts/
