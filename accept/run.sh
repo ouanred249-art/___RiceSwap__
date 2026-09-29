@@ -266,17 +266,24 @@ ok "Donor-graft fixture assembled ($(find "$FIXTURE_DIR" -type f | wc -l) files)
 # ── Phase 4: Launch Hyprland on a spare VT ────────────────────────────────
 phase "4: Launch Hyprland session for $USER_NAME"
 
-# Find a free VT
+# Find a free VT. The probe must run as root: `fuser` unprivileged cannot
+# see another user's — or Xorg's — hold on the tty, and picked tty2 while a
+# running X server owned it (the real machine's first failure). A VT with
+# any live process is busy, period; openvt would refuse it, and forcing one
+# steals an existing desktop, which is the one thing this ritual must never
+# do. Also never take the driver's own VT.
+MY_VT="$(sudo fgconsole)"
 FREE_VT=""
 for vt in $(seq 2 12); do
-  if ! fuser "/dev/tty${vt}" &>/dev/null 2>&1; then
+  [[ "$vt" == "$MY_VT" ]] && continue
+  if ! sudo fuser -s "/dev/tty${vt}" 2>/dev/null; then
     FREE_VT="$vt"
     break
   fi
 done
 
 if [[ -z "$FREE_VT" ]]; then
-  fail "No free VT found (checked tty2-tty12)"
+  fail "No free VT found (checked tty2-tty12; every one held, or the driver own)"
   exit 1
 fi
 info "Using VT $FREE_VT"
