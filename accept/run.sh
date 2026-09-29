@@ -57,6 +57,7 @@ done
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 USER_NAME="riceswap-test-${TS}"
 ARTIFACTS="accept/artifacts/${TS}"
+mkdir -p "$ARTIFACTS"
 FIXTURE_DIR=""
 VT_PID=""
 SUDOERS_FILE=""
@@ -325,7 +326,6 @@ run_as "init" init >/dev/null
 ok "Store initialized"
 
 # ── Evidence directory ─────────────────────────────────────────────────────
-mkdir -p "$ARTIFACTS"
 info "Evidence → $ARTIFACTS"
 
 # ── Phase 5: Happy path ──────────────────────────────────────────────────
