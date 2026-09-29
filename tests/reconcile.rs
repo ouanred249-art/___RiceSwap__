@@ -467,7 +467,16 @@ fn a_profile_with_no_shell_is_skipped_rather_than_guessed_at() {
 
 /// The engine reads and reports; it never shells out and never touches anything
 /// outside the profile it was handed. Switching a profile with dispatches in it
-/// adds no stub traffic beyond the locked switch sequence.
+/// adds no stub traffic of its own.
+///
+/// One qualification since #39, and it is the point of that ticket rather than a
+/// contradiction of this one: the *verification tier* that now runs after the
+/// ten steps does ask the running session one question —
+/// `hyprctl globalshortcuts` — because re-proving the invariant against the live
+/// registry is the check the ticket exists for. The engine is still pure text,
+/// and this test still holds it to that: the engine runs *before* the shell is
+/// up, derives its registry from the profile's own QML, and no foreign shell is
+/// ever booted to ask what it registers.
 #[test]
 fn reconciliation_shells_out_to_nothing() {
     let sandbox = Sandbox::new();
@@ -477,28 +486,27 @@ fn reconciliation_shells_out_to_nothing() {
     sandbox.run(&["switch", "grafted"]).assert_ok();
 
     let traffic = sandbox.log();
-    for line in &traffic {
-        assert!(
-            !line.contains("hyprctl globalshortcuts"),
-            "the engine derives statically and never live-probes: {traffic:?}"
-        );
-    }
     assert!(
         !traffic.iter().any(|line| line.starts_with("grep")),
         "no shelling out to read QML either: {traffic:?}"
     );
-    // The only Hyprland calls are the version probe the pre-flight has always
-    // made and the reload it has always made. Nothing here reads the running
-    // session's shortcuts: the registry is derived from the profile's own QML,
-    // so no foreign shell is ever booted to ask it what it registers.
+    // The Hyprland calls are the reload the switch has always made, the version
+    // probe the pre-flight has always made, and — after the ten steps, as the
+    // verification tier's own step — one `globalshortcuts` read of the running
+    // session. In that order, and nothing else.
     assert_eq!(
         traffic
             .iter()
             .filter(|line| line.starts_with("hyprctl"))
             .cloned()
             .collect::<Vec<String>>(),
-        ["hyprctl reload", "hyprctl version"],
-        "the engine is pure text: {traffic:?}"
+        [
+            "hyprctl reload",
+            "hyprctl globalshortcuts",
+            "hyprctl version"
+        ],
+        "the engine is pure text; the one live read is the verification tier's, after the \
+         switch: {traffic:?}"
     );
 }
 

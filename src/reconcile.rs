@@ -477,6 +477,98 @@ pub fn reconcile(
     report
 }
 
+/// The other half of the pass's invariant, for a consumer that holds the registry
+/// from somewhere else: the names a profile's *reconciled* configs dispatch, the
+/// set that is kept out of it, and the pin a recipe declared for this shell.
+///
+/// [`reconcile`] proves the invariant against a registry **derived** from the
+/// profile's own QML, because a switch cannot ask the arriving shell what it
+/// registers — it has not started yet. The verification tier (#39) runs after the
+/// shell is up and proves the very same invariant against the **live** registry
+/// instead. Both sides of the statement have to come from here, so this is what
+/// the live check measures its own side against: the same scan, the same keep
+/// set, the same `[foreign]` entries, over the same files — read-only, and
+/// derived the same way.
+#[derive(Debug, Default, Serialize)]
+pub struct Dispatched {
+    /// The shell whose registry the caller is holding.
+    pub shell: Option<String>,
+    /// How many config files were read for dispatched names.
+    pub scanned_files: usize,
+    /// Every `ns:name` the configs dispatch, in name order — including the ones a
+    /// layer kept, which are listed so the caller can see what was measured and
+    /// subtract the keep set itself.
+    pub names: Vec<String>,
+    /// The keep set this profile runs with: the built-in foreign guard, the
+    /// caller's explicit keeps, and every recipe's `[foreign] entries`. A name
+    /// here is never dead, whatever any registry says about it.
+    pub keep: Vec<String>,
+    /// The highest-precedence `[shell] appid` pin, when a layer declared one. A
+    /// pin is never a source of truth; it is the claim a live registry is
+    /// checked against to tell *a dead bind* from *a recipe that is out of
+    /// date*.
+    pub pinned_appid: Option<String>,
+    /// Set instead of answering, naming why: a profile that names no shell, or
+    /// one whose Hyprland config is not there.
+    pub skipped: Option<String>,
+    /// Anything the read itself could not do — a file that would not open, a
+    /// recipe that would not parse. A non-empty list means the dispatched set
+    /// below may be incomplete.
+    pub warnings: Vec<String>,
+}
+
+/// The dispatched side of the invariant, read-only and without a registry.
+pub fn dispatched(
+    profile: &Path,
+    context: &Context,
+    shell: Option<&str>,
+    keeps: &BTreeSet<String>,
+) -> Dispatched {
+    let mut out = Dispatched::default();
+    let Some(shell) = shell else {
+        out.skipped = Some(
+            "the profile names no shell, so its dispatches have no registry to resolve against"
+                .to_string(),
+        );
+        return out;
+    };
+    out.shell = Some(shell.to_string());
+
+    let (layers, findings) = recipe::Layers::load(profile, context.data(), shell);
+    out.warnings = findings;
+    out.pinned_appid = layers.appid_pin().map(|(_, appid)| appid);
+
+    let mut keep = keeps.clone();
+    keep.extend(FOREIGN.iter().map(|entry| entry.to_string()));
+    keep.extend(layers.foreign());
+    out.keep = keep.into_iter().collect();
+
+    let hypr = profile.join(".config").join("hypr");
+    if !hypr.is_dir() {
+        out.skipped = Some(format!(
+            "{} holds no Hyprland config, so it dispatches nothing",
+            profile.display()
+        ));
+        return out;
+    }
+    let configs = configs_in_scope(&hypr);
+    out.scanned_files = configs.len();
+
+    let mut names = BTreeSet::new();
+    for path in &configs {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            out.warnings
+                .push(format!("cannot read {}: skipped", relative(path)));
+            continue;
+        };
+        for site in scan(&text).sites {
+            names.insert(site.entry());
+        }
+    }
+    out.names = names.into_iter().collect();
+    out
+}
+
 /// What a read-only look at a tree found, in the shape the research brief reads.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Survey {

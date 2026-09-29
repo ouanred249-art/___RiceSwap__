@@ -43,6 +43,9 @@
 //! [foreign]
 //! entries = ["quickshell:riceswap-toggle"]
 //!
+//! [ipc]                               # optional; only when the shell has one
+//! probe = "qs -c caelestia ipc call panel state"
+//!
 //! [[resolution]]                      # exactly one of `to`, `exec`, `drop`
 //! dispatched = "quickshell:regionScreenshot"
 //! to = "screenshotClip"               # or `to = "caelestia:screenshotClip"`
@@ -137,6 +140,26 @@ pub struct Recipe {
     /// Namespaces that belong to another live shell and are never rewritten.
     #[serde(default)]
     pub foreign: Foreign,
+    /// How to ask the running shell whether it is there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipc: Option<Ipc>,
+}
+
+/// The `[ipc]` table: the liveness probe this shell answers.
+///
+/// It exists because a process surviving a start is a weaker fact than a shell
+/// answering a question. A `qs -c ii` that stays up for its grace window has
+/// proved it did not exit; it has not proved it got past its own initialization,
+/// which is where a broken QML file lands. A shell that exposes an IPC target
+/// can be asked instead, and this is where the question is written down.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Ipc {
+    /// A one-shot command that exits 0 only while the shell answers, and
+    /// non-zero otherwise. Run as a shell reads it, from the operation's own
+    /// environment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe: Option<String>,
 }
 
 /// The `[shell]` table.
@@ -314,6 +337,8 @@ pub struct Tier {
     dirs: BTreeMap<String, Dir>,
     foreign: BTreeSet<String>,
     appid: Option<String>,
+    /// The `[ipc] probe` this tier declares, with the tier that asked for it.
+    probe: Option<(&'static str, String)>,
 }
 
 impl Tier {
@@ -391,6 +416,24 @@ impl Tier {
             dirs.insert(dir.path.clone(), dir);
         }
 
+        // The IPC probe is a *declared* question, so a tier that names one is
+        // obeyed and a tier that names an empty or blank one is a finding: an
+        // empty probe would be run on every switch and answer "the shell is
+        // dead" about a shell nobody asked about.
+        let probe = match recipe.ipc {
+            Some(ipc) => match ipc.probe.map(|probe| probe.trim().to_string()) {
+                Some(probe) if !probe.is_empty() => Some((name, probe)),
+                _ => {
+                    findings.push(format!(
+                        "{origin} has an `[ipc]` table with no `probe` command; it names nothing \
+                         to run"
+                    ));
+                    None
+                }
+            },
+            None => None,
+        };
+
         Some(Tier {
             name,
             origin,
@@ -400,6 +443,7 @@ impl Tier {
             dirs,
             foreign: recipe.foreign.entries.into_iter().collect(),
             appid: recipe.shell.and_then(|shell| shell.appid),
+            probe,
         })
     }
 
@@ -512,6 +556,19 @@ impl Layers {
             .iter()
             .flat_map(|tier| tier.foreign.iter().cloned())
             .collect()
+    }
+
+    /// The `[ipc] probe` the highest-precedence tier that declares one speaks
+    /// for, and which tier it was — the same precedence as every other lookup,
+    /// so a profile's own `adapt.toml` can correct a built-in probe by restating
+    /// it. `None` when no tier declares a probe at all, which is the ordinary
+    /// case: a shell with no IPC target has nothing to ask.
+    pub fn ipc_probe(&self) -> Option<(&'static str, &str)> {
+        self.tiers.iter().find_map(|tier| {
+            tier.probe
+                .as_ref()
+                .map(|(name, probe)| (*name, probe.as_str()))
+        })
     }
 
     /// The `[env]` variables every tier speaks for, higher tiers winning per

@@ -28,6 +28,7 @@ use crate::profile::{
 use crate::reconcile;
 use crate::state::StateStore;
 use crate::tools::{self, Tool};
+use crate::verify;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -1388,32 +1389,426 @@ pub(crate) fn switch(context: &mut Context, target: &str, aur_helper: Option<&st
     }
     completed_steps += 2;
 
+    // The switch is done: ten steps, a live desktop, an envelope ready to be
+    // emitted. Before it is emitted, the verification tier looks at what those
+    // ten steps actually produced (issue #39).
+    //
+    // This is deliberately *not* an eleventh step, and the reason is the same one
+    // the engine's pass above is not a step of its own: nothing here is a stage
+    // of the work, it is a reading of the result, and a half-finished
+    // verification has no state to resume from. Counting it would move
+    // `completed_steps` — a number the panel's checklist, the resume contract and
+    // `tests/contracts.rs`'s pinned step messages are all built on. A re-switch
+    // re-verifies from scratch exactly as a re-switch re-reconciles from scratch,
+    // so nothing is lost by not resuming it. Like the reconcile pass, its facts
+    // ride the envelope (`report.verification`) and the shell check's evidence is
+    // the only thing it says out loud.
+    let verification = verify::run(&verify::Subject {
+        home: &context.home,
+        data: &context.store.data_dir(),
+        profile: &context.store.profile_dir(target),
+        shell: target_manifest.shell.as_ref(),
+        shell_attempted: shell_start.is_some(),
+        shell_started: shell_started.as_deref(),
+        reconcile: &reconcile_report,
+    });
+
+    let report = json!({
+        "installed": installed,
+        "removed": removed,
+        "kept": kept,
+        "conflict_removed": conflict_removed,
+        "aur_output": aur_output,
+        "linked": linked,
+        "unlinked": unlinked,
+        "preserved": preserved,
+        "backed_up": backed_up,
+        "protected": protected,
+        "services_stopped": services_stopped,
+        "services_started": services_started,
+        "shell_stopped": shell_stopped,
+        "shell_started": shell_started,
+        "reloaded": reloaded,
+        "reconcile": reconcile_report,
+        "verification": verification,
+    });
+
+    if verification.failed() {
+        // A rejected desktop. Everything the rollback needs is still in scope —
+        // what was stopped, what was started, what was linked — which is why
+        // this runs here and not in a separate pass over the store.
+        return verification_failure(
+            context,
+            &mut emitter,
+            FailedVerification {
+                target,
+                completed_steps,
+                report: &report,
+                verification: &verification,
+                rollback: &Rollback {
+                    active: active.name.clone(),
+                    old: active_manifest.as_ref(),
+                    new: Some(&target_manifest),
+                    stopped_services: &services_stopped,
+                    started_services: &services_started,
+                    stopped_shell: shell_stopped.as_deref(),
+                    started_shell: shell_started.as_deref(),
+                    started_new_shell: shell_start,
+                },
+            },
+            warnings,
+        );
+    }
+
     let mut envelope = Envelope::ok(json!({
         "target": target,
         "completed_steps": completed_steps,
         "resume_hint": format!("switch to `{target}` to restore"),
-        "report": {
-            "installed": installed,
-            "removed": removed,
-            "kept": kept,
-            "conflict_removed": conflict_removed,
-            "aur_output": aur_output,
-            "linked": linked,
-            "unlinked": unlinked,
-            "preserved": preserved,
-            "backed_up": backed_up,
-            "protected": protected,
-            "services_stopped": services_stopped,
-            "services_started": services_started,
-            "shell_stopped": shell_stopped,
-            "shell_started": shell_started,
-            "reloaded": reloaded,
-            "reconcile": reconcile_report,
-        },
+        "report": report,
     }));
     envelope.warnings = warnings;
     with_tools(&mut envelope, Tool::ALL);
     envelope
+}
+
+/// What the failed switch did, so the rollback can undo exactly that and
+/// nothing else.
+struct Rollback<'a> {
+    /// The profile that was active before the switch, if there was one.
+    active: Option<String>,
+    /// Its manifest, when it could be read.
+    old: Option<&'a Manifest>,
+    /// The manifest of the profile the switch activated.
+    new: Option<&'a Manifest>,
+    /// What the switch stopped, which the rollback starts again.
+    stopped_services: &'a [String],
+    /// What the switch started, which the rollback stops.
+    started_services: &'a [String],
+    /// The shell the switch stopped, which the rollback starts again.
+    stopped_shell: Option<&'a str>,
+    /// The shell the switch started, which the rollback stops.
+    started_shell: Option<&'a str>,
+    /// The `[shell]` the switch started, for the command to stop it with.
+    started_new_shell: Option<&'a Shell>,
+}
+
+/// A rejected desktop, in the parts the failure envelope is built from. One
+/// struct rather than eight positional arguments, because every one of these is
+/// the same shape of thing — a fact about the switch that just finished — and a
+/// caller that got two of them the wrong way round would still compile.
+struct FailedVerification<'a> {
+    /// The profile the switch activated and verification rejected.
+    target: &'a str,
+    /// The switch's own step count, carried through unchanged: the ten steps did
+    /// complete, and the tier that read them is not a step of its own.
+    completed_steps: i32,
+    /// The switch's own report, whole.
+    report: &'a Value,
+    /// The verdict and its checks, with the reason code and facts.
+    verification: &'a verify::Report,
+    /// What the switch did, so the rollback can undo exactly that.
+    rollback: &'a Rollback<'a>,
+}
+
+/// Turns a failed verdict into the envelope the ticket froze, and puts the old
+/// profile back first.
+///
+/// The order inside this function is the whole design, so it is worth stating
+/// plainly: **the flip is reversed first**, before any service is touched. A
+/// rollback that stopped the new desktop and then failed to flip would leave a
+/// session whose `current` names a profile nothing is running, and the next
+/// thing anyone reads is that symlink. Reversing the activation first means the
+/// worst case of a half-finished rollback is "the old profile is active and its
+/// desktop has not come back up yet" — a desktop that is merely blank, and that
+/// `riceswap switch <old>` finishes — rather than a store that disagrees with the
+/// running session.
+fn verification_failure(
+    context: &mut Context,
+    emitter: &mut Emitter,
+    failed: FailedVerification<'_>,
+    mut warnings: Vec<String>,
+) -> Envelope {
+    let FailedVerification {
+        target,
+        completed_steps,
+        report,
+        verification,
+        rollback,
+    } = failed;
+    let reason = verification
+        .reason_code
+        .clone()
+        .unwrap_or_else(|| verify::INVARIANT_DEAD_NAMES.to_string());
+    // The switch's own warnings — the preserved files, the kept packages, the
+    // start that failed and is the reason for all this — are carried into the
+    // failure rather than dropped: they happened, and the diagnosis is only
+    // readable with them.
+    let note = format!("`{target}` did not verify ({reason}); putting the previous profile back");
+    emitter.warning(&note);
+    warnings.push(note);
+
+    let mut next = match rollback.active.clone() {
+        Some(old) => format!("switched back to `{old}`"),
+        None => {
+            format!("there was no previous profile to switch back to; `{target}` is still active")
+        }
+    };
+    // The packages are the one thing the rollback deliberately does not undo, so
+    // the envelope says which ones are in what state rather than leaving a user
+    // to diff two `pacman -Q` outputs.
+    let installed = report["installed"].as_array().map(Vec::len).unwrap_or(0);
+    let removed = report["removed"].as_array().map(Vec::len).unwrap_or(0);
+    if installed > 0 || removed > 0 {
+        next.push_str(&format!(
+            "; the {} package(s) this switch installed and the {} it removed are still in that \
+             state — RiceSwap does not run the opposite transaction for you",
+            installed, removed
+        ));
+    }
+
+    // The verdict is not repeated at the top level: `report.verification` is the
+    // one place it lives, on a pass and on a failure alike, so a consumer reads
+    // one key rather than two that could disagree.
+    let mut data = json!({
+        "error": format!(
+            "`{target}` did not verify: the desktop behind it is not what this profile promises \
+             ({reason}); see `facts` and `report.verification.checks`"
+        ),
+        "phase": "verify",
+        "reason_code": reason,
+        "next": next,
+        "target": target,
+        "completed_steps": completed_steps,
+        "resume_hint": format!("switch to `{target}` to restore"),
+        "facts": verification.facts,
+        "report": report,
+    });
+
+    match restore(context, rollback) {
+        Ok(notes) => {
+            for note in notes {
+                emitter.warning(&note);
+                warnings.push(note);
+            }
+        }
+        Err(error) => {
+            // The rollback is what is left to do by hand, and the envelope says
+            // so instead of reporting a desktop that is not there.
+            let manual = format!(
+                "RiceSwap could not put the previous profile back ({error}); run `riceswap switch \
+                 <profile>` by hand once the desktop is worth switching to"
+            );
+            emitter.warning(&manual);
+            warnings.push(manual);
+            data["error"] = json!(format!(
+                "`{target}` did not verify ({reason}), and the rollback did not finish either: \
+                 {error}"
+            ));
+            data["reason_code"] = json!("rollback-failed");
+            data["next"] = json!(format!(
+                "run `riceswap switch {}` by hand to activate the profile you want back; the \
+                 packages this switch moved were not reverted",
+                rollback
+                    .active
+                    .clone()
+                    .unwrap_or_else(|| target.to_string())
+            ));
+            data["rollback"] = json!({ "ok": false, "error": error });
+        }
+    }
+
+    Envelope {
+        ok: false,
+        data,
+        warnings,
+    }
+}
+
+/// Puts the previous profile back: the symlink, the links it owns, its services
+/// and its shell.
+///
+/// The inverse of the steps the switch just ran, and deliberately *not* a
+/// recursive `switch()`. A second full switch would re-run the engine over the
+/// old profile (harmless — it is idempotent by construction) but it would also
+/// re-verify it, which on a machine whose compositor is the thing that just
+/// failed would run the failing check a second time and, if it failed again,
+/// begin a rollback of a rollback. The rollback here is deliberately the small
+/// set of operations that restores a desktop, with no engine pass and no verdict
+/// of its own: the old profile was verified when it was activated, and the report
+/// of the failed switch is the evidence for the decision to go back.
+///
+/// The symlink goes first (see [`verification_failure`]), then the shell and
+/// services the switch started are stopped, then the links are put back, then the
+/// compositor is reloaded, then the old services and the old shell start — the
+/// same order the switch itself uses, so the old shell comes up against the
+/// config the reload has already installed.
+fn restore(context: &Context, rollback: &Rollback) -> Result<Vec<String>, String> {
+    let mut notes = Vec::new();
+    let Some(old) = rollback.active.as_deref() else {
+        // Nothing to go back to: the switch had no desktop to destroy, so the
+        // one it activated is still the only one there is. Saying so is the
+        // honest outcome — unlinking `current` here would leave the store
+        // pointing at nothing at all, which is worse than a desktop that failed
+        // its checks.
+        notes.push(
+            "there was no previous profile to restore: this was a first switch, so `current` \
+             still names the profile that was just activated"
+                .to_string(),
+        );
+        return Ok(notes);
+    };
+    context.store.flip(old)?;
+    notes.push(format!("`current` points back at `{old}`"));
+
+    // The new desktop goes down before the old one comes up, or the two overlap.
+    if let Some(shell) = rollback.started_new_shell
+        && rollback.started_shell == Some(shell.name.as_str())
+    {
+        let _ = Command::new("sh").arg("-c").arg(&shell.stop).output();
+        notes.push(format!(
+            "stopped the shell this switch started (`{}`)",
+            shell.name
+        ));
+    }
+    if let Some(new) = rollback.new {
+        for name in rollback.started_services {
+            if let Some(service) = new.services.iter().find(|service| &service.name == name) {
+                let _ = Command::new("sh").arg("-c").arg(&service.stop).output();
+                notes.push(format!("stopped the service `{name}` this switch started"));
+            }
+        }
+    }
+
+    for note in restore_links(context, rollback, old) {
+        notes.push(note);
+    }
+
+    if Command::new("hyprctl")
+        .arg("reload")
+        .output()
+        .is_ok_and(|out| out.status.success())
+    {
+        notes.push("reloaded Hyprland against the restored config".to_string());
+    } else {
+        notes.push(
+            "could not reload Hyprland: the restored config takes effect at the next login or a \
+             manual `hyprctl reload`"
+                .to_string(),
+        );
+    }
+
+    // The old services, then the old shell last — a shell started before the
+    // reload would read the old config and keep it, which is the failure the
+    // switch's own ordering exists to prevent.
+    if let Some(previous) = rollback.old {
+        for name in rollback.stopped_services {
+            if let Some(service) = previous.services.iter().find(|s| &s.name == name) {
+                match start_daemonized(&service.start) {
+                    Ok(()) => notes.push(format!("started `{name}` again")),
+                    Err(detail) => {
+                        notes.push(format!("could not start `{name}` again: {detail}"));
+                    }
+                }
+            }
+        }
+        if let Some(shell) = previous.shell.as_ref()
+            && rollback
+                .stopped_shell
+                .is_some_and(|name| name == shell.name)
+        {
+            match start_daemonized(&shell.start) {
+                Ok(()) => notes.push(format!("started the previous shell `{}`", shell.name)),
+                Err(detail) => notes.push(format!(
+                    "could not start the previous shell `{}`: {detail}",
+                    shell.name
+                )),
+            }
+        }
+    }
+    Ok(notes)
+}
+
+/// The link half of the rollback: the previous profile's own paths are linked
+/// back, and the paths only the failed switch claimed are cleared.
+///
+/// A path the previous profile owns is linked from its directory when it has a
+/// file there, and from the bytes the forward switch preserved under its
+/// `backups/` when it does not — which is the case that switch creates
+/// deliberately, when the old profile claimed a path it had no copy of. A path
+/// with neither is left alone and named, because a dangling link at a live
+/// config path is a worse thing than an absent one.
+fn restore_links(context: &Context, rollback: &Rollback, old: &str) -> Vec<String> {
+    let mut notes = Vec::new();
+    let Some(previous) = rollback.old else {
+        return notes;
+    };
+    let old_dir = context.store.profile_dir(old);
+    let claimed: BTreeSet<&str> = rollback
+        .new
+        .map(|new| {
+            new.files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<BTreeSet<&str>>()
+        })
+        .unwrap_or_default();
+    let old_paths: BTreeSet<&str> = previous
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
+
+    // The union, so a path both profiles claim is handled once: the old profile
+    // owns it, and pointing the live path back at the old copy is the whole of
+    // what that takes.
+    let paths: BTreeSet<&str> = old_paths.union(&claimed).copied().collect();
+    for relative in paths {
+        if claimed.contains(relative) && !old_paths.contains(relative) {
+            // A path the failed switch linked that the old profile never owned:
+            // clearing it is what puts the live tree back as it was.
+            if let Err(error) = clear_managed_path(&context.home.join(relative)) {
+                notes.push(format!("could not clear `{relative}`: {error}"));
+            } else {
+                notes.push(format!(
+                    "cleared `{relative}`: only the profile that failed verification claimed it"
+                ));
+            }
+            continue;
+        }
+        let owned = old_dir.join(relative);
+        if owned.exists() {
+            if let Err(error) = link_managed_path(&context.home.join(relative), &owned) {
+                notes.push(format!(
+                    "could not point `{relative}` back at `{old}`: {error}"
+                ));
+            }
+            continue;
+        }
+        // The forward switch preserved the live bytes before unlinking this
+        // path, so they are where the leaving profile was told to keep them.
+        let preserved = context.store.backups_dir(old).join(relative);
+        if preserved.exists() {
+            let live = context.home.join(relative);
+            if let Some(parent) = live.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::rename(&preserved, &live) {
+                Ok(()) => notes.push(format!(
+                    "put `{relative}` back from the bytes this switch preserved"
+                )),
+                Err(error) => notes.push(format!(
+                    "could not restore `{relative}` from {}: {error}",
+                    preserved.display()
+                )),
+            }
+            continue;
+        }
+        notes.push(format!(
+            "`{old}` claims `{relative}`, but it holds no file for it and this switch preserved \
+             none: the live path was left exactly as it was found"
+        ));
+    }
+    notes
 }
 
 /// Says what a reconciliation pass found, out loud and into `warnings`.
@@ -1968,7 +2363,11 @@ fn describe_failure(stderr: &str, status: ExitStatus) -> String {
 /// fails within its first moments (no binary, no display, bad config), and
 /// the grace window gives those failures their stderr back instead of
 /// reporting a success the desktop will not show.
-const START_GRACE: Duration = Duration::from_millis(700);
+///
+/// `pub(crate)` because the verification tier quotes this window back to the
+/// user in its shell check's evidence: the number a start was given is part of
+/// what "alive" means here, and it must not be restated somewhere else.
+pub(crate) const START_GRACE: Duration = Duration::from_millis(700);
 
 /// Runs one `start` command and reports whether to count it as started, in a
 /// bounded time no matter what the command does.

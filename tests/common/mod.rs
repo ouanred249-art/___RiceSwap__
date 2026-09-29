@@ -206,6 +206,19 @@ if [ -n "$RICESWAP_STUB_DELAY_DIR" ] && [ -f "$RICESWAP_STUB_DELAY_DIR/$name" ];
     esac
   done < "$RICESWAP_STUB_DELAY_DIR/$name"
 fi
+if [ -n "$RICESWAP_STUB_FAULT_DIR" ] && [ -r "$RICESWAP_STUB_FAULT_DIR/$name" ]; then
+  # A fault the fake machine develops *while the operation is running*: the one
+  # thing a real filesystem can do that a test otherwise cannot stage up front,
+  # because it has to happen between two calls the same process makes. The
+  # trigger is the first whitespace-delimited word of the line, matched anywhere
+  # in the arguments; the action is the rest of the line, run by `sh`.
+  while read -r trigger action; do
+    [ -n "$trigger" ] && [ -n "$action" ] || continue
+    case " $* " in
+      *" $trigger "*) sh -c "$action" ;;
+    esac
+  done < "$RICESWAP_STUB_FAULT_DIR/$name"
+fi
 if [ -n "$RICESWAP_STUB_FAIL_DIR" ] && [ -r "$RICESWAP_STUB_FAIL_DIR/$name" ]; then
   while read -r pattern; do
     [ -n "$pattern" ] || continue
@@ -310,6 +323,13 @@ if [ "$mode" = "ok" ]; then
     printf 'stub screenshot' > "$destination"
     exit 0
   fi
+  if [ "$name" = "hyprctl" ] && [ "$1" = "globalshortcuts" ]; then
+    # The live registry read (issue #39). A test that cares about the answer
+    # scripts it; a test that does not gets the generic version banner below,
+    # which carries no `appid:name` in it and is therefore read as "no registry
+    # here" — the degrade the CI sandbox is meant to be in.
+    [ -r "$RICESWAP_STUB_GLOBALSHORTCUTS" ] && cat "$RICESWAP_STUB_GLOBALSHORTCUTS"
+  fi
   case "$1" in
     -S*|-R*)
       packages=""
@@ -388,8 +408,14 @@ pub struct Sandbox {
     packages: PathBuf,
     delays: PathBuf,
     fails: PathBuf,
+    faults: PathBuf,
     git_source: PathBuf,
     git_sha: PathBuf,
+    /// What `hyprctl globalshortcuts` answers, in the real command's own
+    /// format. The default is an empty file, so the stub falls through to its
+    /// generic version banner instead — the "no live registry here" the headless
+    /// sandbox is.
+    globalshortcuts: PathBuf,
     /// One line per `pi` research run: the directory it ran in and its flags.
     pi_log: PathBuf,
     /// The JSONL stream the `pi` stub writes for a research run.
@@ -421,15 +447,17 @@ impl Sandbox {
         let packages = root.path().join("installed-packages.txt");
         let delays = root.path().join("delays");
         let fails = root.path().join("fail-on");
+        let faults = root.path().join("faults");
         let git_source = root.path().join("git-source.txt");
         let git_sha = root.path().join("git-sha.txt");
+        let globalshortcuts = root.path().join("hyprctl-globalshortcuts.txt");
         let pi_log = root.path().join("pi-invocations.log");
         let pi_stream = root.path().join("pi-stream.jsonl");
         let pi_auth = root.path().join("pi-auth.json");
         let pi_exit = root.path().join("pi-exit");
         let pi_stderr = root.path().join("pi-stderr.txt");
         let pi_preamble = root.path().join("pi-preamble.jsonl");
-        for dir in [&home, &bin, &modes, &states, &delays, &fails] {
+        for dir in [&home, &bin, &modes, &states, &delays, &fails, &faults] {
             fs::create_dir_all(dir).expect("create sandbox directory");
         }
         for tool in STUB_TOOLS.iter().chain(FALLBACK_STUBS).chain(SERVICE_STUBS) {
@@ -443,6 +471,7 @@ impl Sandbox {
         fs::write(&git_source, "").expect("create git clone-source fixture");
         fs::write(&git_sha, "1a2b3c4d5e6f70819a2b3c4d5e6f70819a2b3c4d\n")
             .expect("create git sha fixture");
+        fs::write(&globalshortcuts, "").expect("create the live registry fixture");
         fs::write(&pi_log, "").expect("create pi invocation log");
         fs::write(&pi_stream, "").expect("create pi stream fixture");
         fs::write(&pi_auth, "").expect("create pi auth fixture");
@@ -462,8 +491,10 @@ impl Sandbox {
             packages,
             delays,
             fails,
+            faults,
             git_source,
             git_sha,
+            globalshortcuts,
             pi_log,
             pi_stream,
             pi_auth,
@@ -592,6 +623,54 @@ impl Sandbox {
         fs::write(&self.git_source, format!("{}\n", tree.display())).expect("write clone source");
     }
 
+    // ------------------------------------------- the live registry (issue #39)
+
+    /// Scripts what `hyprctl globalshortcuts` answers: the registrations the
+    /// live session is claimed to have, as `appid:name`.
+    ///
+    /// Rendered in the real command's own `bind =` lines, because parsing the
+    /// real format is half of what the verification tier does and a stub that
+    /// answered some private shape would not be testing it.
+    pub fn live_registry(&self, entries: &[&str]) {
+        let mut answer = String::from("globalshortcuts:\n");
+        for entry in entries {
+            let (appid, name) = entry.split_once(':').unwrap_or((*entry, ""));
+            answer.push_str(&format!(
+                "bind = SUPER, F{hash}, global, {appid}:{name}, {name} ({appid})\n",
+                hash = name.len(),
+            ));
+        }
+        fs::write(&self.globalshortcuts, answer).expect("write the live registry fixture");
+    }
+
+    /// Scripts `hyprctl globalshortcuts` to answer with `answer` verbatim, for
+    /// the shapes a rendered registry cannot express: a command that fails, a
+    /// session-less answer, a banner with nothing in it.
+    pub fn live_registry_answers(&self, answer: &str) {
+        fs::write(&self.globalshortcuts, answer).expect("write the live registry fixture");
+    }
+
+    /// Makes the fake machine do `action` whenever `tool` is invoked with
+    /// arguments containing `pattern`.
+    ///
+    /// This is the one fault a test cannot stage before the operation starts,
+    /// because it has to happen *between* two calls the same process makes —
+    /// removing the profile a rollback is about to point `current` back at, for
+    /// instance, which only exists as a fault once the forward flip is done.
+    /// Sticky until scripted again.
+    pub fn fault_on(&self, tool: &str, pattern: &str, action: &str) {
+        assert!(
+            STUB_TOOLS.contains(&tool)
+                || FALLBACK_STUBS.contains(&tool)
+                || SERVICE_STUBS.contains(&tool),
+            "unknown stub tool {tool}"
+        );
+        let path = self.faults.join(tool);
+        let mut faults = fs::read_to_string(&path).unwrap_or_default();
+        faults.push_str(&format!("{pattern} {action}\n"));
+        fs::write(&path, faults).expect("write the fault fixture");
+    }
+
     /// The sha the `git` stub answers `rev-parse HEAD` with, for the checkouts
     /// it is told about.
     pub fn git_reports_commit(&self, sha: &str) {
@@ -692,8 +771,10 @@ impl Sandbox {
             ("RICESWAP_STUB_PACKAGES", &self.packages),
             ("RICESWAP_STUB_DELAY_DIR", &self.delays),
             ("RICESWAP_STUB_FAIL_DIR", &self.fails),
+            ("RICESWAP_STUB_FAULT_DIR", &self.faults),
             ("RICESWAP_STUB_GIT_SOURCE", &self.git_source),
             ("RICESWAP_STUB_GIT_SHA", &self.git_sha),
+            ("RICESWAP_STUB_GLOBALSHORTCUTS", &self.globalshortcuts),
             ("RICESWAP_STUB_PI_LOG", &self.pi_log),
             ("RICESWAP_STUB_PI_STREAM", &self.pi_stream),
             ("RICESWAP_STUB_PI_AUTH", &self.pi_auth),

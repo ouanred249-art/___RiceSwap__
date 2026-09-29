@@ -1641,6 +1641,11 @@ pub fn document(subject: &Subject, findings: &Findings) -> (Recipe, Vec<String>)
         foreign: recipe::Foreign {
             entries: foreign.into_iter().collect(),
         },
+        // A research run derives facts, and an IPC probe is a *declaration* —
+        // it is somebody's claim about a command that shell answers. Nothing
+        // here establishes that claim, so the write-back declares none and a
+        // profile that wants one has to say so in its own `adapt.toml`.
+        ipc: None,
     };
     (recipe, notes)
 }

@@ -16,6 +16,7 @@ mod reconcile;
 mod research;
 mod state;
 mod tools;
+mod verify;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

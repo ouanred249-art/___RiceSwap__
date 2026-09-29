@@ -17,6 +17,11 @@
 //! seconds. The file is rewritten after every state change, via a temp file and
 //! a rename so the watcher never reads a half-written document.
 //!
+//! The document records *progress*, and the verification tier's verdict (#39) is
+//! deliberately not one of its facts: the verdict is a result, it arrives on the
+//! envelope at the same moment, and `tests/contracts.rs` pins this document
+//! exactly — an added key here would break the very contract it exists to hold.
+//!
 //! The `operation` entry carries one more field, `source`, which only `install`
 //! fills in. An install's steps are idempotent and it has a fatal half — a
 //! missing AUR helper, a profile that cannot be written — so "run the same
@@ -46,6 +51,13 @@ pub struct OperationState {
 }
 
 /// The outcome of the last finished operation.
+///
+/// The verification tier's verdict (#39) is deliberately **not** a field here.
+/// `tests/contracts.rs` pins this object with an exact equality rather than a
+/// key set, so a "minimal field addition" to `state.json` is precisely the thing
+/// that would break the frozen document the panel reads — and the verdict is
+/// already in the envelope, on the same stream, at the same moment. This type
+/// therefore keeps exactly the two fields it has always had.
 #[derive(Debug, Serialize)]
 pub struct LastResult {
     pub ok: bool,

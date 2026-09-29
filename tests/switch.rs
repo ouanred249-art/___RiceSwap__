@@ -1438,28 +1438,60 @@ fn the_shell_starts_after_the_reload_so_it_reads_the_new_config() {
     );
 }
 
+/// Class: the shell swap, and what a shell that will not start means.
+///
+/// This test was `a_shell_that_will_not_start_warns_without_failing_the_switch`,
+/// and it asserted the warning-only outcome: at step 10 the packages, the links
+/// and the config were all correct, so failing there would have reported a
+/// broken profile for a shell that was merely not up yet. That reasoning is
+/// sound *for a step* — and issue #39 moved the question one level out. A switch
+/// that activated a profile and left no desktop behind it has not worked, so the
+/// shell check is now the first Tier C check, and a start that was attempted and
+/// did not survive fails verification: the previous profile is put back and the
+/// envelope carries the diagnosis.
+///
+/// What the step-level behaviour was is kept here, because it did not change: the
+/// start still *warns*, in the same words, at the same moment. What is new is
+/// only what the operation does with that warning afterwards. The full failure
+/// contract — payload, facts, rollback — is in `tests/verification.rs`.
 #[test]
-fn a_shell_that_will_not_start_warns_without_failing_the_switch() {
+fn a_shell_that_will_not_start_is_reported_and_then_rejected_by_verification() {
     let sandbox = Sandbox::new();
     shell_fixture(&sandbox);
     sandbox.fail_on("qs", "-c caelestia");
     sandbox.clear_log();
 
     let run = sandbox.run(&["switch", "caelestia"]);
-    let data = run.assert_ok();
+    let error = run.assert_failed();
 
-    // Everything else succeeded and the config is correct for the next login,
-    // so failing here would report a broken profile for a shell not yet up.
+    // The warning is unchanged: the failure names the shell and the switch's own
+    // report still says it never came up.
+    let warnings = run.warnings();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("caelestia") && w.contains("failed to start")),
+        "the start still warns first, in the step's own words: {warnings:?}"
+    );
+    let envelope = run.envelope();
+    let data = &envelope["data"];
     assert_eq!(data["completed_steps"], json!(10));
     assert_eq!(data["report"]["shell_started"], Value::Null);
+    assert_eq!(data["phase"], json!("verify"));
+    assert_eq!(data["reason_code"], json!("shell-not-alive"));
+    assert_eq!(
+        data["report"]["verification"]["verdict"],
+        json!("fail"),
+        "the ten steps completed and the tier that reads them rejected the result"
+    );
     assert!(
-        run.warnings().iter().any(|w| w.contains("caelestia")),
-        "the failure names the shell: {:?}",
-        run.warnings()
+        error.contains("shell-not-alive"),
+        "the failure names the reason: {error}"
     );
     assert_eq!(
         sandbox.current_target(),
-        Some(sandbox.profile_dir("caelestia"))
+        Some(sandbox.profile_dir("ii")),
+        "and the previous profile is the active one again"
     );
 }
 
