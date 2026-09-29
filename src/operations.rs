@@ -1413,6 +1413,17 @@ pub(crate) fn switch(context: &mut Context, target: &str, aur_helper: Option<&st
         reconcile: &reconcile_report,
     });
 
+    // A tier that degraded is a fact about this run, and the envelope's
+    // `warnings` is where a fact like that is said out loud: a machine with no
+    // `grim` or `ydotool` gets `verified-core` plus a warning naming what was
+    // missing, rather than a silent downgrade nobody was told about. They ride
+    // the same list the switch's own warnings use, so a failure's payload
+    // carries them too.
+    for note in &verification.warnings {
+        emitter.warning(note);
+        warnings.push(note.clone());
+    }
+
     let report = json!({
         "installed": installed,
         "removed": removed,

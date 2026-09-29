@@ -42,9 +42,12 @@ pub const STUB_TOOLS: &[&str] = &[
 /// variants, so they carry no version contract. `sudo` is the switch's
 /// fallback path when a `pkexec` transaction is refused; a test scripts its
 /// mode to make that path succeed (`Ok`, the default) or fail (`Denied`).
-/// `ydotool` is the synthetic-input tool the verification tier drives: no
-/// backend command shells out to it yet, so it is installed as a seam for
-/// the tickets that will — scriptable now, unprobed until then.
+/// `ydotool` is the synthetic-input tool the functional verification tier
+/// (#40) drives, so it has graduated from a seam to a tool the switch itself
+/// runs: every probe's `key` and `type` steps go through it, and `ydotool help`
+/// is how the tier decides it can drive this session at all. It stays off the
+/// `detect` roster — `tests/harness.rs` asserts that — because it has no
+/// version contract of its own to probe against.
 pub const FALLBACK_STUBS: &[&str] = &["sudo", "ydotool"];
 
 /// Service commands the fixture manifests run (`start`/`stop`), stubbed on
@@ -320,7 +323,28 @@ if [ "$mode" = "ok" ]; then
   fi
   if [ "$name" = "grim" ] && [ "$1" != "-h" ]; then
     for argument in "$@"; do destination=$argument; done
-    printf 'stub screenshot' > "$destination"
+    # The screenshot seam for the functional tier (#40). Two calls write
+    # different bytes, because a counter rides along in them, and the tier's
+    # observation floor is "the encoding of that region is not what it was" —
+    # a stub that wrote the same bytes every time would make every floor probe
+    # fail for a reason that is the stub's and not the desktop's.
+    #
+    # `RICESWAP_STUB_GRIM_FROZEN` holds the call count up to which the bytes
+    # are held still, which is how a test asks for a screen that does not
+    # change (a probe that must fail) or for one that changes only after a
+    # while (a probe that must flake and then pass its re-run). `-h` is the
+    # version probe and still falls through to the generic answer above.
+    shots=0
+    if [ -r "$RICESWAP_STUB_SHOTS" ]; then read -r shots < "$RICESWAP_STUB_SHOTS"; fi
+    shots=$((shots + 1))
+    printf '%s\n' "$shots" > "$RICESWAP_STUB_SHOTS"
+    frozen=0
+    if [ -r "$RICESWAP_STUB_GRIM_FROZEN" ]; then read -r frozen < "$RICESWAP_STUB_GRIM_FROZEN"; fi
+    if [ "$shots" -le "$frozen" ]; then
+      printf 'stub screenshot\n' > "$destination"
+    else
+      printf 'stub screenshot %s\n' "$shots" > "$destination"
+    fi
     exit 0
   fi
   if [ "$name" = "hyprctl" ] && [ "$1" = "globalshortcuts" ]; then
@@ -416,6 +440,14 @@ pub struct Sandbox {
     /// generic version banner instead — the "no live registry here" the headless
     /// sandbox is.
     globalshortcuts: PathBuf,
+    /// How many screenshots the `grim` stub has written, so two calls can write
+    /// different bytes (the functional tier's observation floor) and so a test
+    /// can count them.
+    shots: PathBuf,
+    /// The call count up to which the `grim` stub writes *the same* bytes every
+    /// time: the fixture for a screen that does not change, and for one that
+    /// only starts changing after a while.
+    grim_frozen: PathBuf,
     /// One line per `pi` research run: the directory it ran in and its flags.
     pi_log: PathBuf,
     /// The JSONL stream the `pi` stub writes for a research run.
@@ -451,6 +483,8 @@ impl Sandbox {
         let git_source = root.path().join("git-source.txt");
         let git_sha = root.path().join("git-sha.txt");
         let globalshortcuts = root.path().join("hyprctl-globalshortcuts.txt");
+        let shots = root.path().join("grim-shots");
+        let grim_frozen = root.path().join("grim-frozen");
         let pi_log = root.path().join("pi-invocations.log");
         let pi_stream = root.path().join("pi-stream.jsonl");
         let pi_auth = root.path().join("pi-auth.json");
@@ -472,6 +506,8 @@ impl Sandbox {
         fs::write(&git_sha, "1a2b3c4d5e6f70819a2b3c4d5e6f70819a2b3c4d\n")
             .expect("create git sha fixture");
         fs::write(&globalshortcuts, "").expect("create the live registry fixture");
+        fs::write(&shots, "0\n").expect("create the grim shot counter");
+        fs::write(&grim_frozen, "0\n").expect("create the grim frozen fixture");
         fs::write(&pi_log, "").expect("create pi invocation log");
         fs::write(&pi_stream, "").expect("create pi stream fixture");
         fs::write(&pi_auth, "").expect("create pi auth fixture");
@@ -495,6 +531,8 @@ impl Sandbox {
             git_source,
             git_sha,
             globalshortcuts,
+            shots,
+            grim_frozen,
             pi_log,
             pi_stream,
             pi_auth,
@@ -650,6 +688,31 @@ impl Sandbox {
         fs::write(&self.globalshortcuts, answer).expect("write the live registry fixture");
     }
 
+    // --------------------------------------- the screenshot seam (issue #40)
+
+    /// How many screenshots the `grim` stub has written so far.
+    pub fn shots(&self) -> u32 {
+        fs::read_to_string(&self.shots)
+            .ok()
+            .and_then(|count| count.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// A screen that never changes: every `grim` call writes the same bytes,
+    /// which is the only honest way to ask the functional tier to fail — a
+    /// probe that never sees its expected outcome.
+    pub fn screen_never_changes(&self) {
+        fs::write(&self.grim_frozen, "1000000\n").expect("freeze the fake screen");
+    }
+
+    /// A screen that starts changing only after `calls` screenshots. The
+    /// functional tier's flake case: the first run of a probe sees nothing, and
+    /// the re-run sees something, which is exactly what the one-retry policy
+    /// exists for.
+    pub fn screen_changes_after(&self, calls: u32) {
+        fs::write(&self.grim_frozen, format!("{calls}\n")).expect("freeze the fake screen");
+    }
+
     /// Makes the fake machine do `action` whenever `tool` is invoked with
     /// arguments containing `pattern`.
     ///
@@ -775,6 +838,8 @@ impl Sandbox {
             ("RICESWAP_STUB_GIT_SOURCE", &self.git_source),
             ("RICESWAP_STUB_GIT_SHA", &self.git_sha),
             ("RICESWAP_STUB_GLOBALSHORTCUTS", &self.globalshortcuts),
+            ("RICESWAP_STUB_SHOTS", &self.shots),
+            ("RICESWAP_STUB_GRIM_FROZEN", &self.grim_frozen),
             ("RICESWAP_STUB_PI_LOG", &self.pi_log),
             ("RICESWAP_STUB_PI_STREAM", &self.pi_stream),
             ("RICESWAP_STUB_PI_AUTH", &self.pi_auth),

@@ -58,6 +58,13 @@
 //! [[resolution]]
 //! dispatched = "quickshell:barToggle"
 //! drop = true
+//!
+//! [[probe]]                             # drives the live desktop; see below
+//! id = "launcher-opens"
+//! steps = [
+//!   { do = "key", keycodes = "125:1 125:0" },
+//!   { do = "shot", region = "800x600+960+420", expect = "change" },
+//! ]
 //! ```
 //!
 //! Three rules keep the tier from being able to do damage.
@@ -80,6 +87,16 @@
 //! the profile's own `custom/env.lua` between two marker lines: everything
 //! outside them is the user's and is never read into a decision or written, and
 //! a pass that would leave the file identical writes nothing at all.
+//!
+//! And one declaration is a *machine's* claim rather than a *rice's*, so it is
+//! spelled differently: `[[probe]]` is a script that drives the running desktop
+//! (Tier F, `crate::verify`) — a sequence of synthetic input and observation
+//! steps with an expected outcome each. Unlike a resolution, which says what a
+//! donor's key meant everywhere that rice runs, a probe says what *this* session
+//! should do, so no built-in recipe declares one: the built-in codebooks are
+//! about a rice, and a probe is about the machine the rice landed on. A probe
+//! is therefore something `adapt.toml` or the user tier writes, which is the
+//! same place a machine-specific answer belongs.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -143,6 +160,13 @@ pub struct Recipe {
     /// How to ask the running shell whether it is there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ipc: Option<Ipc>,
+    /// The probe scripts that drive the running desktop and assert on what it
+    /// answers. Absent in every built-in recipe, on purpose: a probe is a claim
+    /// about *this* machine (see the module docs), and a rice's codebook is
+    /// about the rice. A recipe with no probe still gets the built-in floor
+    /// from `crate::verify`.
+    #[serde(default, rename = "probe")]
+    pub probes: Vec<Probe>,
 }
 
 /// The `[ipc]` table: the liveness probe this shell answers.
@@ -160,6 +184,268 @@ pub struct Ipc {
     /// environment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub probe: Option<String>,
+}
+
+/// One `[[probe]]` entry: a script that drives the live desktop and says what
+/// it should see.
+///
+/// The shape is #30's, in its own words — "sequences of (synthetic input | ipc
+/// call) → (screenshot-diff | ipc response) with expected outcomes" — and it is
+/// a *script* rather than a checklist because the outcome belongs to a moment
+/// in time: a launcher that takes 400ms to appear is not a launcher that failed,
+/// which is why the expected outcome is per step and the timing is the tier's
+/// business rather than the declaration's.
+///
+/// A probe that declares no observation proves nothing by driving input at a
+/// desktop, so one is refused at parse time rather than run and believed.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Probe {
+    /// What this probe is called, in the envelope's `checks` and in the
+    /// `probe-failed:<id>` reason code. Letters, digits, `-` and `_`.
+    pub id: String,
+    /// How long one observation of this probe may keep looking for its
+    /// expected outcome, in seconds. Ten is both the default and the cap the
+    /// tier enforces; a smaller number is a probe that refuses to wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settle_seconds: Option<u64>,
+    // The rest of the struct is `steps`, and both are validated by
+    // `validate` — the schema's tolerance is about *missing* declarations, not
+    // about a declaration the tier would have to guess at.
+    /// The script, in the order it runs.
+    #[serde(default)]
+    pub steps: Vec<ProbeStep>,
+}
+
+impl Probe {
+    /// Whether this declaration is one the tier may run, or why it may not.
+    ///
+    /// Every rule here is about a probe that would *lie* rather than fail: an
+    /// empty id cannot be found in `checks`, a `shot` with no expectation has
+    /// nothing to assert, a step that names an argument its kind does not take
+    /// is a declaration the author misread. A refusal costs this entry and
+    /// nothing else, exactly as a bad `[[resolution]]` does.
+    pub fn validate(&self) -> Result<(), String> {
+        let id = self.id.as_str();
+        if id.is_empty() {
+            return Err("declares a `[[probe]]` with an empty `id`".to_string());
+        }
+        if !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        {
+            return Err(format!(
+                "`{}` is not a probe id: letters, digits, `-` and `_` only, because it is a key \
+                 in `checks` and in the `probe-failed:` reason code",
+                self.id
+            ));
+        }
+        if self.steps.is_empty() {
+            return Err(format!("`{id}` declares no `steps`"));
+        }
+        if !self.steps.iter().any(ProbeStep::observes) {
+            return Err(format!(
+                "`{id}` declares no observation — a probe that only sends input asserts nothing \
+                 about the desktop it sent it to"
+            ));
+        }
+        for (index, step) in self.steps.iter().enumerate() {
+            let at = format!(
+                "`{id}` step {} (`do = \"{}\"`)",
+                index + 1,
+                step.action.as_str()
+            );
+            if let Err(why) = step.validate() {
+                return Err(format!("{at} {why}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What one step of a probe does. The set is closed because the tier has to be
+/// able to switch on it — and because a probe's power is exactly this list.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Action {
+    /// `ydotool type` — synthetic text, as a human would type it.
+    Type,
+    /// `ydotool key` — synthetic keycodes, as `ydotool` spells them
+    /// (`"125:1 125:0"` is Super down then Super up).
+    Key,
+    /// `grim` — a screenshot of a region, compared with the one taken before the
+    /// probe began.
+    Shot,
+    /// A command whose answer is read. The `ipc` observation, and the one
+    /// primitive that can be precise where a screenshot can only say "something
+    /// moved".
+    Ipc,
+}
+
+impl Action {
+    /// The kind as a declaration spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Action::Type => "type",
+            Action::Key => "key",
+            Action::Shot => "shot",
+            Action::Ipc => "ipc",
+        }
+    }
+
+    /// Whether this kind of step observes the desktop rather than driving it.
+    /// Input steps say nothing on their own; the observation that follows is
+    /// where a probe's claim lives.
+    pub fn observes(self) -> bool {
+        matches!(self, Action::Shot | Action::Ipc)
+    }
+}
+
+/// One step of a `[[probe]]`, inline in the `steps` array.
+///
+/// Every field is optional in the file and required by the kind: `keycodes` for
+/// a `key`, `text` for a `type`, `cmd` plus `expect` for an `ipc`, and `expect`
+/// (`change` or `same`) for a `shot`, whose `region` (`WxH+X+Y`, or absent for
+/// the whole screen) is the only one with a default. `deny_unknown_fields` is
+/// on, because a step whose field is misspelled is a step that would silently
+/// do less than its author read.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeStep {
+    /// Which of the four primitives this step is.
+    #[serde(rename = "do")]
+    pub action: Action,
+    /// For `key`: the keycodes as `ydotool` takes them, press and release pairs
+    /// included (`"125:1 125:0"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keycodes: Option<String>,
+    /// For `type`: the text to type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// For `shot`: the region as `grim -g` takes it, `WxH+X+Y`. Absent means
+    /// the whole screen, which is the honest default for a probe that only
+    /// wants to know whether anything happened at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// For `ipc`: the command, as a shell reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cmd: Option<String>,
+    /// The expected outcome. `shot`: `change` or `same`. `ipc`: a substring the
+    /// answer must carry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<String>,
+}
+
+impl ProbeStep {
+    /// Whether this step reads the desktop.
+    pub fn observes(&self) -> bool {
+        self.action.observes()
+    }
+
+    /// One of the four step arguments by name, so the rules that say which a
+    /// kind needs and which it must not carry are written once.
+    fn argument(&self, name: &str) -> Option<&str> {
+        match name {
+            "keycodes" => self.keycodes.as_deref(),
+            "text" => self.text.as_deref(),
+            "cmd" => self.cmd.as_deref(),
+            _ => self.expect.as_deref(),
+        }
+    }
+
+    /// The region this step observes, or `None` for the whole screen. Two steps
+    /// naming the same region share a baseline, so the key is the declaration
+    /// itself: `"800x600+0+0"` and `800x600+0+0` are one region, and `None` and
+    /// `Some("")` are the same whole screen only because the parser refuses an
+    /// empty one.
+    pub fn region_key(&self) -> String {
+        self.region.clone().unwrap_or_default()
+    }
+
+    /// Whether this declaration is one the tier may run, or why it may not.
+    ///
+    /// Both halves matter. A step that omits what its kind needs would run as
+    /// nothing at all, so a `key` with no keycodes must be refused. And a step
+    /// that carries an argument its kind has no use for is a declaration the
+    /// author misread — a `shot` with a `text` says something about typing that
+    /// the tier will not do, and following it silently would be a probe that
+    /// runs less than its author read.
+    fn validate(&self) -> Result<(), String> {
+        let (required, forbidden): (&[&str], &[&str]) = match self.action {
+            Action::Key => (&["keycodes"], &["text", "cmd"]),
+            Action::Type => (&["text"], &["keycodes", "cmd"]),
+            Action::Shot => (&["expect"], &["text", "cmd"]),
+            Action::Ipc => (&["cmd", "expect"], &["keycodes", "text"]),
+        };
+        for name in required {
+            if self.argument(name).is_none_or(str::is_empty) {
+                return Err(format!("names no `{name}`"));
+            }
+        }
+        for name in forbidden {
+            if self.argument(name).is_some() {
+                return Err(format!(
+                    "names a `{name}`, which a `{}` step has no use for",
+                    self.action.as_str()
+                ));
+            }
+        }
+        if self.action == Action::Shot {
+            if let Some(region) = self.region.as_deref()
+                && !is_region(region)
+            {
+                return Err(format!(
+                    "`{region}` is not a region: `WxH+X+Y` as `grim -g` takes it"
+                ));
+            }
+            let expect = self.expect.as_deref().unwrap_or_default();
+            if !matches!(expect, CHANGE | SAME) {
+                return Err(format!(
+                    "`expect = \"{expect}\"` names no outcome a screenshot has: `{CHANGE}` or \
+                     `{SAME}`"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The expected outcome of a screenshot step: the region changed.
+pub const CHANGE: &str = "change";
+
+/// The expected outcome of a screenshot step: the region did not change.
+pub const SAME: &str = "same";
+
+/// Whether `text` is a `grim -g` region: `WxH+X+Y`, with an optional negative
+/// offset on either origin. A region this build cannot read is a region it
+/// would pass through to `grim` verbatim and discover at run time, on a
+/// desktop it has already started driving, so it is refused where it is
+/// written.
+fn is_region(text: &str) -> bool {
+    let parts: Vec<&str> = text.split('+').collect();
+    let (Some(size), Some(x), Some(y), None) =
+        (parts.first(), parts.get(1), parts.get(2), parts.get(3))
+    else {
+        return false;
+    };
+    let Some((w, h)) = size.split_once('x') else {
+        return false;
+    };
+    is_measure(w) && is_measure(h) && is_offset(x) && is_offset(y)
+}
+
+/// A non-empty run of digits.
+fn is_measure(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(|c| c.is_ascii_digit())
+}
+
+/// An origin: digits, optionally behind a minus sign.
+fn is_offset(text: &str) -> bool {
+    text.strip_prefix('-')
+        .unwrap_or(text)
+        .chars()
+        .all(|c| c.is_ascii_digit())
+        && text.chars().any(|c| c.is_ascii_digit())
 }
 
 /// The `[shell]` table.
@@ -339,6 +625,12 @@ pub struct Tier {
     appid: Option<String>,
     /// The `[ipc] probe` this tier declares, with the tier that asked for it.
     probe: Option<(&'static str, String)>,
+    /// The `[[probe]]` scripts this tier declares, in declaration order.
+    probes: Vec<Probe>,
+    /// How many `[[probe]]` entries this tier declared and could not use, so the
+    /// tier can say the floor is standing in for a declaration that was not
+    /// obeyed rather than reporting a desktop it only half-proved.
+    broken: usize,
 }
 
 impl Tier {
@@ -434,6 +726,29 @@ impl Tier {
             None => None,
         };
 
+        // Probe scripts validate one by one, like resolutions: a probe that
+        // would drive the desktop with a step the tier cannot read is a
+        // declaration not to obey, and it costs this tier only that entry.
+        let mut probes = Vec::new();
+        let mut broken = 0;
+        for probe in recipe.probes {
+            if let Err(why) = probe.validate() {
+                broken += 1;
+                findings.push(format!("{origin} was not used: {why}"));
+                continue;
+            }
+            if probes.iter().any(|kept: &Probe| kept.id == probe.id) {
+                broken += 1;
+                findings.push(format!(
+                    "{origin} declares two `[[probe]]` entries with the id `{}`; only the first \
+                     is used, because the id is the key `checks` and `probe-failed:` are read by",
+                    probe.id
+                ));
+                continue;
+            }
+            probes.push(probe);
+        }
+
         Some(Tier {
             name,
             origin,
@@ -444,6 +759,8 @@ impl Tier {
             foreign: recipe.foreign.entries.into_iter().collect(),
             appid: recipe.shell.and_then(|shell| shell.appid),
             probe,
+            probes,
+            broken,
         })
     }
 
@@ -569,6 +886,37 @@ impl Layers {
                 .as_ref()
                 .map(|(name, probe)| (*name, probe.as_str()))
         })
+    }
+
+    /// The `[[probe]]` scripts the tiers speak for, in the order the tier walk
+    /// reads them: the human tier's probes first, then the built-in's, then the
+    /// user's — so a profile's own `adapt.toml` runs before anything it
+    /// inherited. Within a tier the declaration order is kept, because a probe
+    /// list is a script to run in order, not a set.
+    ///
+    /// A higher tier's probe of a given id shadows a lower one, by the same
+    /// precedence as every other lookup: `id` is the key `checks` carries and
+    /// `probe-failed:<id>` names, so two rows under one id would be a report
+    /// that cannot be read.
+    pub fn probes(&self) -> Vec<Probe> {
+        let mut probes: Vec<Probe> = Vec::new();
+        for tier in &self.tiers {
+            for probe in &tier.probes {
+                if !probes.iter().any(|kept| kept.id == probe.id) {
+                    probes.push(probe.clone());
+                }
+            }
+        }
+        probes
+    }
+
+    /// How many declared `[[probe]]` entries no tier could use. A tier that
+    /// asked to be driven and was not driven has not been proved, so this
+    /// reaches the verdict rather than only the findings: it is the difference
+    /// between "the floor ran" and "the floor stood in for a script that was
+    /// silently dropped".
+    pub fn broken_probes(&self) -> usize {
+        self.tiers.iter().map(|tier| tier.broken).sum()
     }
 
     /// The `[env]` variables every tier speaks for, higher tiers winning per
@@ -1104,6 +1452,128 @@ mod tests {
         );
     }
 
+    /// A probe script parses whole, and the two halves of one that does not are
+    /// separate answers rather than one: `id`, the four step kinds, their own
+    /// arguments, and the `expect` each observation is held to.
+    #[test]
+    fn a_probe_script_parses_into_the_primitives_the_tier_runs() {
+        // The `[[probe]]` wrapper is the *document's* table, not the entry's, so
+        // a `Probe` on its own is read out of one.
+        let document: Recipe = toml::from_str(concat!(
+            "[[probe]]\n",
+            "id = \"launcher-opens\"\n",
+            "settle_seconds = 4\n",
+            "steps = [\n",
+            "  { do = \"key\", keycodes = \"125:1 125:0\" },\n",
+            "  { do = \"type\", text = \">wal\" },\n",
+            "  { do = \"shot\", region = \"800x600+0+0\", expect = \"change\" },\n",
+            "  { do = \"ipc\", cmd = \"qs -c ii ipc call launcher state\", expect = \"open\" },\n",
+            "]\n",
+        ))
+        .expect("a probe script is a probe script");
+        let probe = &document.probes[0];
+        probe.validate().expect("and it is a runnable one");
+
+        assert_eq!(probe.id, "launcher-opens");
+        assert_eq!(probe.settle_seconds, Some(4));
+        assert_eq!(probe.steps.len(), 4);
+        assert_eq!(probe.steps[0].action, Action::Key);
+        assert_eq!(probe.steps[0].keycodes.as_deref(), Some("125:1 125:0"));
+        assert_eq!(probe.steps[1].action, Action::Type);
+        assert_eq!(probe.steps[1].text.as_deref(), Some(">wal"));
+        assert_eq!(probe.steps[2].action, Action::Shot);
+        assert_eq!(probe.steps[2].region.as_deref(), Some("800x600+0+0"));
+        assert_eq!(probe.steps[2].expect.as_deref(), Some(CHANGE));
+        assert_eq!(probe.steps[3].action, Action::Ipc);
+        assert_eq!(
+            probe.steps[3].cmd.as_deref(),
+            Some("qs -c ii ipc call launcher state")
+        );
+        // The two observation kinds are the ones the tier can wait on; input is
+        // not, which is why a probe needs at least one of them.
+        assert!(!probe.steps[0].observes());
+        assert!(probe.steps[2].observes());
+        assert!(probe.steps[3].observes());
+
+        // And it round-trips, like every other declaration in this schema: what
+        // renders parses back into the same script.
+        let rendered = toml::to_string_pretty(&Probe {
+            id: "round".to_string(),
+            settle_seconds: None,
+            steps: probe.steps.clone(),
+        })
+        .expect("a probe renders");
+        let back: Probe = toml::from_str(&rendered).expect("and parses back");
+        assert_eq!(back.steps, probe.steps);
+        assert!(!rendered.contains("settle_seconds"), "{rendered}");
+    }
+
+    /// A probe declaration that would *lie* is refused, entry by entry, and
+    /// each refusal names the step rather than the file — a recipe author has to
+    /// be able to find the line without reading the other three probes.
+    #[test]
+    fn a_probe_declaration_that_would_lie_is_refused() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "id = \"no-observation\"\nsteps = [{ do = \"key\", keycodes = \"1:1\" }]\n",
+                "declares no observation",
+            ),
+            ("id = \"no-steps\"\nsteps = []\n", "declares no `steps`"),
+            (
+                "id = \"bad id\"\nsteps = [{ do = \"shot\", expect = \"change\" }]\n",
+                "is not a probe id",
+            ),
+            (
+                "id = \"no-keycodes\"\nsteps = [{ do = \"key\" }, { do = \"shot\", expect = \"change\" }]\n",
+                "step 1 (`do = \"key\"`) names no `keycodes`",
+            ),
+            (
+                "id = \"no-expect\"\nsteps = [{ do = \"shot\" }]\n",
+                "step 1 (`do = \"shot\"`) names no `expect`",
+            ),
+            (
+                "id = \"wrong-outcome\"\nsteps = [{ do = \"shot\", expect = \"opens\" }]\n",
+                "names no outcome a screenshot has",
+            ),
+            (
+                "id = \"wrong-region\"\nsteps = [{ do = \"shot\", region = \"big\", expect = \"change\" }]\n",
+                "is not a region",
+            ),
+            (
+                "id = \"stray\"\nsteps = [{ do = \"shot\", expect = \"change\", text = \"hi\" }]\n",
+                "names a `text`, which a `shot` step has no use for",
+            ),
+            (
+                "id = \"no-cmd\"\nsteps = [{ do = \"ipc\", expect = \"x\" }]\n",
+                "step 1 (`do = \"ipc\"`) names no `cmd`",
+            ),
+        ];
+        for (body, expected) in cases {
+            let raw = format!("[[probe]]\n{body}");
+            let document: Recipe = toml::from_str(&raw).expect("the document parses");
+            let probe = &document.probes[0];
+            let why = probe
+                .validate()
+                .expect_err(&format!("`{}` should be refused", probe.id));
+            assert!(
+                why.contains(expected),
+                "`{}` should say {expected:?}, said {why:?}",
+                probe.id
+            );
+        }
+
+        // A misspelled field is a document that will not parse at all, which
+        // silences the whole tier — the same rule a typo in a `[[resolution]]`
+        // has had since #36.
+        assert!(
+            toml::from_str::<Recipe>(
+                "[[probe]]\nid = \"typo\"\nsteps = [{ do = \"shot\", expect = \"change\", regionn = \"1x1+0+0\" }]\n"
+            )
+            .is_err(),
+            "`deny_unknown_fields` is what makes a misspelled step refuse itself"
+        );
+    }
+
     /// The precedence order is the contract three tiers hang on, and it is
     /// walked one name at a time.
     #[test]
@@ -1256,6 +1726,83 @@ mod tests {
         );
         assert_eq!(layers.env()["CAELESTIA_WALLPAPERS_DIR"], "~/Wallpapers");
         assert_eq!(findings.len(), 1, "{findings:?}");
+    }
+
+    /// Probes join the tier walk the same way resolutions do, with two things
+    /// the resolution join does not have to think about: an *id* is a key in the
+    /// envelope, so a higher tier's probe of one id shadows a lower one's; and
+    /// the order is the declaration order within a tier, because a probe list is
+    /// a script to run in order rather than a set to iterate.
+    #[test]
+    fn probes_join_the_tiers_in_declaration_order_with_the_id_shadowing() {
+        let root = tempfile::tempdir().expect("sandbox");
+        let profile = root.path().join("profile");
+        let data = root.path().join("data");
+        std::fs::create_dir_all(&profile).expect("profile tree");
+        std::fs::create_dir_all(data.join(RECIPES_DIR)).expect("user tier");
+        let shot = "steps = [{ do = \"shot\", expect = \"change\" }]\n";
+        std::fs::write(
+            profile.join(ADAPT_FILE),
+            format!("[[probe]]\nid = \"shared\"\n{shot}[[probe]]\nid = \"adapt-only\"\n{shot}"),
+        )
+        .expect("adapt");
+        std::fs::write(
+            data.join(RECIPES_DIR).join("caelestia.toml"),
+            format!("[[probe]]\nid = \"shared\"\n{shot}[[probe]]\nid = \"user-only\"\n{shot}"),
+        )
+        .expect("user recipe");
+
+        let (layers, findings) = Layers::load(&profile, &data, "caelestia");
+        assert!(findings.is_empty(), "{findings:?}");
+        assert_eq!(
+            layers
+                .probes()
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["shared", "adapt-only", "user-only"],
+            "tier order first, declaration order within a tier, and one row per id"
+        );
+        assert_eq!(layers.broken_probes(), 0);
+
+        // A broken entry costs itself, and the count is what degrades the
+        // verdict — the tier's other probe still speaks.
+        let second = tempfile::tempdir().expect("sandbox");
+        std::fs::write(
+            second.path().join(ADAPT_FILE),
+            concat!(
+                "[[probe]]\nid = \"broken\"\nsteps = [{ do = \"shot\" }]\n",
+                "[[probe]]\nid = \"good\"\nsteps = [{ do = \"shot\", expect = \"same\" }]\n",
+            ),
+        )
+        .expect("adapt");
+        let (layers, findings) = Layers::load(second.path(), Path::new("/nonexistent"), "nothing");
+        assert_eq!(layers.probes().len(), 1, "the good probe still speaks");
+        assert_eq!(layers.probes()[0].id, "good");
+        assert_eq!(layers.broken_probes(), 1);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].contains("names no `expect`"), "{findings:?}");
+
+        // Two entries under one id: the first wins, because the id is what
+        // `checks` and `probe-failed:` are read by, and the second is counted
+        // as broken rather than dropped silently.
+        let third = tempfile::tempdir().expect("sandbox");
+        std::fs::write(
+            third.path().join(ADAPT_FILE),
+            format!(
+                "[[probe]]\nid = \"twice\"\nsettle_seconds = 1\n{shot}\
+                 [[probe]]\nid = \"twice\"\n{shot}"
+            ),
+        )
+        .expect("adapt");
+        let (layers, findings) = Layers::load(third.path(), Path::new("/nonexistent"), "nothing");
+        assert_eq!(layers.probes().len(), 1);
+        assert_eq!(layers.probes()[0].settle_seconds, Some(1), "the first one");
+        assert_eq!(layers.broken_probes(), 1);
+        assert!(
+            findings[0].contains("two `[[probe]]` entries"),
+            "{findings:?}"
+        );
     }
 
     /// A missing recipe is not a finding. Most profiles have no `adapt.toml`,

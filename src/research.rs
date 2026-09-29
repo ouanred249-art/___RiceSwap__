@@ -1646,6 +1646,12 @@ pub fn document(subject: &Subject, findings: &Findings) -> (Recipe, Vec<String>)
         // here establishes that claim, so the write-back declares none and a
         // profile that wants one has to say so in its own `adapt.toml`.
         ipc: None,
+        // And no probe script, for a stronger version of the same reason: a
+        // probe drives *this* session with synthetic input and screenshots and
+        // asserts on what it sees. A research run is a `pi` invocation in a
+        // directory; it has no session, and a probe it invented would be a
+        // test written for a machine nobody ran it on.
+        probes: Vec::new(),
     };
     (recipe, notes)
 }

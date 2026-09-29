@@ -23,6 +23,13 @@
 //! * a rollback that cannot finish says so and names the manual step;
 //! * packages are enumerated and never reverted;
 //! * and an install's envelope carries all of it, because install calls switch.
+//!
+//! #40 added the functional tier beside this one, and it runs on the same
+//! sandbox: a machine with a usable `ydotool` and `grim` earns `verified-full`
+//! from the tier's floor probe. The tests below are about the core half, so they
+//! hold their machine to a degraded one (`ydotool` scripted to fail) and keep
+//! asserting the verdicts they were written for; `tests/verifyf.rs` covers the
+//! tier that drives.
 
 mod common;
 
@@ -155,12 +162,21 @@ fn live_caelestia() -> Vec<&'static str> {
 
 /// A switch onto a profile the running session fully backs: `verified-core`,
 /// both checks run, and the verdict object exactly the shape #30 froze.
+///
+/// The machine is a headless one — no `ydotool` — on purpose. Since #40 the
+/// verdict a live-backed switch earns on a machine that *can* be driven is
+/// `verified-full`, because the functional tier's floor probe answers as well;
+/// this test is about the core half of the pass, and it is held to that by
+/// making the functional tier unavailable rather than by letting it run and
+/// asserting a verdict name it is no longer about. `tests/verifyf.rs` covers
+/// the tier that answers.
 #[test]
 fn a_switch_the_live_session_backs_is_verified_core() {
     let sandbox = Sandbox::new();
     old_desktop(&sandbox);
     rice(&sandbox, "caelestia", None);
     sandbox.live_registry(&live_caelestia());
+    sandbox.script("ydotool", Mode::Fail);
     sandbox.clear_log();
 
     let data = sandbox.run(&["switch", "caelestia"]).assert_ok();
@@ -362,6 +378,11 @@ fn a_session_without_a_compositor_degrades_to_a_skipped_check() {
     let sandbox = Sandbox::new();
     old_desktop(&sandbox);
     rice(&sandbox, "caelestia", None);
+    // A machine with no live registry is also a machine whose functional tier
+    // has nothing to look at: the same `verified-core` has to be reachable
+    // through both doors — Tier C's skip (below) and Tier F's absence (#40,
+    // `tests/verifyf.rs`) — so this one is driven with no `ydotool` too.
+    sandbox.script("ydotool", Mode::Fail);
 
     // The two shapes of "no live registry", one after the other.
     sandbox.script("hyprctl", Mode::Fail);
@@ -604,10 +625,15 @@ fn packages_the_failed_switch_moved_are_enumerated_and_not_reverted() {
 /// switch's own `data` under `switch`, so the verdict lives at
 /// `switch.report.verification`, and a switch that failed verification fails the
 /// install with the reason code intact.
+///
+/// The sandbox has no `ydotool`, so the pass arm lands on `verified-core`
+/// whatever the merge does with it. This test is about the merge; the arm where
+/// the functional tier also answers is `tests/verifyf.rs`.
 #[test]
 fn the_verdict_and_its_failure_survive_the_install_envelope() {
     let sandbox = Sandbox::new();
     let tree = rice_tree(&sandbox);
+    sandbox.script("ydotool", Mode::Fail);
 
     // A pass first: the verdict rides the success payload.
     let data = sandbox

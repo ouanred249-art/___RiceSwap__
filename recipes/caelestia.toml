@@ -41,6 +41,17 @@ path = "~/Wallpapers"
 [foreign]
 entries = ["quickshell:riceswap-toggle"]
 
+# No `[[probe]]` here, on purpose, and the reason is worth stating in the file
+# rather than only in `src/recipe.rs`: a probe drives *this* session with
+# synthetic input and screenshots and asserts on what it sees, while everything
+# above is a statement about the rice that holds on any machine that installs it.
+# A codebook compiled into the binary cannot know what a user's Super key opens
+# or where their launcher draws, and a probe written here would either be a lie
+# on someone else's desktop or a rollback of a working one. The built-in floor
+# (`src/verify.rs`) covers the machine-specific case with the one claim that
+# holds everywhere — tapping Super changes the screen — and a profile that wants
+# more says so in its own `adapt.toml`.
+
 # --- FC-3: intents that DO have a counterpart ---------------------------
 #
 # `to` names the target shortcut; an unprefixed name is joined with the
