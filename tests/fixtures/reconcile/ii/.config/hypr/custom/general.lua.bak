@@ -1,0 +1,86 @@
+-- Glass-style blur tuning (saneAspect style, adapted to 0.56.2)
+-- After hyprland-git install, uncomment the variant block for video effects
+-- Variants: kawase, frost, ripple, drops, water, fluid_jar, prism,
+-- heat_shimmer, acrylic (liquid glass), aurora, haze
+hl.config({
+    decoration = {
+        rounding = 18,            -- corner radius (px)
+        rounding_power = 2.5,     -- 2 = circle-ish, 4 = squircle
+        blur = {
+            enabled = true,
+            passes = 1,           -- blur repetitions: 2=perf, 3=video smooth
+            size = 5,             -- blur kernel size; with passes, sets intensity
+            brightness = 1.0,     -- 0.2=very dark, 1.0=neutral, 1.8=light themes
+            contrast = 1,      -- 0.89 neutral (was 2.0 pop - too harsh for acrylic)
+            noise = 0,         -- 0=clean glass, 0.05=video texture
+            vibrancy = 0.2,        -- saturation of blurred colors (0-1)
+            vibrancy_darkness = 0.0,  -- how much vibrancy affects dark areas
+            xray = true,          -- true = blur shows through transparent term
+            new_optimizations = true,
+            popups = true,        -- video has popups blurred (was false)
+            special = false,      -- blur special workspaces (GPU heavy on 4K)
+            ignore_opacity = true, -- let blur ignore window opacity (key for terminals!)
+            -- === VIDEO VARIANTS (hyprland-git only, post Aug 22) ===
+            -- Uncomment after hyprland-git install:
+            -- variant = "acrylic", -- liquid-glass like video. Try: frost, haze, aurora
+            -- acrylic = {
+            --     refraction = 24,   -- 0-48 lens displacement
+            --     bulb = 48,         -- 4-256 curved edge width
+            --     clarity = 0.5,     -- 0-1 sharp backdrop (0.5 = vaxry demo)
+            --     aberration = 0.025,-- 0-0.25 chromatic separation
+            --     -- tint = "rgba(0addeeff)", -- optical absorption tint
+            -- },
+            -- glass = {
+            --     refraction = 20,
+            --     size = 40,
+            --     roughness = 1.0,
+            -- }, 
+        },
+    },
+})
+
+-- HyprGlass Liquid Glass (polished)
+ if hl.plugin.hyprglass then
+    local hg = hl.plugin.hyprglass
+
+    hg.config({
+        default_theme = "dark",
+        default_preset = "clear",
+        tint_color = 0x8899aa22,
+
+        brightness = 1.0,
+        dark = { brightness = 0.99, adaptive_dim = 0.0 },
+        light = { adaptive_boost = 0.5 },
+
+        layers = { enabled = true },
+    })
+
+    -- Layer surfaces: each call whitelists the namespace and configures it
+    hg.layer("waybar", { preset = "subtle", mask_threshold = 0.05 })
+    hg.layer("swaync")
+    hg.layer("quickshell:bezel", { preset = "ui", mask_threshold = 0.3 })
+    hg.layer("debug-panel", { exclude = true })
+
+    -- Presets
+    hg.preset("clear", {
+        glass_opacity = 0.48,
+        blur_strength = 0.2,
+        refraction_strength = 0.8,
+        chromatic_aberration = 0.6,
+        fresnel_strength = 0.8,
+        specular_strength = 0.9,
+        edge_thickness = 0.07,
+        lens_distortion = 0.6,
+        dark = { brightness = 0.95, adaptive_dim = 0.0 },
+        light = { brightness = 1.7 },
+    })
+
+    hg.preset("contrasted", {
+        inherits = "high_contrast"
+,
+        contrast = 1.2,
+        adaptive_dim = 1.5,
+        dark = { tint_color = 0x02142aa9 },
+    })
+end
+

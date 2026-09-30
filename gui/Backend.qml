@@ -178,8 +178,14 @@ QtObject {
         return run("detect", ["detect"]);
     }
 
-    function runSnapshot(name) {
-        return run("snapshot", ["snapshot", name]);
+    // The confirmed selection, not just the name: unchecking a chip on the
+    // snapshot view has to actually narrow the capture, or the confirmation
+    // is theatre. `--only` takes the home-relative paths `detect` reported.
+    function runSnapshot(name, only) {
+        var args = ["snapshot", name];
+        if (only && only.length > 0)
+            args.push("--only", only.join(","));
+        return run("snapshot", args);
     }
 
     function runWallpaperImport(path) {

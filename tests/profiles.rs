@@ -6,7 +6,7 @@
 mod common;
 
 use common::{Sandbox, manifest_toml};
-use serde_json::json;
+use serde_json::{Value, json};
 
 /// Class: profile store reads. A fixture profile with the locked manifest
 /// schema parses, and `info` reports exactly what the manifest says.
@@ -31,9 +31,15 @@ fn a_fixture_profile_manifest_parses_through_info() {
             "profile",
             "rice_info",
             "services",
+            "shell",
         ],
         "the locked manifest schema, every key present"
     );
+
+    // Optional keys serialize as null rather than vanishing, so the panel's
+    // shape does not change with the profile's contents. A profile with no
+    // shell says so.
+    assert_eq!(manifest["shell"], Value::Null);
 
     assert_eq!(manifest["manifest_version"], json!(1));
     assert_eq!(manifest["profile"]["name"], json!("demo rice"));

@@ -61,13 +61,8 @@ fn official_package_ops_run_through_pkexec_pacman() {
         sandbox.log()
     );
     assert!(
-        log_has(&sandbox, "pkexec pacman -R --noconfirm oldbar"),
-        "removals are escalated too: {:?}",
-        sandbox.log()
-    );
-    assert!(
-        log_has(&sandbox, "pkexec pacman -R --noconfirm oldaur"),
-        "AUR packages are still removed with plain pacman -R under pkexec: {:?}",
+        log_has(&sandbox, "pkexec pacman -R --noconfirm oldbar oldaur"),
+        "removals are batched into one escalated transaction: {:?}",
         sandbox.log()
     );
     // The wrapper really ran pacman: the underlying command is in the log.
@@ -113,17 +108,20 @@ fn a_polkit_denial_surfaces_as_a_clean_failed_envelope() {
     );
     assert_eq!(
         envelope["data"]["completed_steps"],
-        json!(5),
-        "verify, plan, flip, stop, link completed; the package step did not"
+        json!(2),
+        "verify and plan completed; the switch died at the package step, \
+         before the flip"
     );
     assert_eq!(
         envelope["data"]["resume_hint"],
         json!("switch to `beta` to restore")
     );
 
-    // The failure model: configs already point at B; nothing rolls back.
-    assert_eq!(sandbox.current_target(), Some(sandbox.profile_dir("beta")));
-    assert_eq!(sandbox.state()["active_profile"], json!("beta"));
+    // The failure model, package-first: a denied install stops the switch
+    // while `current` still points at A and the live desktop is untouched —
+    // nothing to roll back because nothing was reached.
+    assert_eq!(sandbox.current_target(), Some(sandbox.profile_dir("alpha")));
+    assert_eq!(sandbox.state()["active_profile"], json!("alpha"));
     assert_eq!(
         sandbox.state()["last_result"]["ok"],
         json!(false),
@@ -242,9 +240,12 @@ fn no_usable_aur_helper_fails_with_an_error_naming_the_packages() {
     assert_eq!(sandbox.current_target(), Some(sandbox.profile_dir("alpha")));
     assert_eq!(sandbox.state()["active_profile"], json!("alpha"));
     for line in sandbox.log() {
+        // `pacman -T` is the read-only "what does the machine already satisfy" query the
+        // switch uses to size its install list. It transacts nothing and
+        // authenticates nothing; the refusal is still before any real op.
         assert!(
-            line.ends_with("--version"),
-            "no package op ran before the refusal: {line}"
+            line.ends_with("--version") || line.starts_with("pacman -T"),
+            "no package transaction ran before the refusal: {line}"
         );
     }
 }
@@ -315,7 +316,11 @@ fn aur_helper_errors_flow_into_the_switch_report() {
         error.contains("scripted failure"),
         "the helper's own stderr reaches the envelope: {error}"
     );
-    assert_eq!(envelope["data"]["completed_steps"], json!(5));
+    assert_eq!(
+        envelope["data"]["completed_steps"],
+        json!(3),
+        "official installs finished before the helper failed"
+    );
     assert_eq!(
         envelope["data"]["resume_hint"],
         json!("switch to `beta` to restore")

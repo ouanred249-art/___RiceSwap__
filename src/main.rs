@@ -8,12 +8,18 @@
 mod cli;
 mod detection;
 mod envelope;
+mod install;
 mod operations;
 mod profile;
+mod recipe;
+mod reconcile;
+mod research;
 mod state;
 mod tools;
+mod verify;
 
 fn main() {
+    tools::adopt_live_compositor();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match cli::parse(&args) {
         Ok(invocation) => operations::run(invocation),

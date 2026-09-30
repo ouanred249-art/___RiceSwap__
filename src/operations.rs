@@ -22,18 +22,22 @@ use crate::cli::Invocation;
 use crate::detection::{self, IMAGE_EXTENSIONS, PackageScan};
 use crate::envelope::{Emitter, Envelope};
 use crate::profile::{
-    CURRENT_MANIFEST_VERSION, FileEntry, Manifest, Packages, ProfileInfo, RiceInfo, Service, Store,
+    CURRENT_MANIFEST_VERSION, FileEntry, Manifest, Packages, ProfileInfo, RiceInfo, Service, Shell,
+    Store,
 };
+use crate::reconcile;
 use crate::state::StateStore;
 use crate::tools::{self, Tool};
+use crate::verify;
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The tools a package-touching operation depends on.
 const PACKAGE_MANAGERS: &[Tool] = &[Tool::Pacman, Tool::Yay, Tool::Paru];
@@ -44,6 +48,19 @@ const PACKAGE_MANAGERS: &[Tool] = &[Tool::Pacman, Tool::Yay, Tool::Paru];
 /// prefix — the floating-terminal wrapper naming the detected helper — built
 /// where the helper is known.
 const OFFICIAL: &[&str] = &[Tool::PkExec.name(), Tool::Pacman.name()];
+
+/// What a refused escalation says on its stderr — including when the refusal
+/// comes not from the user but from a dead polkit agent, which answers every
+/// password with `Not authorized`. That is the one failure a switch can undo
+/// by itself, by escalating the same transaction through `sudo`, whose prompt
+/// lives on the terminal and needs no session service. The fallback fires on
+/// this marker alone, so a deliberate "no" stays one answer, never two.
+const AUTH_REFUSAL: &str = "Not authorized";
+
+/// Whether the sudo fallback has already failed this process. One working
+/// escalation or none — after a second refusal there is nothing left to ask,
+/// and later transactions must not pay a fresh prompt for a dead one.
+static SUDO_EXHAUSTED: AtomicBool = AtomicBool::new(false);
 
 /// The tools a snapshot reports on: the package managers behind the
 /// binary-reference scan and the package split, and `grim` behind the
@@ -142,6 +159,21 @@ impl Context {
         self.store.hardware_file()
     }
 
+    /// The fake-or-real `$HOME` every operation resolves paths against.
+    pub(crate) fn home(&self) -> &Path {
+        &self.home
+    }
+
+    /// The profile store this operation writes into.
+    pub(crate) fn store(&self) -> &Store {
+        &self.store
+    }
+
+    /// The state document, for the operations that mark themselves unfinished.
+    pub(crate) fn state(&mut self) -> &mut StateStore {
+        &mut self.state
+    }
+
     /// `~/.config/hypr/hyprland.conf`, the live Hyprland config `init` lifts
     /// hardware configuration out of.
     fn hyprland_config(&self) -> PathBuf {
@@ -168,7 +200,7 @@ impl Context {
 
     /// Emits a progress line and mirrors the step into `state.json`, so a panel
     /// reopened mid-operation still renders where the backend is.
-    fn progress(&mut self, emitter: &mut Emitter, message: &str) {
+    pub(crate) fn progress(&mut self, emitter: &mut Emitter, message: &str) {
         emitter.progress(message);
         self.state.set_step(emitter.step());
         self.state.write();
@@ -204,9 +236,14 @@ pub fn run(invocation: Invocation) {
 fn dispatch(invocation: &Invocation, context: &mut Context) -> Envelope {
     match invocation {
         Invocation::Detect => detect(context),
-        Invocation::Snapshot { name, force } => snapshot(context, name, *force),
+        Invocation::Snapshot { name, force, only } => {
+            snapshot(context, name, *force, only.as_deref())
+        }
         Invocation::Plan { target } => plan(context, target),
         Invocation::Switch { target, aur_helper } => switch(context, target, aur_helper.as_deref()),
+        Invocation::Install { source, shell } => {
+            crate::install::install(context, source, shell.as_deref())
+        }
         Invocation::List => list(context),
         Invocation::Info { name } => info(context, name),
         Invocation::Delete { name, force } => delete(context, name, *force),
@@ -304,6 +341,15 @@ fn plan(context: &mut Context, target: &str) -> Envelope {
         )
     };
 
+    // Reported separately from the services for the reason
+    // `compute_shell_change` gives: a shell swap is invisible to a service diff,
+    // and a panel that cannot see it is a panel that cannot warn about the one
+    // step that actually ends the old desktop.
+    let (shell_stop, shell_start) = compute_shell_change(
+        active_manifest.as_ref().and_then(|m| m.shell.as_ref()),
+        target_manifest.shell.as_ref(),
+    );
+
     context.progress(&mut emitter, "checking managed paths for conflicts");
 
     let (symlink_link, symlink_unlink) = if let Some(ref current) = active_manifest {
@@ -319,7 +365,18 @@ fn plan(context: &mut Context, target: &str) -> Envelope {
         )
     };
 
-    let blocked_paths = check_blocked_paths(&context.home, &symlink_link);
+    let profile_dir = context.store.profile_dir(target);
+    let classified = classify_blocked_paths(&context.home, &profile_dir, &symlink_link);
+    let blocked_paths = blocked_paths_of(&classified);
+
+    // The preview's removal lists are gated against the system-package floor
+    // the same way the switch gates them, so the panel never offers a removal
+    // the switch will decline — and the declined ones are named, because a
+    // silent decline in a preview is a surprise at switch time.
+    let (remove_official, mut protected) = partition_removals(&remove_official);
+    let (remove_aur, aur_protected) = partition_removals(&remove_aur);
+    protected.extend(aur_protected);
+    protected.sort();
 
     let mut envelope = Envelope::ok(json!({
         "target": target,
@@ -327,8 +384,31 @@ fn plan(context: &mut Context, target: &str) -> Envelope {
             "install": { "official": install_official, "aur": install_aur },
             "remove": { "official": remove_official, "aur": remove_aur },
         },
+        // The diff above is manifest-to-manifest, so on a first switch it
+        // names every package the profile declares even when the machine
+        // already has it. This is the same set intersected with what pacman
+        // says is actually absent — the honest count, and what a profile
+        // imported from a rice's own dependency list is really asking for.
+        "install_missing": {
+            "official": missing_from_machine(&install_official),
+            "aur": missing_from_machine(&install_aur),
+        },
+        // The floor in action: what the diff asked to remove and the switch
+        // will decline to, because removing `glibc` or `coreutils` is not a
+        // package change but a dead machine. Named here so the panel can show
+        // it and the switch report can repeat it.
+        "remove_protected": protected,
         "service_changes": { "stop": services_stop, "start": services_start },
+        "shell_change": {
+            "stop": shell_stop.map(|shell| shell.name.clone()),
+            "start": shell_start.map(|shell| shell.name.clone()),
+        },
         "symlink_changes": { "link": symlink_link, "unlink": symlink_unlink },
+        // A real file at a target no longer stops the switch: the ones that
+        // differ are preserved under the profile's `backups/` first, and the
+        // report says which. The two lists partition `blocked_paths`.
+        "backed_up_paths": classified.backed_up,
+        "identical_paths": classified.identical,
         "blocked_paths": blocked_paths,
     }));
     with_tools(&mut envelope, PACKAGE_MANAGERS);
@@ -346,7 +426,7 @@ fn plan(context: &mut Context, target: &str) -> Envelope {
 /// is never overwritten in place, force included: snapshotting over an active
 /// profile forks the live desktop into the new profile instead, symlinks
 /// dereferenced, and the `current` symlink untouched.
-fn snapshot(context: &mut Context, name: &str, force: bool) -> Envelope {
+fn snapshot(context: &mut Context, name: &str, force: bool, only: Option<&[String]>) -> Envelope {
     let mut emitter = Emitter::new("snapshot");
     context.progress(&mut emitter, &format!("checking the name `{name}`"));
     if let Err(error) = context.store.validate_name(name) {
@@ -390,24 +470,36 @@ fn snapshot(context: &mut Context, name: &str, force: bool) -> Envelope {
     selected.extend(detection::scan_assets(&context.home));
     selected.sort();
     selected.dedup();
+    // A confirmed selection narrows the capture to exactly what the user kept
+    // checked on screen. Without it every detected path is captured, which is
+    // what a scripted snapshot means. Narrowing here, after the scan, means
+    // `detect` on screen and `snapshot` on disk cannot disagree about what was
+    // available — only about which parts of it were kept.
+    if let Some(only) = only {
+        let kept: BTreeSet<&str> = only.iter().map(String::as_str).collect();
+        let dropped: Vec<String> = selected
+            .iter()
+            .filter(|path| !kept.contains(path.as_str()))
+            .cloned()
+            .collect();
+        if !dropped.is_empty() {
+            context.progress(
+                &mut emitter,
+                &format!(
+                    "narrowing the capture to the {} confirmed paths",
+                    only.len()
+                ),
+            );
+        }
+        selected.retain(|path| kept.contains(path.as_str()));
+    }
 
     context.progress(&mut emitter, "copying the selected files into the profile");
     let mut warnings: Vec<String> = Vec::new();
     if let Some(warning) = active.warning {
         warnings.push(warning);
     }
-    let mut stack = Vec::new();
-    let mut mirrored = Vec::new();
-    for relative in &selected {
-        match mirror_into(&context.home, relative, &profile, &mut stack) {
-            Ok(true) => mirrored.push(relative.clone()),
-            // The selection vanished between scan and copy: nothing to mirror.
-            Ok(false) => {}
-            // One unreadable path must not take the capture down with it; the
-            // envelope says what did not make it in.
-            Err(error) => warnings.push(error),
-        }
-    }
+    let mirrored = mirror_selection(&context.home, &selected, &profile, &mut warnings);
 
     let captured = profile.join(".config").join("hypr").join("hyprland.conf");
     if captured.is_file() {
@@ -461,7 +553,7 @@ fn snapshot(context: &mut Context, name: &str, force: bool) -> Envelope {
 /// The collision rule: an existing profile directory refuses unless `force`
 /// clears it first — the name and the directory stay, everything under them
 /// is the new capture's to write. A missing profile is simply `Ok`.
-fn clear_for_overwrite(profile: &Path, force: bool) -> Result<(), String> {
+pub(crate) fn clear_for_overwrite(profile: &Path, force: bool) -> Result<(), String> {
     match std::fs::symlink_metadata(profile) {
         Ok(_) if !force => Err(format!(
             "a profile already exists at {}; snapshot with --force to overwrite it",
@@ -497,7 +589,7 @@ fn clear_for_overwrite(profile: &Path, force: bool) -> Result<(), String> {
 ///
 /// `stack` holds the directories currently being copied, by canonical path,
 /// so a symlink back up the tree ends the recursion instead of chasing it.
-fn mirror_into(
+pub(crate) fn mirror_into(
     home: &Path,
     relative: &str,
     profile: &Path,
@@ -531,6 +623,30 @@ fn mirror_into(
                 destination.display()
             )
         })
+}
+
+/// Mirrors a scanned selection into a profile, collecting what made it in.
+///
+/// Both `snapshot` and `install` run exactly this: the same walk, the same
+/// symlink-dereferencing copy, the same tolerance — a selection that vanished
+/// between the scan and the copy contributes nothing, and one unreadable path
+/// is a warning on the envelope, never a failure that takes the operation down.
+pub(crate) fn mirror_selection(
+    root: &Path,
+    selected: &[String],
+    profile: &Path,
+    warnings: &mut Vec<String>,
+) -> Vec<String> {
+    let mut stack = Vec::new();
+    let mut mirrored = Vec::new();
+    for relative in selected {
+        match mirror_into(root, relative, profile, &mut stack) {
+            Ok(true) => mirrored.push(relative.clone()),
+            Ok(false) => {}
+            Err(error) => warnings.push(error),
+        }
+    }
+    mirrored
 }
 
 /// Mirrors one directory tree, guarding the recursion against symlinks that
@@ -584,7 +700,7 @@ fn copy_entries(source: &Path, destination: &Path, stack: &mut Vec<PathBuf>) -> 
 /// into — is left verbatim, so a forced re-snapshot can never duplicate the
 /// line. Switch time never comes back here: profiles are written once, at
 /// snapshot time.
-fn inject_hardware_source(captured: &Path) -> Result<(), String> {
+pub(crate) fn inject_hardware_source(captured: &Path) -> Result<(), String> {
     let content = std::fs::read_to_string(captured)
         .map_err(|error| format!("cannot read {}: {error}", captured.display()))?;
     if content.lines().any(sources_hardware) {
@@ -643,12 +759,42 @@ fn build_manifest(
     packages: &PackageScan,
     services: Vec<Service>,
 ) -> Manifest {
+    build_manifest_from(
+        name,
+        has_screenshot,
+        files,
+        packages,
+        services,
+        ManifestOrigin::default(),
+    )
+}
+
+/// What an `install` knows that a `snapshot` does not: where the rice came from,
+/// and the shell it names. Default is the snapshot's shape — no source, no
+/// shell, no description, and a screenshot only when one was taken.
+#[derive(Default)]
+pub(crate) struct ManifestOrigin {
+    pub description: String,
+    pub source_url: Option<String>,
+    pub source_commit: Option<String>,
+    pub shell: Option<Shell>,
+}
+
+/// The one place a `profile.toml` is built, shared by `snapshot` and `install`.
+pub(crate) fn build_manifest_from(
+    name: &str,
+    has_screenshot: bool,
+    files: &[String],
+    packages: &PackageScan,
+    services: Vec<Service>,
+    origin: ManifestOrigin,
+) -> Manifest {
     let now = now_rfc3339();
     Manifest {
         manifest_version: CURRENT_MANIFEST_VERSION,
         profile: ProfileInfo {
             name: name.to_string(),
-            description: String::new(),
+            description: origin.description,
             created_at: now.clone(),
             updated_at: now,
             screenshot: if has_screenshot {
@@ -656,14 +802,18 @@ fn build_manifest(
             } else {
                 String::new()
             },
-            source_url: None,
-            source_commit: None,
+            source_url: origin.source_url,
+            source_commit: origin.source_commit,
         },
         packages: Packages {
             official: packages.official.clone(),
             aur: packages.aur.clone(),
         },
         services,
+        // A snapshot records the shell it found running, so a later switch can
+        // recognise it and end it. `detect` reads it off the environment the
+        // same way it reads the services out of `exec-once`.
+        shell: origin.shell,
         files: files
             .iter()
             .map(|path| FileEntry {
@@ -679,15 +829,22 @@ fn build_manifest(
 /// terminal, and color scheme that showed up among the captured paths and
 /// packages. Nothing detected means no key — the GUI renders the table as it
 /// finds it.
-fn auto_rice_info(files: &[String], packages: &PackageScan) -> RiceInfo {
+pub(crate) fn auto_rice_info(files: &[String], packages: &PackageScan) -> RiceInfo {
     const BARS: &[&str] = &["waybar", "ags", "quickshell"];
-    const TERMINALS: &[&str] = &["kitty", "foot"];
+    const TERMINALS: &[&str] = &["kitty", "foot", "fish", "alacritty", "wezterm", "ghostty"];
     const COLOR_SCHEMES: &[&str] = &["matugen", "pywal"];
 
+    // A captured path counts as the candidate's own config when it is that
+    // config dir or anything inside it: a profile owning
+    // `.config/quickshell/caelestia` is a quickshell desktop exactly as much as
+    // one owning `.config/quickshell` outright, and an exact match would
+    // silently drop the attribution for every nested capture.
     let present = |candidate: &str| {
+        let dir = format!(".config/{candidate}");
+        let nested = format!("{dir}/");
         files
             .iter()
-            .any(|path| path.as_str() == format!(".config/{candidate}"))
+            .any(|path| path.as_str() == dir || path.starts_with(&nested))
             || packages
                 .official
                 .iter()
@@ -709,7 +866,7 @@ fn auto_rice_info(files: &[String], packages: &PackageScan) -> RiceInfo {
 
 /// The current instant as an RFC 3339 UTC timestamp — the manifest's
 /// `created_at`/`updated_at` format, with no date crate to get there.
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
@@ -745,18 +902,27 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 
 /// The switch sequence's heart: verify the target, compute the plan, check for
 /// blocked paths and — when the plan installs AUR packages — a usable AUR
-/// helper, then run the fixed idempotent sequence: flip `current` → stop A's
-/// services → flip symlinks → install-first package ops (official via
-/// `pkexec pacman`, AUR via the detected helper inside the floating-terminal
-/// wrapper; on conflict remove the conflicting A-package and retry; then
-/// remove A-unique with plain `pkexec pacman -R`, logging "kept" when
-/// refused) → `hyprctl reload` → start B's services (failure = warning).
+/// helper, then run the fixed idempotent sequence: install-first package ops
+/// (official via `pkexec pacman`, AUR via the detected helper inside the
+/// floating-terminal wrapper; on conflict remove the conflicting A-package and
+/// retry; then remove A-unique with plain `pkexec pacman -R`, logging "kept"
+/// when refused) → flip `current` → stop A's services → flip symlinks →
+/// `hyprctl reload` → start B's services (failure = warning).
+///
+/// The package ops run before anything is touched, and the order is load-
+/// bearing, not cosmetic: the shell being switched away from hosts the polkit
+/// agent that renders the `pkexec` prompts (and the compositor the AUR
+/// terminal needs). Stop it first and every later authentication can only
+/// answer "Not authorized" — which is exactly how one switch aborted with a
+/// bare desktop. A declined removal is a kept package and a warning: a stray
+/// package is not a broken desktop, and nothing may abort the switch after
+/// the old shell is down.
 /// Failures produce `ok: false` with `completed_steps` + `resume_hint`.
 /// SIGTERM cancels at the next step boundary.
 ///
 /// `aur_helper` is the `--aur-helper` override: it pins the helper instead of
 /// runtime detection (yay before paru).
-fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Envelope {
+pub(crate) fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Envelope {
     let mut emitter = Emitter::new("switch");
 
     // Set up SIGTERM handler
@@ -790,6 +956,38 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
                 Vec::new(),
             )
         };
+    // The diff above is manifest-to-manifest, so with no active profile it
+    // reports every declared package as an install — including the ones the
+    // machine already has. Installing those anyway is not merely wasteful: a
+    // 22-package batch that is already on disk is a doomed transaction and
+    // wasted work, and if the batch were absent, one's follow-up for the whole
+    // run. The machine is the other half of the question, and `plan` already
+    // asks it — the switch asks it too.
+    let install_official = missing_from_machine(&install_official);
+    let install_aur = missing_from_machine(&install_aur);
+
+    // Removals are gated against the system-package floor, and it matters far
+    // more than the install gate above. The diff is "packages the leaving
+    // profile had that the arriving one does not", which on two real shells
+    // reads `glibc` as removable and raised one polkit prompt for the whole
+    // batch — a refusal over a single foundation package that would have held
+    // *every* removal with it if the batch had run. Installing a present
+    // package is waste; attempting to remove a foundation package is a dead
+    // machine, so it is never even asked for. What the floor withholds is
+    // named here and in the report, so the decline is not silent.
+    let (remove_official, mut protected) = partition_removals(&remove_official);
+    let (remove_aur, aur_protected) = partition_removals(&remove_aur);
+    protected.extend(aur_protected);
+    protected.sort();
+    let mut warnings = Vec::new();
+    if !protected.is_empty() {
+        let note = format!(
+            "kept: {} (system packages are never removed by a switch)",
+            protected.join(", ")
+        );
+        emitter.warning(&note);
+        warnings.push(note);
+    }
 
     let (services_stop, services_start) = if let Some(ref current) = active_manifest {
         compute_service_changes(&current.services, &target_manifest.services)
@@ -804,6 +1002,15 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
         )
     };
 
+    // The shell is computed apart from the services, because a shell change is
+    // invisible to a service diff: both profiles record a `qs` service running
+    // `qs -c $qsConfig`, so the names match, the strings match, and the diff
+    // concludes nothing happened. It did not stop the old shell.
+    let (shell_stop, shell_start) = compute_shell_change(
+        active_manifest.as_ref().and_then(|m| m.shell.as_ref()),
+        target_manifest.shell.as_ref(),
+    );
+
     let (symlink_link, symlink_unlink) = if let Some(ref current) = active_manifest {
         compute_symlink_changes(&current.files, &target_manifest.files)
     } else {
@@ -817,18 +1024,33 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
         )
     };
 
-    let blocked_paths = check_blocked_paths(&context.home, &symlink_link);
-    if !blocked_paths.is_empty() {
-        let paths_list = blocked_paths.join(", ");
-        return Envelope {
-            ok: false,
-            data: json!({
-                "error": format!("cannot switch: real files block these target paths: {}. Use `snapshot` to adopt them into a profile first.", paths_list),
-                "completed_steps": 2,
-                "resume_hint": format!("switch to `{target}` to restore"),
-            }),
-            warnings: Vec::new(),
+    // A real file at a target is the user's own, and replacing it must not lose
+    // it. Files that match the profile byte for byte carry nothing the profile
+    // does not already hold; the rest are copied under the target profile's
+    // `backups/` here, before `current` flips, so a failure part-way through
+    // leaves the live tree exactly as it was.
+    let profile_dir = context.store.profile_dir(target);
+    let classified = classify_blocked_paths(&context.home, &profile_dir, &symlink_link);
+    let backups_dir = context.store.backups_dir(target);
+    let mut backed_up = Vec::new();
+    for relative in &classified.backed_up {
+        let stored = match backup_managed_file(&backups_dir, relative, &context.home.join(relative))
+        {
+            Ok(stored) => stored,
+            Err(error) => {
+                return Envelope {
+                    ok: false,
+                    data: json!({
+                        "error": format!("cannot preserve your `{relative}` before switching: {error}"),
+                        "completed_steps": 2,
+                        "resume_hint": format!("switch to `{target}` to restore"),
+                    }),
+                    warnings: Vec::new(),
+                };
+            }
         };
+        emitter.warning(&format!("kept your `{relative}` at {}", stored.display()));
+        backed_up.push(relative.clone());
     }
 
     // AUR installs need a helper before anything is touched: with AUR packages
@@ -862,18 +1084,95 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
     };
 
     let mut completed_steps = 2;
-    let mut warnings = Vec::new();
     let mut installed = Vec::new();
     let mut removed = Vec::new();
     let mut kept = Vec::new();
     let mut conflict_removed = Vec::new();
     let mut linked = Vec::new();
     let mut unlinked = Vec::new();
+    let mut preserved = Vec::new();
     let mut services_stopped = Vec::new();
     let mut services_started = Vec::new();
+    let mut shell_stopped = None;
+    let mut shell_started = None;
     let mut reloaded = false;
 
-    // Step 3: flip `current` symlink
+    // Steps 3-4: install-first package ops — official through `pkexec pacman`,
+    // AUR through the detected helper inside the floating-terminal wrapper.
+    // They run here, while `current` still points at A and A's desktop (and
+    // with it the polkit agent that answers the prompts, and the compositor the
+    // AUR terminal needs) is still up. This is the whole reason the package
+    // steps lead: an authentication request raised after the shell is stopped
+    // has no agent left to render it and can only be denied.
+    context.progress(&mut emitter, "applying package changes");
+
+    // Install official packages. A refused or failed install is still fatal —
+    // but it is fatal before anything has been touched, so the switch that
+    // cannot get its packages simply stops and leaves the live desktop alone.
+    if let Err(error) = install_packages(
+        OFFICIAL,
+        "pkexec pacman",
+        &install_official,
+        &mut installed,
+        &mut removed,
+        &mut conflict_removed,
+    ) {
+        return package_failure(target, completed_steps, warnings, error);
+    }
+    completed_steps += 1;
+
+    // Install AUR packages — the helper was pinned or detected pre-flight.
+    let mut aur_output = Vec::new();
+    if let Some(helper) = &aur_helper {
+        let actor = format!("the AUR helper `{helper}` in the floating terminal");
+        let prefix = [Tool::FloatTerminal.name(), helper.as_str()];
+        match install_packages(
+            &prefix,
+            &actor,
+            &install_aur,
+            &mut installed,
+            &mut removed,
+            &mut conflict_removed,
+        ) {
+            Err(error) => return package_failure(target, completed_steps, warnings, error),
+            Ok(lines) => aur_output = lines,
+        }
+    }
+
+    // Remove A-unique packages in one batched transaction (plain -R, never
+    // -Rs/-Rdd) — one prompt for the whole removal phase, same reasoning as
+    // the batched install above. A removal that pacman declines — still
+    // needed, or a refusal of any kind — keeps the package and warns; it
+    // never aborts. A package left installed beside a finished switch is
+    // trivia; a switch that aborts on the way through is a desktop stranded
+    // mid-change.
+    let pending_removals: Vec<&String> = remove_official
+        .iter()
+        .chain(&remove_aur)
+        .filter(|package| !conflict_removed.contains(package)) // Already removed during conflict resolution
+        .collect();
+    remove_packages(
+        &pending_removals,
+        &mut emitter,
+        &mut kept,
+        &mut removed,
+        &mut warnings,
+    );
+    completed_steps += 1;
+
+    if cancelled.load(Ordering::Relaxed) {
+        return Envelope {
+            ok: false,
+            data: json!({
+                "error": "operation cancelled",
+                "completed_steps": completed_steps,
+                "resume_hint": format!("switch to `{target}` to restore"),
+            }),
+            warnings,
+        };
+    }
+
+    // Step 5: flip `current` symlink
     context.progress(&mut emitter, &format!("activating profile `{target}`"));
     if let Err(error) = context.store.flip(target) {
         return Envelope {
@@ -900,7 +1199,10 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
         };
     }
 
-    // Step 4: stop A's services
+    // Step 6: stop A's services. The shell stops here too — and this is the
+    // point after which no authentication can be asked for, because the agent
+    // that answers dies with it. Everything before it was raised while the old
+    // desktop was still up.
     context.progress(&mut emitter, "stopping old services");
     if let Some(ref current) = active_manifest {
         for service in &current.services {
@@ -910,6 +1212,14 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
             }
         }
     }
+    // The shell stops here too, and for the same reason the other services do:
+    // it belongs to the profile being left. It is driven by its own `[shell]`
+    // table rather than the service list because the service list cannot tell
+    // two shells apart — see `compute_shell_change`.
+    if let Some(shell) = shell_stop {
+        let _ = Command::new("sh").arg("-c").arg(&shell.stop).output();
+        shell_stopped = Some(shell.name.clone());
+    }
     completed_steps += 1;
 
     if cancelled.load(Ordering::Relaxed) {
@@ -924,92 +1234,87 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
         };
     }
 
-    // Step 5: flip symlinks
+    // Step 7: flip symlinks
+    //
+    // The arriving profile's dispatcher names are reconciled first, and against
+    // the *profile's own* files rather than the live ones. Two reasons, and both
+    // are about ordering.
+    //
+    // The links this step makes point into the profile directory, and the
+    // reload that follows reads through them — so a repair made before the link
+    // is a repair the very next `hyprctl reload` installs. Repairing the live
+    // path instead would write through a link that is about to be re-pointed, or
+    // into a real directory that is about to be replaced by one.
+    //
+    // And it is the right moment in the sequence for the same reason the link
+    // step is: the user's own files at the managed paths were already preserved
+    // above, so the only bytes this can touch are the profile's, and the shell
+    // that has to read them has not started yet.
+    //
+    // The pass is deliberately not a numbered step of its own. It is a pure
+    // re-derivation — the next switch performs it again from scratch — so a
+    // half-finished one has no state to resume from, and counting it would move
+    // the resume contract the envelope's `completed_steps` is frozen on. Its
+    // facts ride the envelope; anything worth saying streams as a warning.
+    //
+    // The pass takes the switch's own `$HOME` and data directory, so a declared
+    // path is expanded and bounded against the home the user actually has, and
+    // the user tier's recipes are read from the store this switch writes to.
+    let reconcile_report = reconcile::reconcile(
+        &profile_dir,
+        &reconcile::Context::new(&context.home, &context.store.data_dir()),
+        target_manifest
+            .shell
+            .as_ref()
+            .map(|shell| shell.name.as_str()),
+        &BTreeSet::new(),
+    );
+    announce_reconcile(&mut emitter, &reconcile_report, &mut warnings);
     context.progress(&mut emitter, "linking managed config paths");
+    // A path the old profile managed and the new one does not used to be
+    // deleted. That is the one place the switch could still lose data: the
+    // whole promise is that you can go back, and on the way back the old
+    // profile's own files are exactly the ones the new profile stopped claiming.
+    // So the path is moved into the *leaving* profile's `backups/` before the
+    // link is replaced, and the report names where it went.
     for relative in &symlink_unlink {
-        let path = context.home.join(relative);
-        let _ = std::fs::remove_file(&path);
+        let live = context.home.join(relative);
+        if let Some(name) = active.name.as_ref() {
+            let backups = context.store.backups_dir(name);
+            if let Err(error) = preserve_managed_path(&backups, relative, &live) {
+                return package_failure(
+                    target,
+                    completed_steps,
+                    warnings,
+                    format!("cannot preserve the path `{relative}`: {error}"),
+                );
+            }
+        } else if let Err(error) = clear_managed_path(&live) {
+            return package_failure(
+                target,
+                completed_steps,
+                warnings,
+                format!("cannot unlink the managed path `{relative}`: {error}"),
+            );
+        }
         unlinked.push(relative.clone());
+        preserved.push(relative.clone());
     }
     let profile_dir = context.store.profile_dir(target);
     for relative in &symlink_link {
         let link = context.home.join(relative);
         let target_path = profile_dir.join(relative);
-        if let Some(parent) = link.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        if let Err(error) = link_managed_path(&link, &target_path) {
+            return package_failure(
+                target,
+                completed_steps,
+                warnings,
+                format!("cannot link the managed path `{relative}`: {error}"),
+            );
         }
-        let _ = std::fs::remove_file(&link);
-        let _ = std::os::unix::fs::symlink(&target_path, &link);
         linked.push(relative.clone());
     }
     completed_steps += 1;
-
-    if cancelled.load(Ordering::Relaxed) {
-        return Envelope {
-            ok: false,
-            data: json!({
-                "error": "operation cancelled",
-                "completed_steps": completed_steps,
-                "resume_hint": format!("switch to `{target}` to restore"),
-            }),
-            warnings,
-        };
-    }
-
-    // Step 6-7: install-first package ops — official through `pkexec pacman`,
-    // AUR through the detected helper inside the floating-terminal wrapper.
-    context.progress(&mut emitter, "applying package changes");
-
-    // Install official packages
-    if let Err(error) = install_packages(
-        OFFICIAL,
-        "pkexec pacman",
-        &install_official,
-        &mut installed,
-        &mut removed,
-        &mut conflict_removed,
-    ) {
-        return package_failure(target, completed_steps, warnings, error);
-    }
-
-    // Install AUR packages — the helper was pinned or detected pre-flight.
-    let mut aur_output = Vec::new();
-    if let Some(helper) = &aur_helper {
-        let actor = format!("the AUR helper `{helper}` in the floating terminal");
-        let prefix = [Tool::FloatTerminal.name(), helper.as_str()];
-        match install_packages(
-            &prefix,
-            &actor,
-            &install_aur,
-            &mut installed,
-            &mut removed,
-            &mut conflict_removed,
-        ) {
-            Err(error) => return package_failure(target, completed_steps, warnings, error),
-            Ok(lines) => aur_output = lines,
-        }
-    }
-
-    // Remove A-unique packages (plain -R, never -Rs/-Rdd)
-    for package in remove_official.iter().chain(&remove_aur) {
-        if conflict_removed.contains(package) {
-            continue; // Already removed during conflict resolution
-        }
-        match remove_package(package) {
-            Ok(true) => removed.push(package.clone()),
-            // "still needed" refusal: kept, warned, the switch goes on.
-            Ok(false) => {
-                kept.push(package.clone());
-                let note = format!("kept: {package} (still needed)");
-                emitter.warning(&note);
-                warnings.push(note);
-            }
-            // A polkit denial or dead wrapper on the removal: stop the
-            // package ops and report, per the failure model.
-            Err(error) => return package_failure(target, completed_steps, warnings, error),
-        }
-    }
-    completed_steps += 2;
 
     if cancelled.load(Ordering::Relaxed) {
         return Envelope {
@@ -1047,59 +1352,571 @@ fn switch(context: &mut Context, target: &str, aur_helper: Option<&str>) -> Enve
     context.progress(&mut emitter, "starting new services");
     for service in &target_manifest.services {
         if services_start.contains(&service.name) {
-            let output = Command::new("sh").arg("-c").arg(&service.start).output();
-            if let Ok(out) = output {
-                if out.status.success() {
-                    services_started.push(service.name.clone());
-                } else {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    let note = format!(
-                        "service `{}` failed to start: {}",
-                        service.name,
-                        stderr.trim()
-                    );
+            // A service that is still running after the grace window is up —
+            // `qs`, `wl-paste --watch` and friends are daemons that never
+            // exit. Waiting for one is waiting forever, so the switch gives
+            // each start only the window and reads survival as success.
+            match start_daemonized(&service.start) {
+                Ok(()) => services_started.push(service.name.clone()),
+                Err(detail) => {
+                    let note = format!("service `{}` failed to start: {}", service.name, detail);
                     emitter.warning(&note);
                     warnings.push(note);
                 }
             }
         }
     }
+    // The target's shell starts last, after the reload, so it comes up against
+    // the config the reload has already installed. A shell that starts too early
+    // reads the old config and keeps it — the failure this ordering exists to
+    // prevent.
+    if let Some(shell) = shell_start {
+        // A shell that will not start is a warning, not a failure: the other
+        // services, the packages and the links all succeeded, and the config is
+        // correct for the next login. Failing the switch here would report a
+        // broken profile for a shell that is merely not up yet. The start is
+        // daemonised for the same reason the services' are: `qs -c ii` is the
+        // desktop itself, and it never exits — waiting for it to is waiting
+        // for a switch that has already succeeded to never finish.
+        match start_daemonized(&shell.start) {
+            Ok(()) => shell_started = Some(shell.name.clone()),
+            Err(detail) => {
+                let note = format!("shell `{}` failed to start: {detail}", shell.name);
+                emitter.warning(&note);
+                warnings.push(note);
+            }
+        }
+    }
     completed_steps += 2;
+
+    // The switch is done: ten steps, a live desktop, an envelope ready to be
+    // emitted. Before it is emitted, the verification tier looks at what those
+    // ten steps actually produced (issue #39).
+    //
+    // This is deliberately *not* an eleventh step, and the reason is the same one
+    // the engine's pass above is not a step of its own: nothing here is a stage
+    // of the work, it is a reading of the result, and a half-finished
+    // verification has no state to resume from. Counting it would move
+    // `completed_steps` — a number the panel's checklist, the resume contract and
+    // `tests/contracts.rs`'s pinned step messages are all built on. A re-switch
+    // re-verifies from scratch exactly as a re-switch re-reconciles from scratch,
+    // so nothing is lost by not resuming it. Like the reconcile pass, its facts
+    // ride the envelope (`report.verification`) and the shell check's evidence is
+    // the only thing it says out loud.
+    let verification = verify::run(&verify::Subject {
+        home: &context.home,
+        data: &context.store.data_dir(),
+        profile: &context.store.profile_dir(target),
+        shell: target_manifest.shell.as_ref(),
+        shell_attempted: shell_start.is_some(),
+        shell_started: shell_started.as_deref(),
+        reconcile: &reconcile_report,
+    });
+
+    // A tier that degraded is a fact about this run, and the envelope's
+    // `warnings` is where a fact like that is said out loud: a machine with no
+    // `grim` or `ydotool` gets `verified-core` plus a warning naming what was
+    // missing, rather than a silent downgrade nobody was told about. They ride
+    // the same list the switch's own warnings use, so a failure's payload
+    // carries them too.
+    for note in &verification.warnings {
+        emitter.warning(note);
+        warnings.push(note.clone());
+    }
+
+    let report = json!({
+        "installed": installed,
+        "removed": removed,
+        "kept": kept,
+        "conflict_removed": conflict_removed,
+        "aur_output": aur_output,
+        "linked": linked,
+        "unlinked": unlinked,
+        "preserved": preserved,
+        "backed_up": backed_up,
+        "protected": protected,
+        "services_stopped": services_stopped,
+        "services_started": services_started,
+        "shell_stopped": shell_stopped,
+        "shell_started": shell_started,
+        "reloaded": reloaded,
+        "reconcile": reconcile_report,
+        "verification": verification,
+    });
+
+    if verification.failed() {
+        // A rejected desktop. Everything the rollback needs is still in scope —
+        // what was stopped, what was started, what was linked — which is why
+        // this runs here and not in a separate pass over the store.
+        return verification_failure(
+            context,
+            &mut emitter,
+            FailedVerification {
+                target,
+                completed_steps,
+                report: &report,
+                verification: &verification,
+                rollback: &Rollback {
+                    active: active.name.clone(),
+                    old: active_manifest.as_ref(),
+                    new: Some(&target_manifest),
+                    stopped_services: &services_stopped,
+                    started_services: &services_started,
+                    stopped_shell: shell_stopped.as_deref(),
+                    started_shell: shell_started.as_deref(),
+                    started_new_shell: shell_start,
+                },
+            },
+            warnings,
+        );
+    }
 
     let mut envelope = Envelope::ok(json!({
         "target": target,
         "completed_steps": completed_steps,
         "resume_hint": format!("switch to `{target}` to restore"),
-        "report": {
-            "installed": installed,
-            "removed": removed,
-            "kept": kept,
-            "conflict_removed": conflict_removed,
-            "aur_output": aur_output,
-            "linked": linked,
-            "unlinked": unlinked,
-            "services_stopped": services_stopped,
-            "services_started": services_started,
-            "reloaded": reloaded,
-        },
+        "report": report,
     }));
     envelope.warnings = warnings;
     with_tools(&mut envelope, Tool::ALL);
     envelope
 }
 
-/// Installs a batch of packages with `prefix -S --noconfirm <pkg>` — the
-/// prefix being the privilege path: `pkexec pacman` for official packages,
-/// the floating-terminal wrapper naming the AUR helper for AUR ones — handling
-/// the install-first conflict fallback: when the installer reports a conflict
-/// against a package still in the A-set, that conflicting A-package is removed
-/// with plain `pkexec pacman -R` first and the install retried — exactly the
-/// spec's locked sequence.
+/// What the failed switch did, so the rollback can undo exactly that and
+/// nothing else.
+struct Rollback<'a> {
+    /// The profile that was active before the switch, if there was one.
+    active: Option<String>,
+    /// Its manifest, when it could be read.
+    old: Option<&'a Manifest>,
+    /// The manifest of the profile the switch activated.
+    new: Option<&'a Manifest>,
+    /// What the switch stopped, which the rollback starts again.
+    stopped_services: &'a [String],
+    /// What the switch started, which the rollback stops.
+    started_services: &'a [String],
+    /// The shell the switch stopped, which the rollback starts again.
+    stopped_shell: Option<&'a str>,
+    /// The shell the switch started, which the rollback stops.
+    started_shell: Option<&'a str>,
+    /// The `[shell]` the switch started, for the command to stop it with.
+    started_new_shell: Option<&'a Shell>,
+}
+
+/// A rejected desktop, in the parts the failure envelope is built from. One
+/// struct rather than eight positional arguments, because every one of these is
+/// the same shape of thing — a fact about the switch that just finished — and a
+/// caller that got two of them the wrong way round would still compile.
+struct FailedVerification<'a> {
+    /// The profile the switch activated and verification rejected.
+    target: &'a str,
+    /// The switch's own step count, carried through unchanged: the ten steps did
+    /// complete, and the tier that read them is not a step of its own.
+    completed_steps: i32,
+    /// The switch's own report, whole.
+    report: &'a Value,
+    /// The verdict and its checks, with the reason code and facts.
+    verification: &'a verify::Report,
+    /// What the switch did, so the rollback can undo exactly that.
+    rollback: &'a Rollback<'a>,
+}
+
+/// Turns a failed verdict into the envelope the ticket froze, and puts the old
+/// profile back first.
+///
+/// The order inside this function is the whole design, so it is worth stating
+/// plainly: **the flip is reversed first**, before any service is touched. A
+/// rollback that stopped the new desktop and then failed to flip would leave a
+/// session whose `current` names a profile nothing is running, and the next
+/// thing anyone reads is that symlink. Reversing the activation first means the
+/// worst case of a half-finished rollback is "the old profile is active and its
+/// desktop has not come back up yet" — a desktop that is merely blank, and that
+/// `riceswap switch <old>` finishes — rather than a store that disagrees with the
+/// running session.
+fn verification_failure(
+    context: &mut Context,
+    emitter: &mut Emitter,
+    failed: FailedVerification<'_>,
+    mut warnings: Vec<String>,
+) -> Envelope {
+    let FailedVerification {
+        target,
+        completed_steps,
+        report,
+        verification,
+        rollback,
+    } = failed;
+    let reason = verification
+        .reason_code
+        .clone()
+        .unwrap_or_else(|| verify::INVARIANT_DEAD_NAMES.to_string());
+    // The switch's own warnings — the preserved files, the kept packages, the
+    // start that failed and is the reason for all this — are carried into the
+    // failure rather than dropped: they happened, and the diagnosis is only
+    // readable with them.
+    let note = format!("`{target}` did not verify ({reason}); putting the previous profile back");
+    emitter.warning(&note);
+    warnings.push(note);
+
+    let mut next = match rollback.active.clone() {
+        Some(old) => format!("switched back to `{old}`"),
+        None => {
+            format!("there was no previous profile to switch back to; `{target}` is still active")
+        }
+    };
+    // The packages are the one thing the rollback deliberately does not undo, so
+    // the envelope says which ones are in what state rather than leaving a user
+    // to diff two `pacman -Q` outputs.
+    let installed = report["installed"].as_array().map(Vec::len).unwrap_or(0);
+    let removed = report["removed"].as_array().map(Vec::len).unwrap_or(0);
+    if installed > 0 || removed > 0 {
+        next.push_str(&format!(
+            "; the {} package(s) this switch installed and the {} it removed are still in that \
+             state — RiceSwap does not run the opposite transaction for you",
+            installed, removed
+        ));
+    }
+
+    // The verdict is not repeated at the top level: `report.verification` is the
+    // one place it lives, on a pass and on a failure alike, so a consumer reads
+    // one key rather than two that could disagree.
+    let mut data = json!({
+        "error": format!(
+            "`{target}` did not verify: the desktop behind it is not what this profile promises \
+             ({reason}); see `facts` and `report.verification.checks`"
+        ),
+        "phase": "verify",
+        "reason_code": reason,
+        "next": next,
+        "target": target,
+        "completed_steps": completed_steps,
+        "resume_hint": format!("switch to `{target}` to restore"),
+        "facts": verification.facts,
+        "report": report,
+    });
+
+    match restore(context, rollback) {
+        Ok(notes) => {
+            for note in notes {
+                emitter.warning(&note);
+                warnings.push(note);
+            }
+        }
+        Err(error) => {
+            // The rollback is what is left to do by hand, and the envelope says
+            // so instead of reporting a desktop that is not there.
+            let manual = format!(
+                "RiceSwap could not put the previous profile back ({error}); run `riceswap switch \
+                 <profile>` by hand once the desktop is worth switching to"
+            );
+            emitter.warning(&manual);
+            warnings.push(manual);
+            data["error"] = json!(format!(
+                "`{target}` did not verify ({reason}), and the rollback did not finish either: \
+                 {error}"
+            ));
+            data["reason_code"] = json!("rollback-failed");
+            data["next"] = json!(format!(
+                "run `riceswap switch {}` by hand to activate the profile you want back; the \
+                 packages this switch moved were not reverted",
+                rollback
+                    .active
+                    .clone()
+                    .unwrap_or_else(|| target.to_string())
+            ));
+            data["rollback"] = json!({ "ok": false, "error": error });
+        }
+    }
+
+    Envelope {
+        ok: false,
+        data,
+        warnings,
+    }
+}
+
+/// Puts the previous profile back: the symlink, the links it owns, its services
+/// and its shell.
+///
+/// The inverse of the steps the switch just ran, and deliberately *not* a
+/// recursive `switch()`. A second full switch would re-run the engine over the
+/// old profile (harmless — it is idempotent by construction) but it would also
+/// re-verify it, which on a machine whose compositor is the thing that just
+/// failed would run the failing check a second time and, if it failed again,
+/// begin a rollback of a rollback. The rollback here is deliberately the small
+/// set of operations that restores a desktop, with no engine pass and no verdict
+/// of its own: the old profile was verified when it was activated, and the report
+/// of the failed switch is the evidence for the decision to go back.
+///
+/// The symlink goes first (see [`verification_failure`]), then the shell and
+/// services the switch started are stopped, then the links are put back, then the
+/// compositor is reloaded, then the old services and the old shell start — the
+/// same order the switch itself uses, so the old shell comes up against the
+/// config the reload has already installed.
+fn restore(context: &Context, rollback: &Rollback) -> Result<Vec<String>, String> {
+    let mut notes = Vec::new();
+    let Some(old) = rollback.active.as_deref() else {
+        // Nothing to go back to: the switch had no desktop to destroy, so the
+        // one it activated is still the only one there is. Saying so is the
+        // honest outcome — unlinking `current` here would leave the store
+        // pointing at nothing at all, which is worse than a desktop that failed
+        // its checks.
+        notes.push(
+            "there was no previous profile to restore: this was a first switch, so `current` \
+             still names the profile that was just activated"
+                .to_string(),
+        );
+        return Ok(notes);
+    };
+    context.store.flip(old)?;
+    notes.push(format!("`current` points back at `{old}`"));
+
+    // The new desktop goes down before the old one comes up, or the two overlap.
+    if let Some(shell) = rollback.started_new_shell
+        && rollback.started_shell == Some(shell.name.as_str())
+    {
+        let _ = Command::new("sh").arg("-c").arg(&shell.stop).output();
+        notes.push(format!(
+            "stopped the shell this switch started (`{}`)",
+            shell.name
+        ));
+    }
+    if let Some(new) = rollback.new {
+        for name in rollback.started_services {
+            if let Some(service) = new.services.iter().find(|service| &service.name == name) {
+                let _ = Command::new("sh").arg("-c").arg(&service.stop).output();
+                notes.push(format!("stopped the service `{name}` this switch started"));
+            }
+        }
+    }
+
+    for note in restore_links(context, rollback, old) {
+        notes.push(note);
+    }
+
+    if Command::new("hyprctl")
+        .arg("reload")
+        .output()
+        .is_ok_and(|out| out.status.success())
+    {
+        notes.push("reloaded Hyprland against the restored config".to_string());
+    } else {
+        notes.push(
+            "could not reload Hyprland: the restored config takes effect at the next login or a \
+             manual `hyprctl reload`"
+                .to_string(),
+        );
+    }
+
+    // The old services, then the old shell last — a shell started before the
+    // reload would read the old config and keep it, which is the failure the
+    // switch's own ordering exists to prevent.
+    if let Some(previous) = rollback.old {
+        for name in rollback.stopped_services {
+            if let Some(service) = previous.services.iter().find(|s| &s.name == name) {
+                match start_daemonized(&service.start) {
+                    Ok(()) => notes.push(format!("started `{name}` again")),
+                    Err(detail) => {
+                        notes.push(format!("could not start `{name}` again: {detail}"));
+                    }
+                }
+            }
+        }
+        if let Some(shell) = previous.shell.as_ref()
+            && rollback
+                .stopped_shell
+                .is_some_and(|name| name == shell.name)
+        {
+            match start_daemonized(&shell.start) {
+                Ok(()) => notes.push(format!("started the previous shell `{}`", shell.name)),
+                Err(detail) => notes.push(format!(
+                    "could not start the previous shell `{}`: {detail}",
+                    shell.name
+                )),
+            }
+        }
+    }
+    Ok(notes)
+}
+
+/// The link half of the rollback: the previous profile's own paths are linked
+/// back, and the paths only the failed switch claimed are cleared.
+///
+/// A path the previous profile owns is linked from its directory when it has a
+/// file there, and from the bytes the forward switch preserved under its
+/// `backups/` when it does not — which is the case that switch creates
+/// deliberately, when the old profile claimed a path it had no copy of. A path
+/// with neither is left alone and named, because a dangling link at a live
+/// config path is a worse thing than an absent one.
+fn restore_links(context: &Context, rollback: &Rollback, old: &str) -> Vec<String> {
+    let mut notes = Vec::new();
+    let Some(previous) = rollback.old else {
+        return notes;
+    };
+    let old_dir = context.store.profile_dir(old);
+    let claimed: BTreeSet<&str> = rollback
+        .new
+        .map(|new| {
+            new.files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<BTreeSet<&str>>()
+        })
+        .unwrap_or_default();
+    let old_paths: BTreeSet<&str> = previous
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
+
+    // The union, so a path both profiles claim is handled once: the old profile
+    // owns it, and pointing the live path back at the old copy is the whole of
+    // what that takes.
+    let paths: BTreeSet<&str> = old_paths.union(&claimed).copied().collect();
+    for relative in paths {
+        if claimed.contains(relative) && !old_paths.contains(relative) {
+            // A path the failed switch linked that the old profile never owned:
+            // clearing it is what puts the live tree back as it was.
+            if let Err(error) = clear_managed_path(&context.home.join(relative)) {
+                notes.push(format!("could not clear `{relative}`: {error}"));
+            } else {
+                notes.push(format!(
+                    "cleared `{relative}`: only the profile that failed verification claimed it"
+                ));
+            }
+            continue;
+        }
+        let owned = old_dir.join(relative);
+        if owned.exists() {
+            if let Err(error) = link_managed_path(&context.home.join(relative), &owned) {
+                notes.push(format!(
+                    "could not point `{relative}` back at `{old}`: {error}"
+                ));
+            }
+            continue;
+        }
+        // The forward switch preserved the live bytes before unlinking this
+        // path, so they are where the leaving profile was told to keep them.
+        let preserved = context.store.backups_dir(old).join(relative);
+        if preserved.exists() {
+            let live = context.home.join(relative);
+            if let Some(parent) = live.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::rename(&preserved, &live) {
+                Ok(()) => notes.push(format!(
+                    "put `{relative}` back from the bytes this switch preserved"
+                )),
+                Err(error) => notes.push(format!(
+                    "could not restore `{relative}` from {}: {error}",
+                    preserved.display()
+                )),
+            }
+            continue;
+        }
+        notes.push(format!(
+            "`{old}` claims `{relative}`, but it holds no file for it and this switch preserved \
+             none: the live path was left exactly as it was found"
+        ));
+    }
+    notes
+}
+
+/// Says what a reconciliation pass found, out loud and into `warnings`.
+///
+/// Both passes that run the engine speak through here — the switch's own and the
+/// install's install-adapt — so a repair reads the same whether it was made on
+/// the way in or on the way across. Order is the engine's report order: findings
+/// first, then the appid drift, the materialized env block, the guaranteed
+/// paths, the rewritten files, and what stayed dead.
+///
+/// A pass that had nothing to reconcile says nothing out loud: a profile naming
+/// no shell, or one whose QML tree is not there, is an ordinary profile, not
+/// something to warn a user about on every switch. The reason rides the
+/// envelope, where the panel can show it.
+pub(crate) fn announce_reconcile(
+    emitter: &mut Emitter,
+    report: &reconcile::Report,
+    warnings: &mut Vec<String>,
+) {
+    for warning in &report.warnings {
+        emitter.warning(warning);
+        warnings.push(warning.clone());
+    }
+    for drift in &report.appid_drift {
+        let note = format!("this profile's shell recipe disagrees with its own QML: {drift}");
+        emitter.warning(&note);
+        warnings.push(note);
+    }
+    // The env block is a materialized fact, not a repair of a dead name, so it
+    // is announced as itself rather than swept into the rewrite note below.
+    if let Some(block) = &report.env
+        && block.written
+    {
+        let names = block
+            .entries
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<&str>>()
+            .join(", ");
+        let note = format!(
+            "materialized this profile's recipe environment in `{}` ({names}), inside the \
+             block RiceSwap owns",
+            block.file
+        );
+        emitter.warning(&note);
+        warnings.push(note);
+    }
+    for created in &report.dirs_created {
+        let note = format!("guaranteed the path `{created}` this profile's recipe declares");
+        emitter.warning(&note);
+        warnings.push(note);
+    }
+    for rewritten in &report.files_written {
+        if report
+            .env
+            .as_ref()
+            .is_some_and(|block| block.file == *rewritten)
+        {
+            continue; // Already announced as the managed env block.
+        }
+        let note = format!(
+            "repaired the dispatcher names in `{rewritten}`: this profile's shell does not \
+             register what it was dispatching"
+        );
+        emitter.warning(&note);
+        warnings.push(note);
+    }
+    for dead in &report.dead_names {
+        let note = format!(
+            "`{dead}` is dispatched in this profile but its shell registers no such shortcut; \
+             left as it was"
+        );
+        emitter.warning(&note);
+        warnings.push(note);
+    }
+}
+
+/// Installs every package of one class — official or AUR — in a *single*
+/// transaction: `prefix -S --noconfirm pkg1 pkg2 …`, the prefix being the
+/// privilege path (`pkexec pacman` for official packages, the
+/// floating-terminal wrapper naming the AUR helper for AUR ones). One
+/// transaction is the point: every `pkexec` is its own polkit prompt, so a
+/// per-package loop asked the user for the password once per package — a
+/// switch costing ten. Batched, the whole install phase costs one.
+///
+/// The batch is an optimisation, not a bet: any outcome the batch cannot
+/// explain falls back to [`install_packages_one_by_one`], which preserves the
+/// old per-package behaviour — including the install-first conflict dance
+/// where the installer reports a conflict (exit 2) against a package still in
+/// the A-set: that conflicting package is removed with plain `-R` *on the
+/// same privilege path as the install* (pkexec for official, the wrapper's
+/// helper for AUR) and the transaction retried.
 ///
 /// Returns the stdout the transactions printed — the AUR helper's output the
-/// switch report carries. A polkit denial, a dead wrapper, or any refusal that
-/// is not the declared-conflict dance is an error naming the actor, the
-/// package, and what the transaction said: the failure model's "stop package
+/// switch report carries. A polkit denial, a dead wrapper, or any refusal the
+/// per-package fallback cannot resolve is an error naming the actor, the
+/// packages, and what the transaction said: the failure model's "stop package
 /// ops, report".
 fn install_packages(
     prefix: &[&str],
@@ -1109,9 +1926,101 @@ fn install_packages(
     removed: &mut Vec<String>,
     conflict_removed: &mut Vec<String>,
 ) -> Result<Vec<String>, String> {
+    if packages.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args: Vec<&str> = vec!["-S", "--noconfirm"];
+    args.extend(packages.iter().map(String::as_str));
+    let output =
+        run_privileged(prefix, &args).map_err(|error| format!("cannot run {actor}: {error}"))?;
+    if output.status.code() == Some(2) {
+        // Conflict detected on the batch: name the culprit from its stderr,
+        // remove it — pacman is the removal authority either way, so plain
+        // `pkexec pacman -R`, never the helper — and retry the batch once.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let Some(conflicting) = extract_conflicting_package(&stderr) else {
+            // No culprit named — the batch says nothing a per-package run
+            // could not attribute better.
+            return install_packages_one_by_one(
+                prefix,
+                actor,
+                packages,
+                installed,
+                removed,
+                conflict_removed,
+            );
+        };
+        // Best-effort: if the removal cannot happen, the retry below reports
+        // the conflict that is still standing.
+        let _ = run_privileged(OFFICIAL, &["-R", "--noconfirm", &conflicting]);
+        conflict_removed.push(conflicting.clone());
+        removed.push(conflicting);
+        let retry = run_privileged(prefix, &args)
+            .map_err(|error| format!("cannot run {actor}: {error}"))?;
+        if retry.status.success() {
+            installed.extend(packages.iter().cloned());
+            return Ok(stdout_lines(&retry.stdout));
+        }
+        // The retry failed for a reason the batch cannot attribute; the
+        // per-package fallback names the package that breaks.
+        return install_packages_one_by_one(
+            prefix,
+            actor,
+            packages,
+            installed,
+            removed,
+            conflict_removed,
+        );
+    }
+    if output.status.success() {
+        installed.extend(packages.iter().cloned());
+        return Ok(stdout_lines(&output.stdout));
+    }
+    // A declined authentication is one verdict the user gave deliberately;
+    // re-asking per package would pester them for the answer they already
+    // said no to. Report the refusal, naming the batch.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("Not authorized") {
+        return Err(format!(
+            "{actor} failed to install `{}`: {}",
+            packages.join(", "),
+            failure_detail(&output)
+        ));
+    }
+    // Any other batch failure may have left part of the transaction
+    // installed. The machine knows what actually landed — a read-only query,
+    // no prompt — and the fallback continues with only what is still missing,
+    // never re-running a package that already succeeded.
+    let still_missing = missing_from_machine(packages);
+    if still_missing.is_empty() {
+        return Ok(Vec::new());
+    }
+    install_packages_one_by_one(
+        prefix,
+        actor,
+        &still_missing,
+        installed,
+        removed,
+        conflict_removed,
+    )
+}
+
+/// The original per-package install loop, kept as the fallback that makes the
+/// batch safe: it attributes a failure to exactly one package and re-runs the
+/// conflict dance per package. `install_packages` only reaches it for what
+/// the machine says is still missing, so a package a failed batch already
+/// installed is never offered twice.
+fn install_packages_one_by_one(
+    prefix: &[&str],
+    actor: &str,
+    packages: &[String],
+    installed: &mut Vec<String>,
+    removed: &mut Vec<String>,
+    conflict_removed: &mut Vec<String>,
+) -> Result<Vec<String>, String> {
     let mut output_lines = Vec::new();
     for package in packages {
-        let output = run_command(prefix, &["-S", "--noconfirm", package])
+        let output = run_privileged(prefix, &["-S", "--noconfirm", package])
             .map_err(|error| format!("cannot run {actor}: {error}"))?;
         if output.status.code() == Some(2) {
             // Conflict detected: remove conflicting package and retry
@@ -1124,10 +2033,10 @@ fn install_packages(
             };
             // Best-effort: if the removal cannot happen, the retry below
             // reports the conflict that is still standing.
-            let _ = run_command(OFFICIAL, &["-R", "--noconfirm", &conflicting]);
+            let _ = run_privileged(OFFICIAL, &["-R", "--noconfirm", &conflicting]);
             conflict_removed.push(conflicting.clone());
             removed.push(conflicting);
-            let retry = run_command(prefix, &["-S", "--noconfirm", package])
+            let retry = run_privileged(prefix, &["-S", "--noconfirm", package])
                 .map_err(|error| format!("cannot run {actor}: {error}"))?;
             if retry.status.success() {
                 installed.push(package.clone());
@@ -1152,13 +2061,213 @@ fn install_packages(
     Ok(output_lines)
 }
 
+/// Packages no switch may remove, whatever the manifests say.
+///
+/// The package diff is manifest-to-manifest: "packages the leaving profile had
+/// that the arriving one does not". It is a statement about two rice configs,
+/// not evidence that a package is expendable. A profile that captured the
+/// machine it was written on carries that machine's foundations in its manifest
+/// — `glibc`, `gcc-libs`, `coreutils`, the init system — because the config
+/// referenced something that needed them, not because the rice installed them.
+/// The moment a *different* profile happens not to list `glibc`, the diff reads
+/// it as something to remove, and `pkexec pacman -R glibc` is not a package
+/// change; it is a dead system. This is exactly what happened on a return
+/// switch between two shells whose manifests disagreed about `glibc`.
+///
+/// `remove_package` already keeps a package pacman refuses ("breaks
+/// dependency"), so on a healthy system pacman would have saved `glibc` from
+/// itself. But a polkit *denial* surfaces as a hard error, not a keep — so the
+/// dialog this profile produced aborted the switch before pacman could refuse.
+/// Declining to even raise the transaction for a foundation package is what
+/// makes the return path safe without a password. The list is the floor, not a
+/// filter one machine can adjust.
+///
+/// The floor holds two kinds. First, the system itself: `glibc`, `bash`,
+/// `pacman` — pacman's own dependency guard would mostly refuse these, but a
+/// guard that answers after a polkit round-trip is a guard that can abort the
+/// switch instead of saving the package. Second, the session RiceSwap runs
+/// inside: `hyprland`, `quickshell`. For these there is no guard to rely on —
+/// nothing declares a pacman-level dependency on the compositor, so
+/// `pacman -R hyprland` succeeds and takes the live desktop, the reload of
+/// step 8, and the panel itself down with it. A rice can only exist on top of
+/// the session, never as a replacement for it.
+const SYSTEM_PACKAGES: &[&str] = &[
+    // The system.
+    "filesystem",
+    "glibc",
+    "gcc-libs",
+    "gcc",
+    "binutils",
+    "coreutils",
+    "bash",
+    "sh",
+    "systemd",
+    "systemd-libs",
+    "systemd-sysvcompat",
+    "dbus",
+    "util-linux",
+    "pacman",
+    "linux",
+    "linux-api-headers",
+    "linux-firmware",
+    "base",
+    "base-devel",
+    // The session.
+    "hyprland",
+    "hyprland-git",
+    "quickshell",
+    "quickshell-git",
+    "quickshell-nightly",
+];
+
+/// Whether `package` is one no profile gets to remove.
+fn is_system_package(package: &str) -> bool {
+    SYSTEM_PACKAGES.contains(&package)
+}
+
+/// Splits `removals` into the ones a switch may act on and the foundation
+/// packages it must not, preserving the caller's order on the act list. The
+/// protected list is what the report names so a decline is never silent.
+fn partition_removals(removals: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut actionable = Vec::new();
+    let mut protected = Vec::new();
+    for package in removals {
+        if is_system_package(package) {
+            protected.push(package.clone());
+        } else {
+            actionable.push(package.clone());
+        }
+    }
+    (actionable, protected)
+}
+
+/// Whether `package` is still required by another installed package, per
+/// `pacman -Qi`. This is a read-only query — no privilege, no prompt —
+/// so it can be used to trim the removal set before any `pkexec` is raised.
+/// A package that is still required will never be removed, so asking for it
+/// only costs a password and a refusal.
+fn is_still_needed(package: &str) -> bool {
+    let Ok(output) = Command::new(Tool::Pacman.name())
+        .arg("-Qi")
+        .arg(package)
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        // Not installed or pacman cannot answer — nothing requires it.
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("Required By") {
+            // Format: "Required By     : foo bar"  or  "Required By     : None"
+            let Some(value) = rest.split(':').nth(1) else {
+                continue;
+            };
+            let value = value.trim();
+            return !(value.is_empty() || value == "None");
+        }
+    }
+    false
+}
+
+/// Removes the pending packages — one polkit prompt, never twenty.
+///
+/// The old shape batched `pkexec pacman -R a b c…` and, when any one entry
+/// was still needed, pacman's refusal killed the *whole* batch and the code
+/// retried one `pkexec` per package. Each of those is its own polkit prompt,
+/// so a switch that merely wanted to leave a few dependencies behind asked the
+/// user for their password twenty times — exactly the storm you reported
+/// (`ii → caelestia` removes ~20 packages, most still required).
+///
+/// This version screens the set first with a non-privileged `pacman -Qi`
+/// `Required By` check: packages that are still needed are kept with a
+/// warning *without ever raising a prompt*. Only the truly removable tail
+/// enters the single `pkexec pacman -R` batch. A dependency refusal that
+/// still slips through (racy install, undeclared dependency) falls back to
+/// per-package retries only over that tail — the pre-filter already removed
+/// the bulk, so the fallback at worst costs one extra batch, not twenty.
+fn remove_packages(
+    packages: &[&String],
+    emitter: &mut Emitter,
+    kept: &mut Vec<String>,
+    removed: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    if packages.is_empty() {
+        return;
+    }
+    // Non-privileged pre-filter: keep still-needed packages without a prompt.
+    let mut to_remove: Vec<&String> = Vec::new();
+    for package in packages {
+        if is_still_needed(package) {
+            kept.push((*package).clone());
+            let note = format!("kept: {package} (still needed)");
+            emitter.warning(&note);
+            warnings.push(note);
+        } else {
+            to_remove.push(*package);
+        }
+    }
+    if to_remove.is_empty() {
+        return;
+    }
+    let mut args: Vec<&str> = vec!["-R", "--noconfirm"];
+    args.extend(to_remove.iter().map(|package| package.as_str()));
+    let declined = match run_privileged(OFFICIAL, &args) {
+        Err(error) => Some(format!("cannot run pkexec pacman: {error}")),
+        Ok(output) if output.status.success() => {
+            removed.extend(to_remove.iter().map(|package| (*package).clone()));
+            return;
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("breaks dependency")
+                || stderr.contains("could not satisfy dependencies")
+            {
+                // One still-needed package held the whole batch; per-package
+                // retries keep just that one and free the rest. The pre-filter
+                // already removed the majority, so this loop is the rare tail.
+                for package in &to_remove {
+                    match remove_package(package) {
+                        Ok(true) => removed.push((*package).clone()),
+                        Ok(false) => {
+                            kept.push((*package).clone());
+                            let note = format!("kept: {package} (still needed)");
+                            emitter.warning(&note);
+                            warnings.push(note);
+                        }
+                        Err(error) => {
+                            kept.push((*package).clone());
+                            let note = format!("kept: {package} (removal declined: {error})");
+                            emitter.warning(&note);
+                            warnings.push(note);
+                        }
+                    }
+                }
+                return;
+            }
+            Some(failure_detail(&output))
+        }
+    };
+    // A declined batch is one verdict for every package it named.
+    let error = declined.expect("the non-success paths above return or set a reason");
+    for package in &to_remove {
+        kept.push((*package).clone());
+        let note = format!("kept: {package} (removal declined: {error})");
+        emitter.warning(&note);
+        warnings.push(note);
+    }
+}
+
 /// Removes one package with plain `pkexec pacman -R` — never `-Rs`/`-Rdd` —
 /// for official and AUR packages alike: pacman is the removal authority
 /// either way. `Ok(false)` is the dependency refusal the caller logs as kept;
 /// anything else (a polkit denial, a spawn failure) is an error, so a denial
 /// on a removal surfaces exactly like one on an install.
 fn remove_package(package: &str) -> Result<bool, String> {
-    let output = run_command(OFFICIAL, &["-R", "--noconfirm", package])
+    let output = run_privileged(OFFICIAL, &["-R", "--noconfirm", package])
         .map_err(|error| format!("cannot run pkexec pacman: {error}"))?;
     if output.status.success() {
         return Ok(true);
@@ -1182,18 +2291,184 @@ fn run_command(prefix: &[&str], args: &[&str]) -> std::io::Result<Output> {
     Command::new(program).args(escalated).args(args).output()
 }
 
+/// Runs one privileged transaction, and when polkit itself refuses, asks the
+/// terminal instead.
+///
+/// `Not authorized` on stderr comes in two shapes. The user typed "no" at a
+/// live dialog — one verdict, honoured once. Or there is no agent to talk to
+/// at all: a broken desktop (a shell that died, an agent that was never
+/// started) makes polkit fail the *authentication itself* — every password
+/// answered becomes a refusal — and the switch that stops there strands the
+/// desktop mid-change and blames the user's typing. Both said the same words
+/// on the switch that should have installed one package.
+///
+/// So a `pkexec` refusal is retried through `sudo`, which prompts straight on
+/// the controlling terminal and needs no session service. The user's own
+/// terminal answers even when the desktop cannot. The retry happens at most
+/// once per process — if sudo refuses too, the machine has no working
+/// escalation and the remaining transactions must not stack prompts — and a
+/// prefix that is not `pkexec` (the AUR wrapper escalates through its own
+/// terminal) or a failure that is not the auth marker (a pacman dependency
+/// refusal) runs exactly once, as before.
+fn run_privileged(prefix: &[&str], args: &[&str]) -> std::io::Result<Output> {
+    let output = run_command(prefix, args)?;
+    let via_polkit = prefix.first() == Some(&Tool::PkExec.name());
+    if !via_polkit
+        || output.status.success()
+        || !String::from_utf8_lossy(&output.stderr).contains(AUTH_REFUSAL)
+    {
+        return Ok(output);
+    }
+    if SUDO_EXHAUSTED.load(Ordering::Relaxed) {
+        return Ok(output);
+    }
+    let mut fallback: Vec<&str> = vec!["sudo"];
+    fallback.extend(prefix.iter().skip(1).copied());
+    fallback.extend(args.iter().copied());
+    match run_command(&fallback, &[]) {
+        // sudo authenticated and ran the transaction. Whatever it answered,
+        // success or pacman's own failure, is the verdict: the polkit refusal
+        // it replaced says nothing about why pacman then stopped, and
+        // reporting it tells a user whose password was accepted that it was
+        // not.
+        Ok(retried) if retried.status.success() || !sudo_refused(&retried) => {
+            // sudo's credential cache keeps this the only terminal prompt of
+            // the switch, however many transactions polkit refused.
+            eprintln!(
+                "warning: polkit refused the transaction (is an authentication agent \
+                 running?); retried through sudo"
+            );
+            Ok(retried)
+        }
+        // Refused or missing: remember it. Both elevators failed, so the
+        // original polkit verdict is the more honest one to surface, and no
+        // later transaction pays a second round of prompts for the same dead
+        // escalation.
+        _ => {
+            SUDO_EXHAUSTED.store(true, Ordering::Relaxed);
+            Ok(output)
+        }
+    }
+}
+
+/// Whether a failed `sudo` run died at `sudo` itself — a password it would
+/// not take, no terminal to ask on — rather than inside the command it
+/// elevated. `sudo` prefixes its own complaints with `sudo:`; the elevated
+/// `pacman` speaks as `error:`.
+fn sudo_refused(output: &Output) -> bool {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr.contains(AUTH_REFUSAL) || stderr.lines().any(|line| line.starts_with("sudo:"))
+}
+
 /// What a failed transaction said — or how it died when it said nothing — so
 /// every package failure reaches the envelope with a reason.
 fn failure_detail(output: &Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let text = stderr.trim();
-    if !text.is_empty() {
-        return text.to_string();
+    describe_failure(
+        String::from_utf8_lossy(&output.stderr).trim(),
+        output.status,
+    )
+}
+
+/// Why a command that ran and exited badly is reported: its own stderr if it
+/// printed one, else the bare facts of how it died (code or signal), so every
+/// failure reaches the envelope with a reason.
+fn describe_failure(stderr: &str, status: ExitStatus) -> String {
+    if !stderr.is_empty() {
+        return stderr.to_string();
     }
-    match output.status.code() {
+    match status.code() {
         Some(code) => format!("exit code {code}, with no error output"),
         None => "killed by a signal".to_string(),
     }
+}
+
+/// How long a service or shell gets to prove it will not die on its own. A
+/// daemon — `qs -c ii`, `wl-paste --watch` — never exits, so the switch must
+/// not wait for it to; but a start that is *going* to fail almost always
+/// fails within its first moments (no binary, no display, bad config), and
+/// the grace window gives those failures their stderr back instead of
+/// reporting a success the desktop will not show.
+///
+/// `pub(crate)` because the verification tier quotes this window back to the
+/// user in its shell check's evidence: the number a start was given is part of
+/// what "alive" means here, and it must not be restated somewhere else.
+pub(crate) const START_GRACE: Duration = Duration::from_millis(700);
+
+/// Runs one `start` command and reports whether to count it as started, in a
+/// bounded time no matter what the command does.
+///
+/// `sh -c` plus a blocking `.output()` was the old shape, and it hangs:
+/// Quickshell *is* the desktop, it does not exit, and a switch that waits for
+/// the shell to exit waits forever — at step 10, with the session already
+/// killed at step 4. Instead the command runs with a stdout and stdin of
+/// `/dev/null` and its stderr pointed at a capture file, and the child is
+/// watched without blocking for [`START_GRACE`]: an early exit is read as
+/// success or failure with the command's own error text from the file, and a
+/// command still alive when the window closes is a daemon coming up. The file
+/// is then deleted: a surviving daemon keeps writing into the unlinked inode,
+/// which is harmless, where a pipe it inherited would hand it `SIGPIPE` the
+/// moment the switch exited.
+///
+/// The returned `Err` string is the failure's text: the captured stderr when
+/// the command said one, else the bare facts of how it died.
+fn start_daemonized(start: &str) -> Result<(), String> {
+    let capture = std::env::temp_dir().join(format!(
+        "riceswap-start-{}-{:x}.log",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0),
+    ));
+    let quoted = format!("'{}'", capture.display().to_string().replace('\'', r"'\''"));
+    let mut child = match Command::new("sh")
+        .arg("-c")
+        // `exec` replaces the shell with the command, so what the grace window
+        // watches is the daemon itself, not a shell waiting behind it; the
+        // `2>` is applied before the exec and is what makes the daemon's own
+        // error text recoverable. Every descriptor the command would otherwise
+        // inherit is /dev/null or the capture file — nothing it holds open can
+        // keep the switch's stdout reader waiting after the switch has exited.
+        .arg(format!("exec {start} 2>{quoted}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => return Err(format!("cannot run `{start}`: {error}")),
+    };
+
+    // `try_wait` never blocks, so the window is polled to its deadline; a
+    // process that exits on its own is seen on the very next poll.
+    let deadline = Instant::now() + START_GRACE;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = std::fs::remove_file(&capture);
+                return Err(format!("cannot watch `{start}`: {error}"));
+            }
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+
+    let outcome = match status {
+        // Still running at the deadline: a daemon is up. Already exited 0:
+        // a one-shot service did its job. Either way, started.
+        None => Ok(()),
+        Some(exit) if exit.success() => Ok(()),
+        Some(exit) => {
+            let stderr = std::fs::read_to_string(&capture).unwrap_or_default();
+            Err(describe_failure(stderr.trim(), exit))
+        }
+    };
+    let _ = std::fs::remove_file(&capture);
+    outcome
 }
 
 /// The non-empty lines a transaction printed — the AUR helper's output that
@@ -1452,7 +2727,7 @@ fn wallpaper_import(context: &mut Context, path: &str) -> Envelope {
 
 /// Verifies `source` is an existing, readable image file. Every failure is a
 /// message naming the path, so the refusal explains itself.
-fn validate_image(source: &Path) -> Result<(), String> {
+pub(crate) fn validate_image(source: &Path) -> Result<(), String> {
     let metadata = std::fs::metadata(source).map_err(|error| match error.kind() {
         ErrorKind::NotFound => format!(
             "{} does not exist; wallpaper-import needs a path to an image file",
@@ -1534,7 +2809,7 @@ fn has_image_signature(header: &[u8]) -> bool {
 /// Where the image should land: its own file name when free (or already the
 /// same image, so the move is a no-op overwrite), otherwise a numbered name —
 /// importing must never destroy a wallpaper already in the layer.
-fn available_destination(wallpapers: &Path, source: &Path, name: &OsStr) -> PathBuf {
+pub(crate) fn available_destination(wallpapers: &Path, source: &Path, name: &OsStr) -> PathBuf {
     let destination = wallpapers.join(name);
     if !destination.exists() || same_contents(source, &destination) {
         return destination;
@@ -1985,6 +3260,34 @@ fn compute_package_diff(
     (install_official, install_aur, remove_official, remove_aur)
 }
 
+/// The shell change a switch implies: (stop, start).
+///
+/// The rule is name equality, because the name is the only thing that says
+/// "same shell". Two profiles both carrying a `qs` service whose command is the
+/// identical string `qs -c $qsConfig` are two different shells wearing one
+/// service name; comparing services alone says nothing changed and leaves the
+/// old shell running under the new one's config. Comparing the shells says
+/// `ii` and `caelestia` differ, which is the truth.
+///
+/// `stop` is the shell to end, `start` the one to begin. Each is `None` when
+/// that half is not called for.
+fn compute_shell_change<'a>(
+    current: Option<&'a Shell>,
+    target: Option<&'a Shell>,
+) -> (Option<&'a Shell>, Option<&'a Shell>) {
+    match (current, target) {
+        // No active profile: nothing is known to be running, so the target's
+        // shell starts — the same call the service diff makes with no `current`.
+        (None, target) => (None, target),
+        // The target claims no shell. Ending the old one would leave a desktop
+        // with none, so it stays: a profile that does not name a shell has no
+        // opinion about the one running.
+        (Some(_), None) => (None, None),
+        (Some(current), Some(target)) if current.name == target.name => (None, None),
+        (Some(current), Some(target)) => (Some(current), Some(target)),
+    }
+}
+
 /// Computes service changes: (stop, start)
 fn compute_service_changes(current: &[Service], target: &[Service]) -> (Vec<String>, Vec<String>) {
     let current_names: std::collections::HashSet<&str> =
@@ -2026,17 +3329,342 @@ fn compute_symlink_changes(
     (link, unlink)
 }
 
-/// Checks for real files at target symlink paths (blocked paths)
-fn check_blocked_paths(home: &Path, paths: &[String]) -> Vec<String> {
-    paths
-        .iter()
-        .filter_map(|relative| {
-            let metadata = std::fs::symlink_metadata(home.join(relative)).ok()?;
-            (!metadata.file_type().is_symlink() && metadata.is_file()).then(|| relative.clone())
-        })
-        .collect()
+/// The packages in `wanted` that this machine does not satisfy, per `pacman -T`.
+///
+/// `plan` reports the raw manifest difference, which on a first switch is every
+/// package the target declares. Intersecting with what the machine already
+/// has is what turns "this profile declares 20 packages" into "this machine is
+/// missing 5", which is the number worth putting in front of someone before
+/// they authorise a switch.
+///
+/// The question goes to pacman's own resolver, not to a list of installed
+/// names: `matugen-bin` provides `matugen`, so a name-only comparison called
+/// `matugen` missing and the switch tried to install the repo package over the
+/// one already standing in for it, a transaction pacman refuses whole. `-T`
+/// prints exactly the names nothing installed satisfies and exits 127 when
+/// there are any.
+///
+/// The query runs under plain `pacman`, never the `OFFICIAL` prefix: `plan` is
+/// a preview, and a preview that asks for a password is not a preview. A query
+/// pacman cannot answer (it did not run, or exited with neither 0 nor 127)
+/// leaves the set alone: the manifest difference stays the conservative answer.
+fn missing_from_machine(wanted: &[String]) -> Vec<String> {
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let mut args: Vec<&str> = vec!["-T"];
+    args.extend(wanted.iter().map(String::as_str));
+    let Ok(output) = run_command(&[Tool::Pacman.name()], &args) else {
+        return wanted.to_vec();
+    };
+    match output.status.code() {
+        Some(0) => Vec::new(),
+        Some(127) => {
+            let listing = String::from_utf8_lossy(&output.stdout).into_owned();
+            let unmet: std::collections::HashSet<&str> = listing
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect();
+            wanted
+                .iter()
+                .filter(|package| unmet.contains(package.as_str()))
+                .cloned()
+                .collect()
+        }
+        _ => wanted.to_vec(),
+    }
 }
-fn describe(status: &tools::ToolStatus) -> String {
+
+/// The real files standing at the paths a switch would link, split by what the
+/// switch would do about each one.
+struct BlockedPaths {
+    /// Byte-for-byte the same as the profile's own copy: replacing it loses
+    /// nothing, so the switch says nothing and links it.
+    identical: Vec<String>,
+    /// Genuinely different: the switch copies these into the target profile's
+    /// `backups/` before it replaces them, and the report names each one.
+    backed_up: Vec<String>,
+}
+
+/// Classifies the real files sitting at the paths a switch would link.
+///
+/// A real file at a link target used to abort the whole switch, which made any
+/// profile un-switchable on a machine that had never switched — and every real
+/// machine has a `.bashrc` and a `.zshrc`. Nothing is clobbered either way: a
+/// file that matches the profile byte for byte carries no information the
+/// profile does not already hold, and one that differs is preserved under
+/// `backups/` first.
+fn classify_blocked_paths(home: &Path, profile: &Path, paths: &[String]) -> BlockedPaths {
+    let mut identical = Vec::new();
+    let mut backed_up = Vec::new();
+    for relative in paths {
+        let live = home.join(relative);
+        let Ok(metadata) = std::fs::symlink_metadata(&live) else {
+            continue; // Absent: nothing stands in the way.
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            continue; // Already managed, or a directory this handles elsewhere.
+        }
+        let (Ok(mine), Ok(theirs)) = (std::fs::read(&live), std::fs::read(profile.join(relative)))
+        else {
+            // The profile has no copy to compare against, so the difference is
+            // unprovable: treat it as something worth keeping.
+            backed_up.push(relative.clone());
+            continue;
+        };
+        if mine == theirs {
+            identical.push(relative.clone());
+        } else {
+            backed_up.push(relative.clone());
+        }
+    }
+    BlockedPaths {
+        identical,
+        backed_up,
+    }
+}
+
+/// Every real file at a link target, whatever the switch would do with it: the
+/// blocked set `plan` reports, in path order.
+fn blocked_paths_of(classified: &BlockedPaths) -> Vec<String> {
+    let mut all: Vec<String> = classified
+        .identical
+        .iter()
+        .chain(&classified.backed_up)
+        .cloned()
+        .collect();
+    all.sort();
+    all
+}
+
+/// Moves a path the new profile no longer manages into the *leaving* profile's
+/// `backups/`, so the switch gives the path back instead of deleting it.
+///
+/// The bytes already exist — inside the leaving profile, which is what the path
+/// is currently a symlink to — so what is being preserved is the right to have
+/// them back at this path without a second profile copy. A symlink is recreated
+/// under the backup name pointing at its own profile copy; a real file or
+/// directory is moved, recursively, so a profile that was edited in place since
+/// it was captured is preserved as edited rather than as the stale capture.
+///
+/// `now_rfc3339` names the collision suffix, so returning to a profile twice
+/// keeps both generations.
+fn preserve_managed_path(backups: &Path, relative: &str, live: &Path) -> Result<(), String> {
+    let Ok(metadata) = std::fs::symlink_metadata(live) else {
+        return Ok(()); // Absent: nothing to preserve, nothing to unlink.
+    };
+    let mut destination = backups.join(relative);
+    let parent = destination
+        .parent()
+        .ok_or_else(|| format!("the backup path for `{relative}` has no parent directory"))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+
+    if destination.exists() || std::fs::symlink_metadata(&destination).is_ok() {
+        let stem = destination
+            .file_stem()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| relative.to_string());
+        let extension = destination
+            .extension()
+            .map(|name| format!(".{}", name.to_string_lossy()))
+            .unwrap_or_default();
+        destination = parent.join(format!("{stem}.{}.bak{extension}", now_rfc3339()));
+    }
+
+    if metadata.file_type().is_symlink() {
+        // A link to the leaving profile's own copy: recreating it under
+        // `backups/` keeps those bytes reachable, and a plain `remove_file`
+        // would have discarded the pointer to them.
+        std::os::unix::fs::symlink(
+            std::fs::read_link(live)
+                .map_err(|error| format!("cannot read the link at {}: {error}", live.display()))?,
+            &destination,
+        )
+        .map_err(|error| {
+            format!(
+                "cannot store the link at {}: {error}",
+                destination.display()
+            )
+        })?;
+        return std::fs::remove_file(live)
+            .map_err(|error| format!("cannot remove {}: {error}", live.display()));
+    }
+
+    if metadata.is_dir() {
+        return move_directory(&destination, live);
+    }
+    std::fs::rename(live, &destination).map_err(|error| {
+        format!(
+            "cannot move {} to {}: {error}",
+            live.display(),
+            destination.display()
+        )
+    })
+}
+
+/// Moves a directory and everything under it, creating the destination as it
+/// goes, so a half-finished move leaves the source intact rather than a
+/// truncated tree in both places.
+fn move_directory(destination: &Path, source: &Path) -> Result<(), String> {
+    let mut entries: Vec<_> = std::fs::read_dir(source)
+        .map_err(|error| format!("cannot read {}: {error}", source.display()))?
+        .collect::<Result<_, _>>()
+        .map_err(|error| format!("cannot read {}: {error}", source.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    std::fs::create_dir_all(destination)
+        .map_err(|error| format!("cannot create {}: {error}", destination.display()))?;
+    for entry in entries {
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        let metadata = std::fs::symlink_metadata(&from)
+            .map_err(|error| format!("cannot inspect {}: {error}", from.display()))?;
+        if metadata.file_type().is_symlink() {
+            std::os::unix::fs::symlink(
+                std::fs::read_link(&from).map_err(|error| {
+                    format!("cannot read the link at {}: {error}", from.display())
+                })?,
+                &to,
+            )
+            .map_err(|error| format!("cannot store the link at {}: {error}", to.display()))?;
+            std::fs::remove_file(&from)
+                .map_err(|error| format!("cannot remove {}: {error}", from.display()))?;
+        } else if metadata.is_dir() {
+            move_directory(&to, &from)?;
+        } else {
+            std::fs::rename(&from, &to).map_err(|error| {
+                format!(
+                    "cannot move {} to {}: {error}",
+                    from.display(),
+                    to.display()
+                )
+            })?;
+        }
+    }
+    std::fs::remove_dir(source)
+        .map_err(|error| format!("cannot remove {}: {error}", source.display()))
+}
+
+/// Copies a real file the switch is about to replace into the target profile's
+/// `backups/`, so the bytes survive the switch.
+///
+/// The copy is staged beside its destination and renamed into place, the same
+/// staged-then-rename primitive `Store::flip` and `link_managed_path` use, so a
+/// crash mid-write cannot leave a truncated file where the user's config used to
+/// be. `now_rfc3339` names a collision suffix, so a second switch over the same
+/// path keeps both copies instead of overwriting the first.
+fn backup_managed_file(backups: &Path, relative: &str, live: &Path) -> Result<PathBuf, String> {
+    let mut destination = backups.join(relative);
+    let parent = destination
+        .parent()
+        .ok_or_else(|| format!("the backup path for `{relative}` has no parent directory"))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+
+    if destination.exists() {
+        let stem = destination
+            .file_stem()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| relative.to_string());
+        let extension = destination
+            .extension()
+            .map(|name| format!(".{}", name.to_string_lossy()))
+            .unwrap_or_default();
+        // Two switches over the same path, minutes apart: keep both.
+        destination = parent.join(format!("{stem}.{}.bak{extension}", now_rfc3339()));
+    }
+
+    let staged = staged_backup_path(&destination);
+    let _ = std::fs::remove_file(&staged);
+    std::fs::copy(live, &staged).map_err(|error| {
+        format!(
+            "cannot copy {} to {}: {error}",
+            live.display(),
+            staged.display()
+        )
+    })?;
+    if let Err(error) = std::fs::rename(&staged, &destination) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(format!(
+            "cannot store the backup at {}: {error}",
+            destination.display()
+        ));
+    }
+    Ok(destination)
+}
+
+/// The scratch name a backup is written under before it is renamed into place.
+fn staged_backup_path(destination: &Path) -> PathBuf {
+    let mut name = destination.as_os_str().to_os_string();
+    name.push(".riceswap-staged");
+    PathBuf::from(name)
+}
+
+/// Clears a managed path the active profile owned and the target no longer does,
+/// so the switch leaves nothing of the old rice behind.
+///
+/// A symlink is simply unlinked. A real **directory** is the profile's own copy of
+/// a `$HOME` path — the shape every captured config dir has — and is removed in
+/// full: the live tree is mid-switch, and leaving a half-old config in place is
+/// worse than replacing it. A real **file** is user data that no profile claims, so
+/// it refuses rather than deleting it. Anything that cannot be inspected is left
+/// alone: an absent path is already clear.
+fn clear_managed_path(path: &Path) -> Result<(), String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
+    };
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        return std::fs::remove_file(path)
+            .map_err(|error| format!("cannot remove {}: {error}", path.display()));
+    }
+    if metadata.is_dir() {
+        return std::fs::remove_dir_all(path)
+            .map_err(|error| format!("cannot remove {}: {error}", path.display()));
+    }
+    // A fifo or socket holds nothing a config switch needs to clear.
+    Ok(())
+}
+
+/// Points `link` at the target profile's copy of a managed path.
+///
+/// The link is staged beside its destination and renamed into place, the same
+/// staged-then-rename primitive `Store::flip` uses for the `current` symlink, so a
+/// watcher never observes a half-linked config. The destination is cleared first:
+/// a path the old profile left as a real directory has to be replaced wholesale,
+/// which `remove_file` alone cannot do.
+fn link_managed_path(link: &Path, target: &Path) -> Result<(), String> {
+    if let Some(parent) = link.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    }
+    clear_managed_path(link)?;
+    let staged = staged_link_path(link);
+    let _ = std::fs::remove_file(&staged);
+    std::os::unix::fs::symlink(target, &staged)
+        .map_err(|error| format!("cannot create {}: {error}", staged.display()))?;
+    if let Err(error) = std::fs::rename(&staged, link) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(format!(
+            "cannot point {} at the profile: {error}",
+            link.display()
+        ));
+    }
+    Ok(())
+}
+
+/// The staging path a managed link is built at before being renamed onto its
+/// destination: the destination with a `.riceswap-staged` suffix, in the same
+/// directory so the rename stays within one filesystem.
+fn staged_link_path(link: &Path) -> PathBuf {
+    let mut name = link.as_os_str().to_os_string();
+    name.push(".riceswap-staged");
+    PathBuf::from(name)
+}
+
+pub(crate) fn describe(status: &tools::ToolStatus) -> String {
     match (&status.error, status.exit_code) {
         (Some(error), _) if !status.available => error.clone(),
         (Some(error), Some(code)) => format!("exited {code}: {error}"),

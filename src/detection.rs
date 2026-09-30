@@ -3,7 +3,9 @@
 //! `detect` proposes the candidates the user confirms before `snapshot`
 //! writes a profile, and `snapshot` re-runs the same scan to capture them:
 //! config directories from the curated allowlist merged with a
-//! format-agnostic scan of the Hyprland config (lua `source` refs included),
+//! format-agnostic scan of the Hyprland config (both the `hyprland.conf` and
+//! `hyprland.lua` entrypoints, with lua `source` refs and `hl.exec_cmd`
+//! startup lines included),
 //! packages found by a binary-reference scan over the detected configs and
 //! resolved through `pacman -Qo` (split official/AUR via `pacman -Qm`),
 //! fonts, icons, and themes from the standard asset locations, and image
@@ -31,10 +33,13 @@ pub const IMAGE_EXTENSIONS: &[&str] = &[
 /// with releases: anything here is proposed whenever it exists on disk.
 const CONFIG_ALLOWLIST: &[&str] = &[
     "ags",
+    "bash",
     "cava",
     "dunst",
+    "fish",
     "foot",
     "fontconfig",
+    "fzf",
     "fuzzel",
     "gtk-3.0",
     "gtk-4.0",
@@ -45,13 +50,16 @@ const CONFIG_ALLOWLIST: &[&str] = &[
     "kitty",
     "mako",
     "matugen",
+    "nushell",
     "quickshell",
     "rofi",
+    "starship",
     "swaync",
     "swww",
     "waybar",
     "wlogout",
     "wofi",
+    "zsh",
 ];
 
 /// The standard asset locations outside `~/.config` whose contents belong to
@@ -62,6 +70,114 @@ const ASSET_DIRS: &[&str] = &[
     ".local/share/icons",
     ".local/share/themes",
     ".local/share/color-schemes",
+];
+
+/// The lua module names a line requires: `require("hyprland.execs")` and the
+/// `dofile`/`loadfile` spellings. Only a quoted, dot-separated module name
+/// counts — a bare word in a comment or a string that is clearly a path is
+/// left to `path_references`, which already handles it.
+fn module_references(line: &str) -> Vec<String> {
+    let mut modules = Vec::new();
+    for marker in ["require", "dofile", "loadfile"] {
+        let mut search = 0usize;
+        while let Some(found) = line[search..].find(marker) {
+            let index = search + found;
+            search = index + marker.len();
+            // A module name, not a longer identifier ending in the marker.
+            if index > 0 {
+                let previous = line.as_bytes()[index - 1];
+                if previous.is_ascii_alphanumeric() || previous == b'_' || previous == b'.' {
+                    continue;
+                }
+            }
+            let rest = line[search..].trim_start();
+            let Some(rest) = rest.strip_prefix('(').map(str::trim_start) else {
+                continue;
+            };
+            let Some(rest) = rest.strip_prefix('"') else {
+                continue;
+            };
+            let Some(end) = rest.find('"') else {
+                continue;
+            };
+            let name = &rest[..end];
+            // A path is a path: `dofile(HOME .. "/x.lua")` and friends are
+            // already handled as references, and a module name has no
+            // separator in it.
+            if name.is_empty() || name.contains('/') || name.starts_with('.') {
+                continue;
+            }
+            if !name.split('.').all(|part| !part.is_empty()) {
+                continue;
+            }
+            modules.push(name.to_string());
+        }
+    }
+    modules
+}
+
+/// Resolves a lua module name to the file lua itself would load it from.
+///
+/// Lua resolves `require("hyprland.execs")` by searching the config tree, so
+/// the module's dotted path is tried relative to the requiring file and then
+/// under the roots a Hyprland lua config actually uses: the config dir itself,
+/// and its `hypr` subdirectory (which is where `require("hyprland.execs")`
+/// resolves from `~/.config/hypr/hyprland.lua`). `.lua` is the extension
+/// unless the name already carries one.
+///
+/// The first path segment is also tried dropped: a config that lives in
+/// `~/.config/hypr/` and spells its modules `require("hyprland.execs")` keeps
+/// them in a `hyprland/` subdirectory of that same root, so the name resolves
+/// there only once the leading segment is removed.
+fn resolve_lua_module(home: &Path, requiring: &Path, module: &str) -> Option<PathBuf> {
+    let parts: Vec<&str> = module.split('.').collect();
+    let mut relatives = vec![module.replace('.', "/")];
+    if parts.len() > 1 {
+        relatives.push(parts[1..].join("/"));
+    }
+    let config = home.join(".config");
+    let hypr = config.join("hypr");
+    let mut roots = Vec::new();
+    if let Some(parent) = requiring.parent() {
+        roots.push(parent.to_path_buf());
+    }
+    roots.push(config);
+    roots.push(hypr.clone());
+    roots.push(hypr.join("hyprland"));
+    for root in roots {
+        for relative in &relatives {
+            let stems = if Path::new(relative).extension().is_some() {
+                vec![relative.clone()]
+            } else {
+                vec![format!("{relative}.lua"), format!("{relative}/init.lua")]
+            };
+            for stem in stems {
+                let candidate = root.join(&stem);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The `$HOME`-relative **files** a rice owns, which the directory allowlist
+/// above can never propose because it only walks directories. A prompt or a
+/// shell's rc file is a single file at a known name — `starship` keeps its
+/// config in `.config/starship.toml`, not in a `.config/starship/` directory —
+/// and a profile that captured the terminal but not the prompt is half a rice.
+const CONFIG_FILE_ALLOWLIST: &[&str] = &[
+    ".bash_profile",
+    ".bashrc",
+    ".profile",
+    ".zprofile",
+    ".zshenv",
+    ".zshrc",
+    ".config/fish/config.fish",
+    ".config/starship.toml",
+    ".config/bashrc",
+    ".config/zsh/.zshrc",
 ];
 
 /// The separators a reference or command token may be wrapped in. Splitting
@@ -148,8 +264,21 @@ pub fn scan_config(home: &Path) -> ConfigScan {
                 continue;
             }
             if entry.path().is_dir() {
-                dirs.insert(format!(".config/{name}"));
+                for candidate in shell_candidates(&entry.path(), &name) {
+                    insert_candidate(&mut dirs, candidate);
+                }
             }
+        }
+    }
+    // The single-file half of the allowlist, proposed the same way: present on
+    // disk, so it belongs to the rice. `insert_candidate`, not `insert`: a raw
+    // insert would let a file through beside the directory that already
+    // contains it (`.config/fish` *and* `.config/fish/config.fish`), and a
+    // manifest holding both a parent and its own child can never be switched
+    // — the child blocks the parent, then destroys it.
+    for relative in CONFIG_FILE_ALLOWLIST {
+        if home.join(relative).is_file() {
+            insert_candidate(&mut dirs, (*relative).to_string());
         }
     }
     let mut services = BTreeMap::new();
@@ -224,15 +353,23 @@ pub fn scan_wallpapers(home: &Path) -> Vec<String> {
     found.into_iter().collect()
 }
 
-/// The seed of the reference scan: the live Hyprland config, read first, then
+/// The seeds of the reference scan: the live Hyprland config, read first, then
 /// every file it (transitively) references.
+///
+/// Both entrypoints are seeded, because a machine may use either or both: the
+/// classic `hyprland.conf`, and the `hyprland.lua` that Hyprland 0.56+ loads when
+/// a config is written in lua. Seeding only the `.conf` left a lua-configured
+/// desktop entirely unscanned — no services, no referenced dirs.
 fn follow_hyprland_refs(
     home: &Path,
     dirs: &mut BTreeSet<String>,
     services: &mut BTreeMap<String, Service>,
 ) {
-    let start = home.join(".config").join("hypr").join("hyprland.conf");
-    let mut queue = VecDeque::from([(start, 0usize)]);
+    let hypr = home.join(".config").join("hypr");
+    let mut queue: VecDeque<(PathBuf, usize)> = ["hyprland.conf", "hyprland.lua"]
+        .iter()
+        .map(|name| (hypr.join(name), 0usize))
+        .collect();
     let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
     while let Some((file, depth)) = queue.pop_front() {
         if visited.len() >= MAX_FOLLOWED_FILES {
@@ -254,9 +391,34 @@ fn follow_hyprland_refs(
             if let Some(service) = exec_once_service(line) {
                 services.entry(service.name.clone()).or_insert(service);
             }
+            // A lua `require("hyprland.execs")` names a module, not a path, so
+            // `path_references` cannot see it. Lua resolves it against the
+            // config tree, so the same referenced file is reached by resolving
+            // the module name the way lua would — without this, a lua
+            // entrypoint is a dead end and nothing below it is ever read.
+            for module in module_references(line) {
+                if depth < MAX_FOLLOW_DEPTH
+                    && let Some(target) = resolve_lua_module(home, &file, &module)
+                {
+                    queue.push_back((target, depth + 1));
+                }
+            }
             for reference in path_references(line) {
                 if let Some(candidate) = candidate_for(home, &reference) {
-                    insert_candidate(dirs, candidate);
+                    // A reference into a container of independent configs
+                    // proposes the same per-config paths the allowlist would,
+                    // so a Hyprland line cannot reintroduce the parent that
+                    // `shell_candidates` just split up.
+                    let name = candidate
+                        .strip_prefix(".config/")
+                        .and_then(|rest| rest.split('/').next());
+                    if name == Some("quickshell") && candidate == ".config/quickshell" {
+                        for each in shell_candidates(&home.join(&candidate), name.unwrap_or("")) {
+                            insert_candidate(dirs, each);
+                        }
+                    } else {
+                        insert_candidate(dirs, candidate);
+                    }
                 }
                 if depth < MAX_FOLLOW_DEPTH
                     && (is_sourcey(line) || has_config_extension(&reference))
@@ -269,6 +431,49 @@ fn follow_hyprland_refs(
             }
         }
     }
+}
+
+/// What a config directory proposes, when that directory is a container of
+/// independently-switchable things rather than one rice's own files.
+///
+/// `~/.config/quickshell` is the case that matters: Quickshell keeps every
+/// shell in one directory, each its own config named by `-c`. Capturing the
+/// parent takes all of them at once, so the profile for one shell swallows
+/// every other — and two shells can never both be profiles, because whichever
+/// is captured second owns the path the first one needs. The same is true of
+/// any directory whose immediate children are each a complete config.
+///
+/// A child that holds QML at its top level is one, so the children are
+/// proposed instead of the parent. Anything else — a flat directory of this
+/// rice's own files — is proposed as itself, exactly as before.
+fn shell_candidates(dir: &Path, name: &str) -> Vec<String> {
+    let name = name.to_owned();
+    let mut children = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let Some(child) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let has_qml = std::fs::read_dir(entry.path()).is_ok_and(|files| {
+                files.flatten().any(|file| {
+                    file.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.ends_with(".qml"))
+                })
+            });
+            if has_qml {
+                children.push(format!(".config/{name}/{child}"));
+            }
+        }
+    }
+    if children.is_empty() {
+        return vec![format!(".config/{name}")];
+    }
+    children.sort();
+    children
 }
 
 /// Adds a proposed directory unless an entry already covers it — a reference
@@ -338,7 +543,19 @@ fn path_references(line: &str) -> Vec<String> {
 /// The service an `exec-once = <command>` line declares: the startup
 /// command, with the `pkill <name>` stop the manifest defaults to. A path
 /// rather than a bare command is a script, not a service.
+///
+/// `hl.exec_cmd("<command>")` — the lua-config equivalent, as a lua-configured
+/// desktop writes it — declares the same thing and is read the same way.
 fn exec_once_service(line: &str) -> Option<Service> {
+    if let Some(service) = ini_exec_once_service(line) {
+        return Some(service);
+    }
+    lua_exec_cmd_service(line)
+}
+
+/// The `exec-once = <command>` form: the marker must start a token of its own, so
+/// `hl.myexec-once` never reads as one.
+fn ini_exec_once_service(line: &str) -> Option<Service> {
     let marker = "exec-once";
     let index = line.find(marker)?;
     if index > 0 {
@@ -349,6 +566,35 @@ fn exec_once_service(line: &str) -> Option<Service> {
     }
     let rest = line[index + marker.len()..].trim_start();
     let rest = rest.strip_prefix('=')?.trim_start();
+    service_from_command(rest)
+}
+
+/// The `hl.exec_cmd("<command>")` form. The command is a single lua string, so
+/// it is read up to the closing quote rather than by whitespace — a quoted
+/// command is the only thing a lua config can pass here.
+///
+/// The marker is the `exec_cmd` of a method call, so the `.` in `hl.exec_cmd`
+/// is part of the syntax and not a reason to skip the line; only a longer
+/// identifier ending in the marker (`hl.myexec_cmd`) is.
+fn lua_exec_cmd_service(line: &str) -> Option<Service> {
+    let index = line.find("exec_cmd")?;
+    if index > 0 {
+        let previous = line.as_bytes()[index - 1];
+        if previous.is_ascii_alphanumeric() || previous == b'-' || previous == b'_' {
+            return None;
+        }
+    }
+    let rest = line[index + "exec_cmd".len()..].trim_start();
+    let rest = rest.strip_prefix('(')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    service_from_command(rest[..end].trim())
+}
+
+/// The `Service` a startup command declares: its own text as the start command,
+/// with the `pkill <name>` stop the manifest defaults to. A path rather than a
+/// bare command is a script, not a service.
+fn service_from_command(rest: &str) -> Option<Service> {
     let comment = rest.find(" #").unwrap_or(rest.len());
     let rest = rest[..comment].trim();
     if rest.is_empty() {

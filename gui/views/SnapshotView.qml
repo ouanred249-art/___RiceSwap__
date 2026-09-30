@@ -99,7 +99,7 @@ PanelView {
             return;
         }
         view.nameError = "";
-        if (view.shell.backend.runSnapshot(name)) {
+        if (view.shell.backend.runSnapshot(name, view.confirmedSelections().configs.concat(view.confirmedSelections().assets))) {
             // success is handled by the Connections below, which pops back to
             // Profiles on the new card.
         }

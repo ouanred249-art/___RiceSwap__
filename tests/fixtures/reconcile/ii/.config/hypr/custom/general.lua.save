@@ -1,0 +1,111 @@
+-- Glass-style blur tuning (saneAspect style, adapted to 0.56.2)
+-- After hyprland-git install, uncomment the variant block for video effects
+-- Variants: kawase, frost, ripple, drops, water, fluid_jar, prism,
+-- heat_shimmer, acrylic (liquid glass), aurora, haze
+hl.config({
+    decoration = {
+        rounding = 18,            -- corner radius (px)
+        rounding_power = 2.5,     -- 2 = circle-ish, 4 = squircle
+        blur = {
+            enabled = true,
+            passes = 1,           -- blur repetitions: 2=perf, 3=video smooth
+            size = 10,            -- blur kernel size; with passes, sets intensity
+            brightness = 0.8,     -- 0.2=very dark, 1.0=neutral, 1.8=light themes
+            contrast = 1,      -- 0.89 neutral (was 2.0 pop - too harsh for acrylic)
+            noise = 0,         -- 0=clean glass, 0.05=video texture
+            vibrancy = 0.35,       -- saturation of blurred colors (0-1)
+            vibrancy_darkness = 0.35,  -- how much vibrancy affects dark areas
+            xray = true,          -- true = blur shows through transparent term
+            new_optimizations = true,
+            popups = true,        -- video has popups blurred (was false)
+            special = false,      -- blur special workspaces (GPU heavy on 4K)
+            ignore_opacity = true, -- let blur ignore window opacity (key for terminals!)
+            -- === VIDEO VARIANTS (hyprland-git only, post Aug 22) ===
+            -- Uncomment after hyprland-git install:
+            -- variant = "acrylic", -- liquid-glass like video. Try: frost, haze, aurora
+            -- acrylic = {
+            --     refraction = 24,   -- 0-48 lens displacement
+            --     bulb = 48,         -- 4-256 curved edge width
+            --     clarity = 0.5,     -- 0-1 sharp backdrop (0.5 = vaxry demo)
+            --     aberration = 0.025,-- 0-0.25 chromatic separation
+            --     -- tint = "rgba(0addeeff)", -- optical absorption tint
+            -- },
+            -- glass = {
+            --     refraction = 20,
+            --     size = 40,
+            --     roughness = 1.0,
+            -- }, 
+        },
+    },
+})
+
+-- HyprGlass Liquid Glass (video style)
+if hl.plugin.hyprglass then
+    local hg = hl.plugin.hyprglass
+
+    hg.config({
+        default_theme = "dark",
+        default_preset = "glass",
+        tint_color = 0xffffff14,
+        brightness = 0.9,
+        dark = { brightness = 0.85 },
+        light = { adaptive_boost = 0.5 },
+        layers = { enabled = true },
+    })
+
+    -- Your layers (quickshell ii) -- waybar/swaync not installed here
+    hg.layer("quickshell:bar", { preset = "bar", mask_threshold = 0.05 })
+    hg.layer("quickshell:background", { preset = "subtle" })
+    hg.layer("quickshell:screenCorners", { preset = "glass" })
+    hg.layer("notifications", { preset = "frost" })
+
+    -- Apple Liquid Glass, like the video: solid glass block,
+    -- strong edge refraction + heavy chromatic aberration +
+    -- bright specular edge light, sharper backdrop
+    hg.preset("glass", {
+        glass_opacity = 2.0,
+        blur_strength = 1.2,
+        blur_iterations = 3,
+        refraction_strength = 0.85,
+        chromatic_aberration = 0.75,
+        fresnel_strength = 0.8,
+        specular_strength = 0.9,
+        edge_thickness = 0.08,
+        lens_distortion = 0.65,
+        tint_color = 0xffffff14,
+        dark = { brightness = 0.85, saturation = 0.9, adaptive_dim = 0.5 },
+        light = { brightness = 1.15, saturation = 0.9, adaptive_boost = 0.5 },
+    })
+
+    -- Apple light variant: brighter, airier daytime glass
+    hg.preset("apple", {
+        inherits = "glass",
+        glass_opacity = 0.68,
+        blur_strength = 1.0,
+        specular_strength = 1.0,
+        tint_color = 0xffffff22,
+        dark = { brightness = 0.9 },
+        light = { brightness = 1.22, adaptive_boost = 0.6 },
+    })
+
+    -- Frosted terminals / popups
+    hg.preset("frost", {
+        glass_opacity = 0.88,
+        blur_strength = 2.1,
+        refraction_strength = 0.5,
+        chromatic_aberration = 0.35,
+        fresnel_strength = 0.6,
+        specular_strength = 0.7,
+    })
+
+    -- Bar: minimal, keeps text readable
+    hg.preset("bar", {
+        inherits = "subtle",
+        glass_opacity = 0.92,
+        blur_strength = 1.3,
+        refraction_strength = 0.4,
+        chromatic_aberration = 0.3,
+        fresnel_strength = 0.45,
+    })
+end
+

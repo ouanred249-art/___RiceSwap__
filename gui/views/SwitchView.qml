@@ -36,7 +36,10 @@ PanelView {
     property bool servicesOpen: false
     property bool configsOpen: false
 
-    readonly property var planBlocked: planData !== null && planData.blocked_paths ? planData.blocked_paths : []
+    // Real files at a target path no longer stop the switch. The ones that
+    // differ from the profile are copied under the profile's `backups/` first,
+    // so this list is a promise about what is kept, not a wall.
+    readonly property var planBackedUp: planData !== null && planData.backed_up_paths ? planData.backed_up_paths : []
 
     readonly property var planInstall: {
         const install = planData && planData.package_diff && planData.package_diff.install ? planData.package_diff.install : {};
@@ -58,6 +61,14 @@ PanelView {
         const start = planData && planData.service_changes && planData.service_changes.start ? planData.service_changes.start : [];
         return start;
     }
+    // The shell swap is the one step that ends the running desktop, and a
+    // service diff cannot see it: both profiles record a `qs` service running
+    // the same command, so the service list is empty across a shell change.
+    // It gets its own line so the panel never shows "nothing to do" while the
+    // old shell is about to be killed.
+    readonly property string planShellStop: planData && planData.shell_change && planData.shell_change.stop ? planData.shell_change.stop : ""
+    readonly property string planShellStart: planData && planData.shell_change && planData.shell_change.start ? planData.shell_change.start : ""
+    readonly property var planRemoveProtected: planData && planData.remove_protected ? planData.remove_protected : []
     readonly property var planLink: planData && planData.symlink_changes ? planData.symlink_changes.link : []
     readonly property var planUnlink: planData && planData.symlink_changes ? planData.symlink_changes.unlink : []
 
@@ -75,6 +86,8 @@ PanelView {
             parts.push("stop " + stop + " service" + (stop === 1 ? "" : "s"));
         if (start > 0)
             parts.push("start " + start + " service" + (start === 1 ? "" : "s"));
+        if (planShellStop.length > 0)
+            parts.push("swap shell " + planShellStop + " → " + planShellStart);
         if (planLink.length > 0)
             parts.push("link " + planLink.length + " config path" + (planLink.length === 1 ? "" : "s"));
         if (planUnlink.length > 0)
@@ -96,12 +109,16 @@ PanelView {
     //
     //   1 verify the target profile
     //   2 compute the switch plan
-    //   3 activate the profile (flip `current`)
-    //   4 stop the old services
-    //   5 link the managed config paths
-    //   6 apply the package changes (install-first, then remove)
+    //   3 apply the package changes (install-first, then remove)
+    //   4 activate the profile (flip `current`)
+    //   5 stop the old services
+    //   6 link the managed config paths
     //   7 reload Hyprland
     //   8 start the new services
+    //
+    // The package changes come before the flip on purpose: pkexec prompts are
+    // answered by the polkit agent running inside the old shell's desktop, so
+    // asking for them after the shell is stopped guarantees a denial.
     //
     // The GUI pre-runs steps 1–2 as the separate `plan` operation, so the
     // list starts at step 3; live progress lines map onto it directly.
@@ -109,10 +126,10 @@ PanelView {
     readonly property var switchSteps: [
         "Verify the target profile",
         "Compute the switch plan",
+        "Apply package changes",
         "Activate the profile",
         "Stop old services",
         "Link managed config paths",
-        "Apply package changes",
         "Reload Hyprland",
         "Start new services"
     ]
@@ -204,12 +221,6 @@ PanelView {
         // an honest "cancelled" envelope with completed_steps + resume_hint.
         cancelling = true;
         shell.backend.cancelSwitch();
-    }
-
-    function snapshotFirst() {
-        // Chain into the snapshot flow; SnapshotView re-detects on open and
-        // this view re-plans when it comes back active.
-        shell.push("snapshot", null);
     }
 
     function finishSwitch() {
@@ -351,7 +362,7 @@ PanelView {
             Item {
                 width: confirmColumn.width
                 height: summaryText.implicitHeight + (summarySubText.implicitHeight > 0 ? summarySubText.implicitHeight + 4 : 0)
-                visible: view.planData !== null && view.planBlocked.length === 0
+                visible: view.planData !== null
 
                 Text {
                     id: summaryText
@@ -419,6 +430,39 @@ PanelView {
                             font.family: "monospace"
                         }
                     }
+                    // Foundation packages the leaving profile's manifest asked
+                    // to remove. The switch declines them without ever asking
+                    // pacman, so the panel says so rather than hiding it.
+                    Repeater {
+                        model: view.planRemoveProtected
+                        delegate: Text {
+                            text: "=  " + modelData + "   kept (system)"
+                            color: view.theme.muted
+                            font.pixelSize: 12
+                            font.family: "monospace"
+                        }
+                    }
+                }
+            }
+
+            // The shell swap, called out on its own rather than folded into the
+            // service counts: a shell is the one service whose loss is visible
+            // the instant it happens, and it is invisible to the service diff.
+            Column {
+                width: confirmColumn.width
+                visible: view.planData !== null && view.planShellStop.length > 0
+                spacing: 2
+
+                Text {
+                    text: "shell  " + view.planShellStop + "  →  " + view.planShellStart
+                    color: view.theme.accent
+                    font.pixelSize: 12
+                    font.family: "monospace"
+                }
+                Text {
+                    text: "your current desktop closes and " + view.planShellStart + " takes over"
+                    color: view.theme.muted
+                    font.pixelSize: 11
                 }
             }
 
@@ -512,26 +556,27 @@ PanelView {
                 }
             }
 
-            // Blocked paths → Snapshot first chain.
+            // Real files at a target path: the switch keeps them, so this is a
+            // note about what is preserved rather than a reason to stop.
             Column {
                 width: confirmColumn.width
-                visible: view.planBlocked.length > 0
+                visible: view.planBackedUp.length > 0
                 spacing: 8
 
                 Text {
                     width: parent.width
                     wrapMode: Text.WordWrap
-                    text: "These target paths hold real files that would be overwritten:"
-                    color: view.theme.danger
+                    text: "These files differ from the profile. They are copied into the profile's backups/ folder before the switch replaces them — nothing is lost."
+                    color: view.theme.muted
                     font.pixelSize: 13
                     font.bold: true
                 }
 
                 Repeater {
-                    model: view.planBlocked
+                    model: view.planBackedUp
                     delegate: Text {
                         text: "•  " + modelData
-                        color: view.theme.danger
+                        color: view.theme.muted
                         font.pixelSize: 12
                         font.family: "monospace"
                     }
@@ -540,37 +585,13 @@ PanelView {
                 Text {
                     width: parent.width
                     wrapMode: Text.WordWrap
-                    text: "Snapshot your current desktop first to adopt them into a profile, then come back and switch."
+                    text: "You can put any of them back afterwards from that folder."
                     color: view.theme.muted
                     font.pixelSize: 12
                 }
 
                 Row {
                     spacing: 10
-
-                    Rectangle {
-                        width: snapLabel.implicitWidth + 28
-                        height: 38
-                        radius: 8
-                        color: view.theme.surface
-                        border.width: 1
-                        border.color: view.theme.accent
-
-                        Text {
-                            id: snapLabel
-                            anchors.centerIn: parent
-                            text: "Snapshot first"
-                            color: view.theme.accent
-                            font.pixelSize: 13
-                            font.bold: true
-                        }
-
-                        MouseArea {
-                            anchors.fill: parent
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: view.snapshotFirst()
-                        }
-                    }
 
                     Rectangle {
                         width: cancelLabel.implicitWidth + 28
@@ -597,10 +618,10 @@ PanelView {
                 }
             }
 
-            // Switch now / Cancel — only when nothing blocks the switch.
+            // Switch now / Cancel.
             Row {
                 width: confirmColumn.width
-                visible: view.planData !== null && view.planBlocked.length === 0 && !view.planning
+                visible: view.planData !== null && !view.planning
                 spacing: 10
 
                 Rectangle {

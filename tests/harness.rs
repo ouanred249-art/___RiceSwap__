@@ -20,17 +20,25 @@ fn probe_args(tool: &str) -> &'static str {
     }
 }
 
-/// Every tool name gets an executable stub, and `PATH` finds it.
+/// Every probed tool gets an executable stub, `PATH` finds it, and `detect`
+/// gets a clean answer from all of them. The roster is what `detect` probes,
+/// not what the backend shells out to: `git` and `pi` are probe-ready ahead
+/// of the install commands that will call them.
 #[test]
-fn stubs_are_installed_for_every_tool_the_backend_shells_out_to() {
+fn every_probed_tool_gets_a_stub_and_probes_clean() {
     let sandbox = Sandbox::new();
-    sandbox.run(&["detect"]).assert_ok();
+    let data = sandbox.run(&["detect"]).assert_ok();
 
     for tool in STUB_TOOLS {
         assert!(
             sandbox.log_contains(&format!("{tool} {}", probe_args(tool))),
             "no stub invocation recorded for {tool}: {:?}",
             sandbox.log()
+        );
+        assert_eq!(
+            data["tools"][tool]["exit_code"],
+            json!(0),
+            "{tool} was not probed successfully"
         );
     }
 }
@@ -54,24 +62,49 @@ fn stub_log_records_invocations_in_order_with_arguments() {
     }
 }
 
-/// A stub scripted to fail makes the backend report it as unusable.
+/// A stub on the roster that no backend command calls is installed and
+/// scriptable, but never probed: `ydotool` is the seam the verification tier
+/// will drive, and until a command shells out to it there is nothing honest
+/// for `detect` to report about it.
 #[test]
-fn a_stub_scripted_to_fail_is_reported_as_unusable() {
+fn a_stub_no_backend_command_calls_is_installed_but_never_probed() {
     let sandbox = Sandbox::new();
-    sandbox.script("yay", Mode::Fail);
+    sandbox.script("ydotool", Mode::Fail);
+    let data = sandbox.run(&["detect"]).assert_ok();
+
+    assert!(
+        !data["tools"]
+            .as_object()
+            .expect("tools is a map")
+            .contains_key("ydotool"),
+        "an unprobed tool has no status: {data:?}"
+    );
+    assert!(
+        !sandbox.log_contains("ydotool"),
+        "nothing invoked it: {:?}",
+        sandbox.log()
+    );
+}
+
+/// One failed probe is a fact the envelope renders, not a run that fails:
+/// the tool reports exit 1, its neighbours stay clean, and exactly one
+/// warning names it. `bystander` is any other stub — its probe must stay 0.
+fn probe_failure_is_reported(tool: &str, bystander: &str) {
+    let sandbox = Sandbox::new();
+    sandbox.script(tool, Mode::Fail);
     let run = sandbox.run(&["detect"]);
     let data = run.assert_ok();
 
     assert_eq!(
-        data["tools"]["yay"]["available"],
+        data["tools"][tool]["available"],
         json!(true),
         "the stub still ran"
     );
-    assert_eq!(data["tools"]["yay"]["exit_code"], json!(1));
+    assert_eq!(data["tools"][tool]["exit_code"], json!(1));
     assert_eq!(
-        data["tools"]["pacman"]["exit_code"],
+        data["tools"][bystander]["exit_code"],
         json!(0),
-        "other stubs are unaffected"
+        "the probes beside it are unaffected"
     );
 
     let warnings = run.warnings();
@@ -81,10 +114,24 @@ fn a_stub_scripted_to_fail_is_reported_as_unusable() {
         "only the failed tool warns: {warnings:?}"
     );
     assert!(
-        warnings[0].contains("yay"),
+        warnings[0].contains(tool),
         "the warning names the tool: {}",
         warnings[0]
     );
+}
+
+/// A stub scripted to fail makes the backend report it as unusable.
+#[test]
+fn a_stub_scripted_to_fail_is_reported_as_unusable() {
+    probe_failure_is_reported("yay", "pacman");
+}
+
+/// The same for an install-tier tool: a `git` whose probe fails is recorded,
+/// not fatal. The install commands are what make `git` fatal, and they decide
+/// that for themselves.
+#[test]
+fn a_stub_scripted_to_fail_records_its_exit_without_failing_the_run() {
+    probe_failure_is_reported("git", "pi");
 }
 
 /// A stub scripted to conflict exits distinctly, so switch conflict fallbacks

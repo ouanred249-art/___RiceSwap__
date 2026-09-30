@@ -2,8 +2,8 @@
 //! between fixture profiles (install/remove/symlink/service sets and blocked
 //! paths), the locked switch sequence against stubbed pacman, the install-first
 //! conflict fallback, kept-package refusals, service-start warnings, SIGTERM
-//! cancellation at a step boundary, idempotent re-runs, and the refusal to
-//! ever clobber a real file.
+//! cancellation at a step boundary, idempotent re-runs, and the preservation of
+//! a real file the switch is about to replace.
 
 mod common;
 
@@ -177,16 +177,36 @@ fn plan_between_fixture_profiles_reports_the_diff_and_blocked_paths() {
         "the live managed paths are symlinks, not real files"
     );
 
-    // A real file where beta wants a symlink is flagged, never planned over.
+    // A real file where beta wants a symlink is flagged, and the plan says which
+    // side of the identical/backed-up split it falls on.
     sandbox.write_home(".config/kitty", "my own kitty config\n");
     let data = sandbox.run(&["plan", "beta"]).assert_ok();
     assert_eq!(data["blocked_paths"], json!([".config/kitty"]));
+    assert_eq!(data["backed_up_paths"], json!([".config/kitty"]));
+    assert_eq!(data["identical_paths"], json!([]));
 
     // A missing target refuses through the failed envelope, naming it.
     let message = sandbox.run(&["plan", "ghost"]).assert_failed();
     assert!(
         message.contains("ghost"),
         "the refusal must name the profile: {message}"
+    );
+
+    // A first switch has no active manifest, so the package diff names every
+    // declared package. `install_missing` is that set against what the machine
+    // actually has — the honest count, and what a profile carrying a real
+    // rice's dependency list is really asking for.
+    sandbox.mark_installed("newbar");
+    let data = sandbox.run(&["plan", "beta"]).assert_ok();
+    assert_eq!(
+        data["package_diff"]["install"],
+        json!({ "official": ["newbar"], "aur": ["newaur"] }),
+        "the diff stays manifest-to-manifest: {data}"
+    );
+    assert_eq!(
+        data["install_missing"],
+        json!({ "official": [], "aur": ["newaur"] }),
+        "only the package the machine lacks is reported missing: {data}"
     );
 
     for line in sandbox.log() {
@@ -198,10 +218,13 @@ fn plan_between_fixture_profiles_reports_the_diff_and_blocked_paths() {
 }
 
 /// Class: the switch sequence. Against stubbed pacman the switch executes the
-/// locked order — stop A's services, install B while A's packages are still
-/// present, remove A-unique with plain `pacman -R`, reload Hyprland, start
-/// B's services — verified through the stub log, and the report names what
-/// happened.
+/// locked order — install B while A's packages are still present, remove
+/// A-unique with plain `pacman -R`, only then stop A's services, flip
+/// symlinks, reload Hyprland, start B's services — verified through the stub
+/// log, and the report names what happened. The package ops lead because they
+/// authenticate through the still-running old desktop: its polkit agent is
+/// what answers a `pkexec` prompt, and a switch that stopped the shell first
+/// can only be denied.
 #[test]
 fn switch_runs_the_locked_sequence_in_order() {
     let sandbox = Sandbox::new();
@@ -231,22 +254,29 @@ fn switch_runs_the_locked_sequence_in_order() {
     let sequence: Vec<String> = locked_commands(&sandbox)
         .into_iter()
         .filter(|line| {
-            !(line.ends_with("--version") || line.ends_with("-h") || line.ends_with(" version"))
+            // `pacman -T` (what the machine already satisfies) and `pacman -Qi`
+            // (still-needed pre-filter) are read-only queries; like the probes
+            // they are not part of the locked sequence.
+            !(line.ends_with("--version")
+                || line.ends_with("-h")
+                || line.ends_with(" version")
+                || line.starts_with("pacman -T")
+                || line.starts_with("pacman -Qi "))
         })
         .collect();
     assert_eq!(
         sequence,
         [
-            "pkill waybar",
             "pacman -S --noconfirm newbar",
             "yay -S --noconfirm newaur",
-            "pacman -R --noconfirm oldbar",
-            "pacman -R --noconfirm oldaur",
+            "pacman -R --noconfirm oldbar oldaur",
+            "pkill waybar",
             "hyprctl reload",
             "ags",
         ],
-        "the locked sequence: stop A's services, install-first, plain -R, \
-         hyprctl reload, start B's services"
+        "the locked sequence: batched installs, one batched plain -R while the \
+         old desktop can still authenticate, then stop A's services, hyprctl \
+         reload, start B's services"
     );
     assert!(
         sandbox
@@ -285,9 +315,254 @@ fn switch_runs_the_locked_sequence_in_order() {
     );
 }
 
-/// Class: conflict fallback. A declared pacman conflict on an install removes
-/// just the conflicting A-package, retries the install, and the switch
-/// completes.
+/// Class: real directories at managed paths. The fixture above symlinks the
+/// managed paths the way an activated profile leaves them, which is the only
+/// shape the old `remove_file` could clear. A machine that has never switched —
+/// or whose config is a plain directory — is the other case, and it used to
+/// report a successful switch that changed nothing.
+#[test]
+fn a_real_directory_at_a_managed_path_is_replaced_by_the_symlink() {
+    let sandbox = Sandbox::new();
+    fixture(&sandbox);
+
+    // Put the live tree back the way a fresh machine has it: real directories,
+    // not links. This is the state the original code silently no-opped on.
+    fs::remove_file(sandbox.home().join(".config/waybar")).expect("drop the waybar link");
+    fs::remove_file(sandbox.home().join(".config/hypr")).expect("drop the hypr link");
+    fs::create_dir_all(sandbox.home().join(".config/waybar")).expect("real waybar dir");
+    fs::write(
+        sandbox.home().join(".config/waybar/config.jsonc"),
+        "{ \"rice\": \"live\" }\n",
+    )
+    .expect("real waybar config");
+    fs::create_dir_all(sandbox.home().join(".config/hypr")).expect("real hypr dir");
+    fs::write(
+        sandbox.home().join(".config/hypr/hyprland.conf"),
+        "exec-once = waybar\n",
+    )
+    .expect("real hypr config");
+    sandbox.clear_log();
+
+    let data = sandbox.run(&["switch", "beta"]).assert_ok();
+
+    assert_eq!(
+        fs::read_link(sandbox.home().join(".config/waybar")).ok(),
+        Some(sandbox.profile_dir("beta").join(".config/waybar")),
+        "the real directory is replaced by a link into the target profile"
+    );
+    assert!(
+        data["report"]["linked"]
+            .as_array()
+            .expect("linked is a list")
+            .contains(&json!(".config/waybar")),
+        "a path that really linked is reported as linked"
+    );
+    assert_eq!(
+        fs::read_to_string(sandbox.home().join(".config/waybar/config.jsonc"))
+            .expect("read through the new link"),
+        "{ \"rice\": \"beta\" }\n",
+        "the link resolves into the target profile, not the old directory"
+    );
+    assert!(
+        fs::symlink_metadata(sandbox.home().join(".config/hypr")).is_err(),
+        "an unlinked real directory is cleared, not left behind"
+    );
+}
+
+/// A real *file* at a managed path is user data, so it is never destroyed: a
+/// file the profile does not already hold byte for byte is preserved under the
+/// profile's `backups/` before the symlink goes in.
+#[test]
+fn a_real_file_is_backed_up_before_a_managed_path_replaces_it() {
+    let sandbox = Sandbox::new();
+    fixture(&sandbox);
+
+    fs::remove_file(sandbox.home().join(".config/waybar")).expect("drop the waybar link");
+    fs::write(sandbox.home().join(".config/waybar"), "not a directory\n")
+        .expect("a real file where a config dir belongs");
+
+    let data = sandbox.run(&["switch", "beta"]).assert_ok();
+
+    assert_eq!(
+        data["report"]["backed_up"],
+        json!([".config/waybar"]),
+        "the report names what it preserved: {data}"
+    );
+    assert_eq!(
+        fs::read_to_string(sandbox.profile_dir("beta").join("backups/.config/waybar"))
+            .expect("the user's file is kept under the profile"),
+        "not a directory\n",
+        "the backup holds the bytes that were there before the switch"
+    );
+    assert!(
+        fs::symlink_metadata(sandbox.home().join(".config/waybar"))
+            .expect("the path is linked now")
+            .file_type()
+            .is_symlink(),
+        "the managed path is the profile's own copy again"
+    );
+    assert_eq!(sandbox.current_target(), Some(sandbox.profile_dir("beta")));
+}
+
+/// A file the profile already holds byte for byte carries no information the
+/// profile does not have, so it is linked with no backup and no report entry.
+/// This is the common case for a shell rc the snapshot copied straight back.
+#[test]
+fn a_real_file_identical_to_the_profile_links_without_a_backup() {
+    let sandbox = Sandbox::new();
+    sandbox.write_profile(
+        "prompt",
+        &profile_toml("prompt", &[], &[], &[], &[".config/starship.toml"]),
+    );
+    sandbox.write_profile_file("prompt", ".config/starship.toml", "add_newline = true\n");
+    // The live file is the same bytes, but a real file rather than a link.
+    sandbox.write_home(".config/starship.toml", "add_newline = true\n");
+
+    let plan = sandbox.run(&["plan", "prompt"]).assert_ok();
+    assert_eq!(
+        plan["identical_paths"],
+        json!([".config/starship.toml"]),
+        "plan separates the identical from the ones it would keep: {plan}"
+    );
+    assert_eq!(plan["backed_up_paths"], json!([]), "{plan}");
+
+    let data = sandbox.run(&["switch", "prompt"]).assert_ok();
+    assert_eq!(data["report"]["backed_up"], json!([]), "{data}");
+    assert!(
+        !sandbox.profile_dir("prompt").join("backups").exists(),
+        "nothing differed, so nothing was copied"
+    );
+}
+
+/// A nested real file keeps its shape under `backups/`, so the restore path is
+/// the same path the user had.
+#[test]
+fn a_nested_real_file_is_backed_up_at_a_nested_path() {
+    let sandbox = Sandbox::new();
+    sandbox.write_profile(
+        "prompt",
+        &profile_toml(
+            "prompt",
+            &[],
+            &[],
+            &[],
+            &[".config/starship.toml", ".config/kitty"],
+        ),
+    );
+    sandbox.write_profile_file("prompt", ".config/starship.toml", "from the profile\n");
+    sandbox.write_profile_file("prompt", ".config/kitty/kitty.conf", "font 12\n");
+    sandbox.write_home(".config/starship.toml", "my own prompt\n");
+
+    let data = sandbox.run(&["switch", "prompt"]).assert_ok();
+
+    assert_eq!(
+        data["report"]["backed_up"],
+        json!([".config/starship.toml"])
+    );
+    assert_eq!(
+        fs::read_to_string(
+            sandbox
+                .profile_dir("prompt")
+                .join("backups/.config/starship.toml")
+        )
+        .expect("nested backup"),
+        "my own prompt\n"
+    );
+}
+
+/// Switching twice over the same path must not overwrite the first backup:
+/// the first switch's copy is the one the user would go back to.
+#[test]
+fn a_second_switch_keeps_the_first_backup() {
+    let sandbox = Sandbox::new();
+    fixture(&sandbox);
+    let backups = sandbox.profile_dir("beta").join("backups/.config/waybar");
+
+    for content in ["first\n", "second\n"] {
+        fs::remove_file(sandbox.home().join(".config/waybar")).ok();
+        fs::write(sandbox.home().join(".config/waybar"), content).expect("a real file");
+        sandbox.run(&["switch", "beta"]).assert_ok();
+    }
+
+    let kept: Vec<String> = fs::read_dir(backups.parent().expect("the backups dir"))
+        .expect("backups exist")
+        .map(|entry| {
+            entry
+                .expect("a directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(kept.len(), 2, "both copies are kept: {kept:?}");
+    assert_eq!(
+        fs::read_to_string(&backups).expect("the first backup is intact"),
+        "first\n",
+        "the earlier backup is the one the user had first"
+    );
+}
+
+/// A nested managed path — a profile that owns `.config/quickshell/caelestia`
+/// rather than all of `.config/quickshell` — links even when the parent holds
+/// unrelated siblings that must survive.
+#[test]
+fn a_nested_managed_path_links_without_disturbing_its_siblings() {
+    let sandbox = Sandbox::new();
+    sandbox.write_profile(
+        "nested",
+        &profile_toml("nested", &[], &[], &[], &[".config/quickshell/caelestia"]),
+    );
+    sandbox.write_profile_file(
+        "nested",
+        ".config/quickshell/caelestia/shell.qml",
+        "Shell { }\n",
+    );
+    // A sibling shell the profile does not claim.
+    fs::create_dir_all(sandbox.home().join(".config/quickshell/ii")).expect("sibling dir");
+    fs::write(
+        sandbox.home().join(".config/quickshell/ii/shell.qml"),
+        "Sibling { }\n",
+    )
+    .expect("sibling config");
+    fs::create_dir_all(sandbox.home().join(".config/quickshell/caelestia"))
+        .expect("a real dir where the nested profile belongs");
+    fs::write(
+        sandbox
+            .home()
+            .join(".config/quickshell/caelestia/shell.qml"),
+        "Live { }\n",
+    )
+    .expect("live nested config");
+
+    sandbox.run(&["switch", "nested"]).assert_ok();
+
+    assert_eq!(
+        fs::read_link(sandbox.home().join(".config/quickshell/caelestia")).ok(),
+        Some(
+            sandbox
+                .profile_dir("nested")
+                .join(".config/quickshell/caelestia")
+        ),
+        "the nested path is linked into the profile"
+    );
+    assert_eq!(
+        fs::read_to_string(sandbox.home().join(".config/quickshell/ii/shell.qml"))
+            .expect("sibling survives"),
+        "Sibling { }\n",
+        "a path the profile does not manage is never touched"
+    );
+    assert_eq!(
+        fs::read_to_string(
+            sandbox
+                .home()
+                .join(".config/quickshell/caelestia/shell.qml")
+        )
+        .expect("read through the link"),
+        "Shell { }\n",
+        "the nested link resolves into the profile"
+    );
+}
+
 #[test]
 fn a_declared_package_conflict_removes_the_conflicting_package_and_retries() {
     let sandbox = Sandbox::new();
@@ -342,8 +617,133 @@ fn a_declared_package_conflict_removes_the_conflicting_package_and_retries() {
     assert_eq!(sandbox.state()["active_profile"], json!("beta"));
 }
 
-/// Class: kept packages. A "still needed" refusal is logged as kept, the
-/// switch continues, and removals never use `-Rs`/`-Rdd`.
+/// Class: a declined removal is trivia, not a verdict. A removal that fails
+/// outright — the shape a polkit denial has, and exactly how one real switch
+/// aborted with a bare desktop — keeps the package, warns, and the switch
+/// finishes all ten steps with the new desktop up. A stray installed package
+/// must never cost the user their shell.
+#[test]
+fn a_denied_removal_is_kept_and_the_switch_finishes() {
+    let sandbox = Sandbox::new();
+    fixture(&sandbox);
+    // Only removals through pkexec fail; installs authenticate fine.
+    sandbox.fail_on("pkexec", "-R");
+    sandbox.clear_log();
+
+    let run = sandbox.run(&["switch", "beta"]);
+    let data = run.assert_ok();
+
+    assert_eq!(data["completed_steps"], json!(10));
+    assert_eq!(
+        data["report"]["kept"],
+        json!(["oldbar", "oldaur"]),
+        "a package pacman would not remove is reported as kept"
+    );
+    assert_eq!(data["report"]["removed"], json!([]));
+    assert!(
+        run.warnings()
+            .iter()
+            .all(|warning| warning.contains("kept:")),
+        "the decline surfaces as kept-warnings, never an abort: {:?}",
+        run.warnings()
+    );
+    assert!(
+        sandbox.log_contains("hyprctl reload"),
+        "the switch went on to finish the desktop: {:?}",
+        sandbox.log()
+    );
+    assert_eq!(data["report"]["shell_started"], json!(null));
+    assert_eq!(data["report"]["services_started"], json!(["ags"]));
+    assert_eq!(sandbox.current_target(), Some(sandbox.profile_dir("beta")));
+}
+
+/// Class: a dead polkit agent must not strand the switch. Every password
+/// typed into a dialog no agent listens to comes back `Not authorized` —
+/// exactly how one real switch died at step 3 over a single `neovim`, while
+/// the user's terminal was the one place the same password still works. A
+/// refused `pkexec` transaction is therefore retried through `sudo`; the
+/// switch completes, and the retry says so on stderr.
+#[test]
+fn a_refused_pkexec_transaction_falls_back_to_sudo_and_the_switch_finishes() {
+    let sandbox = Sandbox::new();
+    fixture(&sandbox);
+    // The dead agent: pkexec answers its version probe (the tool is
+    // detected) and refuses every transaction with polkit's own words.
+    sandbox.script("pkexec", Mode::Denied);
+    sandbox.clear_log();
+
+    let run = sandbox.run(&["switch", "beta"]);
+    let data = run.assert_ok();
+
+    assert_eq!(data["completed_steps"], json!(10));
+    assert_eq!(
+        data["report"]["installed"],
+        json!(["newbar", "newaur"]),
+        "the refused official install landed through the terminal path: {data}"
+    );
+
+    let log = sandbox.log();
+    assert!(
+        log.iter()
+            .any(|line| line.trim_start().starts_with("pkexec pacman -S")),
+        "polkit was asked first, as always: {log:?}"
+    );
+    assert!(
+        log.iter()
+            .any(|line| line.trim_start().starts_with("sudo pacman -S")),
+        "the refusal was retried through sudo, not fatal: {log:?}"
+    );
+    assert!(
+        run.stderr.contains("polkit refused") && run.stderr.contains("sudo"),
+        "the fallback is announced where the terminal user sees it: {:?}",
+        run.stderr
+    );
+    assert_eq!(sandbox.current_target(), Some(sandbox.profile_dir("beta")));
+}
+
+/// The fallback is one chance, not a habit. When sudo is refused too — both
+/// elevators dead — the switch stops package ops exactly where it used to,
+/// and every later transaction is spared a prompt that cannot land: the
+/// password storm was the original complaint, and a double refusal must not
+/// re-raise it one prompt per package.
+#[test]
+fn a_double_refusal_stops_package_ops_without_repeated_prompts() {
+    let sandbox = Sandbox::new();
+    fixture(&sandbox);
+    sandbox.script("pkexec", Mode::Denied);
+    sandbox.script("sudo", Mode::Denied);
+    sandbox.clear_log();
+
+    let run = sandbox.run(&["switch", "beta"]);
+    let error = run.assert_failed();
+
+    assert!(
+        error.contains("Not authorized"),
+        "the original polkit verdict is what the failure names: {error}"
+    );
+    let pkexec_installs = sandbox
+        .log()
+        .iter()
+        .filter(|line| line.trim_start().starts_with("pkexec pacman -S"))
+        .count();
+    let sudo_installs = sandbox
+        .log()
+        .iter()
+        .filter(|line| line.trim_start().starts_with("sudo pacman -S"))
+        .count();
+    assert!(
+        sudo_installs <= 1,
+        "one sudo attempt, remembered as failed — never a prompt per package: \
+         {:?}",
+        sandbox.log()
+    );
+    assert!(
+        pkexec_installs <= 1,
+        "and polkit is not re-asked once both paths are known dead either: \
+         {:?}",
+        sandbox.log()
+    );
+}
 #[test]
 fn a_still_needed_refusal_is_kept_and_removals_are_plain_r() {
     let sandbox = Sandbox::new();
@@ -527,8 +927,9 @@ fn sigterm_stops_at_the_next_step_boundary_and_a_reshwitch_recovers() {
     let data = &envelope["data"];
     assert_eq!(
         data["completed_steps"],
-        json!(7),
-        "steps 1-7 finished; nothing after the package step ran: {data}"
+        json!(4),
+        "verify, plan and both package steps finished; the switch stopped \
+         before the flip and touched nothing else: {data}"
     );
     assert_eq!(data["resume_hint"], json!("switch to `beta` to restore"));
     assert!(
@@ -548,12 +949,21 @@ fn sigterm_stops_at_the_next_step_boundary_and_a_reshwitch_recovers() {
         "the package step finished its removals: {log:?}"
     );
     assert!(
+        !log.iter().any(|line| line.contains("pkill waybar")),
+        "the cancellation came before the flip, so nothing was stopped: {log:?}"
+    );
+    assert!(
         !sandbox.log_contains("hyprctl reload"),
         "no step starts after cancellation: {log:?}"
     );
     assert!(
         !log.iter().any(|line| line.trim_end() == "ags"),
         "services are not started after cancellation: {log:?}"
+    );
+    assert_eq!(
+        sandbox.current_target(),
+        Some(sandbox.profile_dir("alpha")),
+        "cancelling after the package steps leaves `current` on the old profile"
     );
 
     // Re-switch is the recovery: the same switch completes the sequence.
@@ -619,65 +1029,53 @@ fn switch_is_idempotent_a_second_run_ends_in_the_same_state() {
     assert_eq!(sandbox.state()["active_profile"], json!("beta"));
 }
 
-/// Class: blocked paths. A real file at a target path is flagged by `plan`
-/// and `switch` refuses before touching anything — no flip, no symlinks, no
-/// pacman, no services, and the file itself untouched.
+/// Class: blocked paths. A real file at a target path is reported by `plan` and
+/// preserved by `switch` — the bytes survive under the profile's `backups/`, the
+/// switch carries on to completion, and the report names what it kept. This is
+/// what makes a switch possible at all on a machine that has never switched: a
+/// real `$HOME` always has a `.bashrc`.
 #[test]
-fn a_real_file_at_a_target_path_blocks_plan_and_switch_refuses_before_touching() {
+fn a_real_file_at_a_target_path_is_preserved_and_the_switch_completes() {
     let sandbox = Sandbox::new();
     fixture(&sandbox);
     let kitty = sandbox.write_home(".config/kitty", "my own kitty config\n");
 
     let plan = sandbox.run(&["plan", "beta"]).assert_ok();
     assert_eq!(plan["blocked_paths"], json!([".config/kitty"]));
-    sandbox.clear_log();
-    let before = sandbox.home_tree();
+    assert_eq!(
+        plan["backed_up_paths"],
+        json!([".config/kitty"]),
+        "plan says which files it would keep: {plan}"
+    );
+    assert_eq!(plan["identical_paths"], json!([]), "{plan}");
 
     let run = sandbox.run(&["switch", "beta"]);
-    let envelope = run.envelope();
-    assert_eq!(envelope["ok"], json!(false), "{}", run.stdout);
-    let data = &envelope["data"];
-    let message = data["error"]
-        .as_str()
-        .expect("failed envelope carries an error")
-        .to_string();
-    assert!(
-        message.contains(".config/kitty"),
-        "the refusal must name the blocked path: {message}"
-    );
-    assert!(
-        message.contains("snapshot"),
-        "the refusal points at the adoption path: {message}"
-    );
-    assert_eq!(data["completed_steps"], json!(2), "{data}");
-    assert_eq!(data["resume_hint"], json!("switch to `beta` to restore"));
+    let data = run.assert_ok();
+    run.assert_no_panic();
 
     assert_eq!(
-        sandbox.current_target(),
-        Some(sandbox.profile_dir("alpha")),
-        "a refused switch never flips `current`"
-    );
-    assert_eq!(sandbox.state()["active_profile"], json!("alpha"));
-    assert_eq!(
-        sandbox.home_tree(),
-        before,
-        "a refused switch changes nothing under the fake $HOME"
-    );
-    let metadata = fs::symlink_metadata(&kitty).expect("the real file is still there");
-    assert!(
-        !metadata.file_type().is_symlink(),
-        "real files are never clobbered"
+        data["report"]["backed_up"],
+        json!([".config/kitty"]),
+        "the report names the preserved path: {data}"
     );
     assert_eq!(
-        fs::read_to_string(&kitty).expect("read the real file"),
-        "my own kitty config\n"
+        fs::read_to_string(sandbox.profile_dir("beta").join("backups/.config/kitty"))
+            .expect("the real file's bytes are kept"),
+        "my own kitty config\n",
+        "real files are never lost"
     );
     assert!(
-        sandbox.log().is_empty(),
-        "a refused switch never reaches pacman or the services: {:?}",
-        sandbox.log()
+        fs::symlink_metadata(&kitty)
+            .expect("the path is linked now")
+            .file_type()
+            .is_symlink()
     );
-    run.assert_no_panic();
+    assert_eq!(sandbox.current_target(), Some(sandbox.profile_dir("beta")));
+    assert_eq!(sandbox.state()["active_profile"], json!("beta"));
+    assert!(
+        !kitty.to_string_lossy().is_empty(),
+        "the switch ran to the end, not a refusal"
+    );
 }
 
 /// Class: live warnings (ticket #19). Warnings reach the panel as they
@@ -728,7 +1126,7 @@ fn warnings_stream_inline_as_they_arrive_and_still_close_the_envelope() {
     assert_eq!(streamed[0]["operation"], json!("switch"));
     assert_eq!(
         streamed[0]["step"],
-        json!(6),
+        json!(3),
         "the kept note arrives on the package step: {streamed:?}"
     );
     assert!(
@@ -781,6 +1179,46 @@ fn warnings_stream_inline_as_they_arrive_and_still_close_the_envelope() {
     between("starting new services", run.lines.len() - 1, "`ags`");
 }
 
+/// Class: package scope. A first switch has no active profile, so the
+/// manifest-to-manifest diff reports every declared package as an install.
+/// Installing the ones the machine already has is not merely wasted: a
+/// 22-package batch that is already on disk is a doomed transaction and wasted
+/// work. The machine is the other half of the question.
+#[test]
+fn a_first_switch_installs_only_the_packages_the_machine_lacks() {
+    let sandbox = Sandbox::new();
+    fixture(&sandbox);
+    // Every package both fixtures declare is already on this machine.
+    for package in ["oldbar", "shared", "newbar", "oldaur", "newaur"] {
+        sandbox.mark_installed(package);
+    }
+    // No active profile: this is the first switch, where the raw diff would
+    // call all of beta's packages an install.
+    let _ = fs::remove_file(sandbox.data_dir().join("current"));
+    sandbox.clear_log();
+
+    let data = sandbox.run(&["switch", "beta"]).assert_ok();
+
+    assert_eq!(
+        data["report"]["installed"],
+        json!([]),
+        "nothing needs installing, so nothing is reported installed: {}",
+        data["report"]
+    );
+    for line in sandbox.log() {
+        assert!(
+            !line.contains(" -S --noconfirm"),
+            "an already-installed package must not be reinstalled — that is a password prompt per package: {line}"
+        );
+        // `pkexec --version` is a tool probe, not a transaction: polkit does
+        // not authenticate it. Only a real package op must be absent.
+        assert!(
+            !(line.starts_with("pkexec ") && !line.contains("--version")),
+            "no password prompt at all when there is nothing to install: {line}"
+        );
+    }
+}
+
 /// Class: the confirmation is read-only (ticket #19). The plan behind the
 /// confirm view probes tools and computes a diff; it changes nothing under
 /// `$HOME` and never reaches a transaction — so Cancel, which only pops the
@@ -812,8 +1250,890 @@ fn the_confirmation_plan_is_read_only_so_cancel_aborts_before_anything_runs() {
     );
     for line in sandbox.log() {
         assert!(
-            line.ends_with("--version"),
-            "plan only probes tools, never transacts: {line}"
+            line.starts_with("pacman -T") || line.ends_with("--version"),
+            "plan only probes tools and asks pacman what is installed, never transacts: {line}"
+        );
+        assert!(
+            !line.starts_with("pkexec "),
+            "a preview must never ask for a password: {line}"
         );
     }
+}
+
+/// Class: the shell swap. A desktop shell is a service like any other, and a
+/// service diff cannot see that two profiles hold *different* shells — both
+/// record a `qs` service whose command is the identical string
+/// `qs -c $qsConfig`, so the names match, the strings match, and the diff
+/// concludes nothing happened. It did not stop the old shell. The `[shell]`
+/// table is what says `ii` and `caelestia` differ.
+///
+/// The fixture is the real one: identical `qs` service in both profiles,
+/// different `[shell]` names.
+fn shell_fixture(sandbox: &Sandbox) {
+    let service = ("qs", "qs -c $qsConfig", "pkill qs");
+    sandbox.write_profile(
+        "ii",
+        &common::profile_toml_with_shell(
+            "ii",
+            &[],
+            &[],
+            &[service],
+            &[".config/quickshell/ii"],
+            ("ii", "qs -c ii", "pkill qs"),
+        ),
+    );
+    sandbox.write_profile(
+        "caelestia",
+        &common::profile_toml_with_shell(
+            "caelestia",
+            &[],
+            &[],
+            &[service],
+            &[".config/quickshell/caelestia"],
+            ("caelestia", "qs -c caelestia", "pkill qs"),
+        ),
+    );
+    sandbox.activate("ii");
+}
+
+#[test]
+fn switching_between_two_shells_stops_the_old_one_and_starts_the_new_one() {
+    let sandbox = Sandbox::new();
+    shell_fixture(&sandbox);
+    sandbox.clear_log();
+
+    let data = sandbox.run(&["switch", "caelestia"]).assert_ok();
+
+    // The report names the shell by name, both ways. This is the assertion the
+    // whole feature exists for: a service diff reports nothing here.
+    assert_eq!(data["report"]["shell_stopped"], json!("ii"));
+    assert_eq!(data["report"]["shell_started"], json!("caelestia"));
+
+    // The stop runs the *leaving* profile's command and the start runs the
+    // *entering* profile's, each with its shell spelled out rather than read
+    // from an environment variable that says `ii`.
+    assert!(
+        sandbox.log_contains("pkill qs"),
+        "the old shell is stopped: {:?}",
+        sandbox.log()
+    );
+    assert!(
+        sandbox.log_contains("qs -c caelestia"),
+        "the new shell is started by name, not via $qsConfig: {:?}",
+        sandbox.log()
+    );
+    assert!(
+        !sandbox.log_contains("qs -c $qsConfig"),
+        "the switch never runs the env-dependent command: {:?}",
+        sandbox.log()
+    );
+}
+
+#[test]
+fn switching_to_a_profile_with_the_same_shell_restarts_nothing() {
+    let sandbox = Sandbox::new();
+    shell_fixture(&sandbox);
+    // A second profile wearing the same shell: a settings change, not a
+    // desktop change. The shell is already right, so restarting it would drop
+    // the user's session for nothing.
+    sandbox.write_profile(
+        "ii-tweaked",
+        &common::profile_toml_with_shell(
+            "ii-tweaked",
+            &[],
+            &[],
+            &[("qs", "qs -c $qsConfig", "pkill qs")],
+            &[".config/quickshell/ii"],
+            ("ii", "qs -c ii", "pkill qs"),
+        ),
+    );
+    sandbox.clear_log();
+
+    let data = sandbox.run(&["switch", "ii-tweaked"]).assert_ok();
+
+    assert_eq!(data["report"]["shell_stopped"], Value::Null);
+    assert_eq!(data["report"]["shell_started"], Value::Null);
+    assert!(
+        !sandbox.log_contains("pkill qs"),
+        "the same shell is left running: {:?}",
+        sandbox.log()
+    );
+}
+
+#[test]
+fn a_profile_with_no_shell_leaves_the_running_one_alone() {
+    let sandbox = Sandbox::new();
+    shell_fixture(&sandbox);
+    // A profile that names no shell has no opinion about the one running —
+    // a theme tweak, a keybind change. Ending the desktop because such a
+    // profile was activated would be a switch that breaks the machine.
+    sandbox.write_profile(
+        "plain",
+        &common::profile_toml(
+            "plain",
+            &[],
+            &[],
+            &[("qs", "qs -c $qsConfig", "pkill qs")],
+            &[],
+        ),
+    );
+    sandbox.clear_log();
+
+    let data = sandbox.run(&["switch", "plain"]).assert_ok();
+
+    assert_eq!(data["report"]["shell_stopped"], Value::Null);
+    assert_eq!(data["report"]["shell_started"], Value::Null);
+    assert!(
+        !sandbox.log_contains("pkill qs"),
+        "no shell is named, so none is ended: {:?}",
+        sandbox.log()
+    );
+}
+
+#[test]
+fn plan_reports_the_shell_change_before_anything_runs() {
+    let sandbox = Sandbox::new();
+    shell_fixture(&sandbox);
+    sandbox.clear_log();
+
+    let data = sandbox.run(&["plan", "caelestia"]).assert_ok();
+
+    // The service diff alone says nothing changed. The shell diff is the only
+    // thing in the payload that tells the panel a desktop is about to end, so
+    // it has to be there before the user commits.
+    assert_eq!(data["service_changes"]["stop"], json!([]));
+    assert_eq!(data["service_changes"]["start"], json!([]));
+    assert_eq!(data["shell_change"]["stop"], json!("ii"));
+    assert_eq!(data["shell_change"]["start"], json!("caelestia"));
+    assert!(
+        !sandbox.log_contains("pkill qs"),
+        "the preview stops nothing: {:?}",
+        sandbox.log()
+    );
+}
+
+#[test]
+fn the_shell_starts_after_the_reload_so_it_reads_the_new_config() {
+    let sandbox = Sandbox::new();
+    shell_fixture(&sandbox);
+    sandbox.clear_log();
+    let log_path = sandbox.log_path();
+
+    sandbox.run(&["switch", "caelestia"]).assert_ok();
+    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    let reload = log
+        .lines()
+        .position(|line| line.contains("hyprctl reload"))
+        .expect("the reload runs");
+    let start = log
+        .lines()
+        .position(|line| line.contains("qs -c caelestia"))
+        .expect("the shell starts");
+
+    // A shell that comes up before the reload reads the old config and keeps
+    // it — the exact half-switched state that started this.
+    assert!(
+        start > reload,
+        "the shell must start after the reload, not before:\n{log}"
+    );
+}
+
+/// Class: the shell swap, and what a shell that will not start means.
+///
+/// This test was `a_shell_that_will_not_start_warns_without_failing_the_switch`,
+/// and it asserted the warning-only outcome: at step 10 the packages, the links
+/// and the config were all correct, so failing there would have reported a
+/// broken profile for a shell that was merely not up yet. That reasoning is
+/// sound *for a step* — and issue #39 moved the question one level out. A switch
+/// that activated a profile and left no desktop behind it has not worked, so the
+/// shell check is now the first Tier C check, and a start that was attempted and
+/// did not survive fails verification: the previous profile is put back and the
+/// envelope carries the diagnosis.
+///
+/// What the step-level behaviour was is kept here, because it did not change: the
+/// start still *warns*, in the same words, at the same moment. What is new is
+/// only what the operation does with that warning afterwards. The full failure
+/// contract — payload, facts, rollback — is in `tests/verification.rs`.
+#[test]
+fn a_shell_that_will_not_start_is_reported_and_then_rejected_by_verification() {
+    let sandbox = Sandbox::new();
+    shell_fixture(&sandbox);
+    sandbox.fail_on("qs", "-c caelestia");
+    sandbox.clear_log();
+
+    let run = sandbox.run(&["switch", "caelestia"]);
+    let error = run.assert_failed();
+
+    // The warning is unchanged: the failure names the shell and the switch's own
+    // report still says it never came up.
+    let warnings = run.warnings();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("caelestia") && w.contains("failed to start")),
+        "the start still warns first, in the step's own words: {warnings:?}"
+    );
+    let envelope = run.envelope();
+    let data = &envelope["data"];
+    assert_eq!(data["completed_steps"], json!(10));
+    assert_eq!(data["report"]["shell_started"], Value::Null);
+    assert_eq!(data["phase"], json!("verify"));
+    assert_eq!(data["reason_code"], json!("shell-not-alive"));
+    assert_eq!(
+        data["report"]["verification"]["verdict"],
+        json!("fail"),
+        "the ten steps completed and the tier that reads them rejected the result"
+    );
+    assert!(
+        error.contains("shell-not-alive"),
+        "the failure names the reason: {error}"
+    );
+    assert_eq!(
+        sandbox.current_target(),
+        Some(sandbox.profile_dir("ii")),
+        "and the previous profile is the active one again"
+    );
+}
+
+#[test]
+fn a_shell_that_never_exits_does_not_hang_the_switch() {
+    let sandbox = Sandbox::new();
+    fixture(&sandbox);
+    // The real manifests start `qs -c ii` — the desktop itself, which never
+    // exits. A switch that waits for such a start to finish waits forever: it
+    // has already killed the session at step 4, so a hang at step 10 is a dead
+    // desktop and a terminal wedged on one switch line, with no report and no
+    // way back. Beta's shell here is the honest shape of that command: a
+    // process that simply stays alive.
+    sandbox.write_profile(
+        "beta",
+        &common::profile_toml_with_shell(
+            "beta",
+            &["newbar", "shared"],
+            &["newaur"],
+            &[("ags", "ags", "pkill ags")],
+            &[".config/waybar", ".config/kitty"],
+            ("neverends", "sleep 30", "pkill neverends"),
+        ),
+    );
+    sandbox.clear_log();
+
+    let mut child = sandbox.spawn(&["switch", "beta"]);
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (lines_tx, lines_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut buffer = String::new();
+        while reader.read_line(&mut buffer).unwrap_or(0) > 0 {
+            let line = buffer.trim_end().to_string();
+            buffer.clear();
+            if lines_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    // The watchdog the suite lacked: every earlier fixture stub exited
+    // instantly, so `.output()` looked safe in tests and wedged on the real
+    // machine. This switch must close its own envelope in seconds, while the
+    // daemon it started is still sleeping.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut lines: Vec<String> = Vec::new();
+    loop {
+        match lines_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(line) => lines.push(line),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "the switch never finished — it is waiting for a start that never exits. Lines so far: {lines:?}"
+                    );
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let status = child.wait().expect("wait for the switch");
+    assert!(status.success(), "the switch exited {status}");
+    let run = Run::from_parts(lines, String::new());
+    let data = run.envelope();
+    assert_eq!(data["ok"], json!(true), "{}", run.stdout);
+    assert_eq!(
+        data["data"]["completed_steps"],
+        json!(10),
+        "the steps after the daemon start still ran: {}",
+        run.stdout
+    );
+    // Survival through the grace window is reported as started — the desktop
+    // came up and stayed up, which is exactly what happened.
+    assert_eq!(data["data"]["report"]["shell_started"], json!("neverends"));
+}
+
+/// Class: the way back. A path the new profile no longer manages used to be
+/// deleted outright — and on the return leg the old profile's *own* files are
+/// exactly the ones the new profile stopped claiming. Deleting them makes the
+/// round trip the tool exists to support lossy: you can go out, but coming
+/// home finds the config gone. The path is moved into the leaving profile's
+/// `backups/` instead, and the report says so.
+fn round_trip_fixture(sandbox: &Sandbox) {
+    sandbox.write_profile(
+        "out",
+        &common::profile_toml_with_shell(
+            "out",
+            &[],
+            &[],
+            &[("qs", "qs -c $qsConfig", "pkill qs")],
+            &[".config/quickshell/out"],
+            ("out", "qs -c out", "pkill qs"),
+        ),
+    );
+    sandbox.write_profile(
+        "home",
+        &common::profile_toml_with_shell(
+            "home",
+            &[],
+            &[],
+            &[("qs", "qs -c $qsConfig", "pkill qs")],
+            &[".config/quickshell/ii"],
+            ("ii", "qs -c ii", "pkill qs"),
+        ),
+    );
+    // Real content for the managed symlinks to point at — a manifest naming a
+    // path with nothing behind it tests the wiring, not the preservation.
+    sandbox.write_profile_file("out", ".config/quickshell/out/shell.qml", "out shell\n");
+    sandbox.write_profile_file("home", ".config/quickshell/ii/shell.qml", "home shell\n");
+    sandbox.activate("out");
+    // Activation in the real store leaves the managed paths linked; the
+    // fixture mirrors that, or nothing at `~/.config/quickshell/out` exists to
+    // take back.
+    let link = sandbox.home().join(".config/quickshell/out");
+    fs::create_dir_all(link.parent().expect("a parent")).expect("create the parent");
+    symlink(
+        sandbox.profile_dir("out").join(".config/quickshell/out"),
+        &link,
+    )
+    .expect("link the active profile's config");
+}
+
+#[test]
+fn a_path_the_new_profile_does_not_manage_is_preserved_not_deleted() {
+    let sandbox = Sandbox::new();
+    round_trip_fixture(&sandbox);
+    sandbox.clear_log();
+
+    // `plan` is the side that names the paths; `switch` is the side that acts
+    // on them. Both are asserted, so the promise is checked from both ends.
+    let planned = sandbox.run(&["plan", "home"]).assert_ok();
+    let data = sandbox.run(&["switch", "home"]).assert_ok();
+
+    // The path the leaving profile owned and the arriving one does not.
+    assert_eq!(
+        planned["symlink_changes"]["unlink"],
+        json!([".config/quickshell/out"]),
+        "the outgoing shell config is among the paths the switch takes back"
+    );
+    assert_eq!(
+        data["report"]["unlinked"],
+        json!([".config/quickshell/out"]),
+        "and the switch reports acting on it"
+    );
+    assert_eq!(
+        data["report"]["preserved"],
+        json!([".config/quickshell/out"]),
+        "and reports preserving it rather than dropping it"
+    );
+
+    // Its bytes are still there — inside the leaving profile's backups.
+    let backups = sandbox.profile_dir("out").join("backups");
+    assert!(
+        backups.join(".config/quickshell/out").exists(),
+        "the path is preserved under the leaving profile, not deleted: {}",
+        backups.display()
+    );
+    // The profile's own copy is untouched: this is a pointer being moved, not
+    // the config being consumed.
+    assert!(
+        sandbox
+            .profile_dir("out")
+            .join(".config/quickshell/out/shell.qml")
+            .exists(),
+        "the leaving profile still holds its own config"
+    );
+}
+
+#[test]
+fn a_switch_out_and_back_leaves_both_profiles_whole() {
+    let sandbox = Sandbox::new();
+    round_trip_fixture(&sandbox);
+    let out_before = sandbox
+        .profile_dir("out")
+        .join(".config/quickshell/out/shell.qml")
+        .exists();
+    let home_before = sandbox
+        .profile_dir("home")
+        .join(".config/quickshell/ii/shell.qml")
+        .exists();
+    assert!(out_before && home_before, "the fixture ships both configs");
+
+    // Out to the other shell, then home again. The promise is that the second
+    // leg works from a machine the first leg did not damage.
+    sandbox.run(&["switch", "home"]).assert_ok();
+    let returned = sandbox.run(&["switch", "out"]).assert_ok();
+
+    assert_eq!(returned["completed_steps"], json!(10));
+    assert_eq!(sandbox.current_target(), Some(sandbox.profile_dir("out")));
+    assert_eq!(returned["report"]["shell_started"], json!("out"));
+    assert!(
+        sandbox
+            .profile_dir("out")
+            .join(".config/quickshell/out/shell.qml")
+            .exists(),
+        "the first profile's config survived the trip and the return"
+    );
+    assert!(
+        sandbox
+            .profile_dir("home")
+            .join(".config/quickshell/ii/shell.qml")
+            .exists(),
+        "so did the second's"
+    );
+    assert!(
+        sandbox.home().join(".config/quickshell/out").exists(),
+        "and the path is live again, linked to the profile that owns it"
+    );
+}
+
+#[test]
+fn a_second_take_back_of_the_same_path_keeps_both_generations() {
+    let sandbox = Sandbox::new();
+    round_trip_fixture(&sandbox);
+
+    // Out, home, and home again by way of a third profile: the same path is
+    // taken back twice. Neither generation may overwrite the other.
+    sandbox.write_profile(
+        "third",
+        &common::profile_toml_with_shell(
+            "third",
+            &[],
+            &[],
+            &[("qs", "qs -c $qsConfig", "pkill qs")],
+            &[".config/quickshell/ii"],
+            ("ii", "qs -c ii", "pkill qs"),
+        ),
+    );
+    sandbox.run(&["switch", "home"]).assert_ok();
+    sandbox.run(&["switch", "out"]).assert_ok();
+    sandbox.run(&["switch", "home"]).assert_ok();
+    sandbox.run(&["switch", "third"]).assert_ok();
+
+    let backups = sandbox
+        .profile_dir("out")
+        .join("backups/.config/quickshell");
+    let generations: Vec<_> = fs::read_dir(&backups)
+        .expect("the backups directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        generations.len() >= 2,
+        "both take-backs are kept: {generations:?}"
+    );
+}
+
+#[test]
+fn a_path_edited_in_place_while_linked_is_preserved_as_edited() {
+    let sandbox = Sandbox::new();
+    round_trip_fixture(&sandbox);
+
+    // The user replaced the symlink with a real directory and put their own
+    // config in it — a legitimate thing to do while a profile is active. What
+    // is preserved must be *their* version, not the profile's stale capture.
+    let live = sandbox.home().join(".config/quickshell/out");
+    let _ = fs::remove_file(&live);
+    fs::create_dir_all(&live).expect("make a real directory");
+    fs::write(live.join("mine.qml"), "user edit\n").expect("write the edit");
+
+    sandbox.run(&["switch", "home"]).assert_ok();
+
+    let preserved = sandbox
+        .profile_dir("out")
+        .join("backups/.config/quickshell/out/mine.qml");
+    assert_eq!(
+        fs::read_to_string(&preserved).unwrap_or_default(),
+        "user edit\n",
+        "the edit is preserved, not the profile's copy"
+    );
+}
+
+/// A leaving profile whose manifest names foundation packages — the exact
+/// shape the real caelestia manifest had, which raised `pkexec pacman -R
+/// glibc` and died on a polkit denial mid-switch.
+fn system_package_fixture(sandbox: &Sandbox) {
+    let alpha = profile_toml(
+        "alpha",
+        &["glibc", "coreutils", "oldbar"],
+        &["gcc-libs"],
+        &[("waybar", "waybar", "pkill waybar")],
+        &[".config/waybar", ".config/hypr"],
+    );
+    fixture_with(sandbox, &alpha);
+}
+
+/// Class: removal safety. The system-package floor is raised before pacman is
+/// ever asked: a switch away from a profile whose manifest lists foundation
+/// packages removes the ordinary ones, keeps the foundation ones without a
+/// transaction, completes all ten steps, and names what it kept.
+#[test]
+fn a_switch_never_raises_a_transaction_for_system_packages() {
+    let sandbox = Sandbox::new();
+    system_package_fixture(&sandbox);
+
+    let run = sandbox.run(&["switch", "beta"]);
+    let data = run.assert_ok();
+
+    assert_eq!(
+        data["completed_steps"],
+        json!(10),
+        "the switch completes instead of dying at a denial: {data}"
+    );
+    assert_eq!(data["report"]["removed"], json!(["oldbar"]));
+    assert_eq!(
+        data["report"]["protected"],
+        json!(["coreutils", "gcc-libs", "glibc"]),
+        "the floor's keeps are named, official and AUR alike"
+    );
+    assert!(
+        run.warnings().iter().any(|warning| {
+            warning.contains("glibc")
+                && warning.contains("coreutils")
+                && warning.contains("gcc-libs")
+        }),
+        "the decline is warned about, live: {:?}",
+        run.warnings()
+    );
+
+    let log = sandbox.log();
+    for forbidden in ["glibc", "coreutils", "gcc-libs"] {
+        assert!(
+            !log.iter()
+                .any(|line| line.contains("-R") && line.contains(forbidden)),
+            "no removal transaction is ever raised for {forbidden}: {log:?}"
+        );
+    }
+    assert!(
+        log.iter()
+            .any(|line| line.contains("pacman -R --noconfirm oldbar")),
+        "the ordinary removal still happens: {log:?}"
+    );
+}
+
+/// Class: removal safety. The preview gates removals the same way the switch
+/// does, so the panel never offers a `glibc` removal the switch will decline,
+/// and the declined ones are named in the plan for the panel to show.
+#[test]
+fn plan_names_the_removals_the_floor_will_decline() {
+    let sandbox = Sandbox::new();
+    system_package_fixture(&sandbox);
+
+    let data = sandbox.run(&["plan", "beta"]).assert_ok();
+    assert_eq!(
+        data["package_diff"]["remove"],
+        json!({ "official": ["oldbar"], "aur": [] }),
+        "the offered removals exclude the floor: {data}"
+    );
+    assert_eq!(
+        data["remove_protected"],
+        json!(["coreutils", "gcc-libs", "glibc"]),
+        "the declines are named, not hidden"
+    );
+}
+
+/// Two absent packages against no active profile: one transaction for both.
+#[test]
+fn several_missing_official_packages_install_in_one_transaction() {
+    let sandbox = Sandbox::new();
+    fixture(&sandbox);
+    // Two beta official packages absent, one shared present — so only two
+    // install. No active profile, so the raw diff is "every beta official
+    // package", trimmed by the machine to what is actually missing.
+    let _ = fs::remove_file(sandbox.data_dir().join("current"));
+    sandbox.write_profile(
+        "beta",
+        &profile_toml(
+            "beta",
+            &["newbar", "extrabar", "shared"],
+            &["newaur"],
+            &[("ags", "ags", "pkill ags")],
+            &[".config/kitty"],
+        ),
+    );
+    sandbox.mark_installed("shared");
+    sandbox.mark_installed("newaur");
+    sandbox.clear_log();
+
+    let data = sandbox.run(&["switch", "beta"]).assert_ok();
+
+    assert_eq!(data["completed_steps"], json!(10));
+    assert!(
+        data["report"]["installed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "newbar")
+            && data["report"]["installed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "extrabar"),
+        "both missing packages are reported installed: {}",
+        data["report"]["installed"]
+    );
+    let installs: Vec<_> = locked_commands(&sandbox)
+        .into_iter()
+        .filter(|line| line.contains("-S --noconfirm") && line.contains("newbar"))
+        .collect();
+    assert_eq!(
+        installs.len(),
+        1,
+        "one batch for the two-package install, not two prompts: {installs:?}"
+    );
+    assert!(
+        installs[0].contains("extrabar"),
+        "the batch names both packages: {}",
+        installs[0]
+    );
+}
+
+/// Several removable packages go in one transaction, not one per package.
+#[test]
+fn several_removals_run_in_one_transaction() {
+    let sandbox = Sandbox::new();
+    fixture(&sandbox);
+    sandbox.clear_log();
+
+    let run = sandbox.run(&["switch", "beta"]);
+    let data = run.assert_ok();
+
+    assert_eq!(data["completed_steps"], json!(10));
+    assert_eq!(data["report"]["removed"], json!(["oldbar", "oldaur"]));
+    assert!(run.warnings().is_empty(), "{:?}", run.warnings());
+
+    let removes: Vec<_> = locked_commands(&sandbox)
+        .into_iter()
+        .filter(|line| line.contains("-R --noconfirm"))
+        .collect();
+    assert_eq!(
+        removes.len(),
+        1,
+        "one batch for the two-package removal, not two prompts: {removes:?}"
+    );
+    assert!(
+        removes[0].contains("oldbar") && removes[0].contains("oldaur"),
+        "the batch names both packages: {}",
+        removes[0]
+    );
+}
+
+/// A leaving profile whose removals are *all* still needed by the machine —
+/// the shape of the real caelestia manifest, where ~twenty packages each had
+/// a dependent. The old code raised one `pkexec` per package after the batch
+/// died on the first refusal: twenty password prompts for a switch. The
+/// `pacman -Qi` pre-filter must keep every one of them without raising a
+/// removal transaction at all.
+#[test]
+fn every_removal_still_needed_raises_no_transaction() {
+    let sandbox = Sandbox::new();
+    let alpha = profile_toml(
+        "alpha",
+        &[
+            "oldbar",
+            "oldbaz",
+            "oldqux",
+            "legacydep",
+            "fuzzel",
+            "cava",
+            "songrec",
+            "neovim",
+        ],
+        &["oldaur", "legacyaur"],
+        &[],
+        &[".config/kitty"],
+    );
+    fixture_with(&sandbox, &alpha);
+    for package in [
+        "oldbar",
+        "oldbaz",
+        "oldqux",
+        "legacydep",
+        "fuzzel",
+        "cava",
+        "songrec",
+        "neovim",
+        "oldaur",
+        "legacyaur",
+    ] {
+        sandbox.declare_still_needed(package);
+    }
+    sandbox.clear_log();
+
+    let run = sandbox.run(&["switch", "beta"]);
+    let data = run.assert_ok();
+
+    assert_eq!(
+        data["report"]["removed"],
+        json!([]),
+        "nothing is removed — every package is still needed: {data}"
+    );
+    assert_eq!(
+        data["report"]["kept"],
+        json!([
+            "oldbar",
+            "oldbaz",
+            "oldqux",
+            "legacydep",
+            "fuzzel",
+            "cava",
+            "songrec",
+            "neovim",
+            "oldaur",
+            "legacyaur"
+        ]),
+        "each kept package is named in the report"
+    );
+    assert!(
+        run.warnings()
+            .iter()
+            .all(|warning| warning.contains("kept:")),
+        "the declines surface as kept notes, never as failures: {:?}",
+        run.warnings()
+    );
+
+    let log = sandbox.log();
+    assert!(
+        log.iter().all(|line| !line.contains("-R")),
+        "no removal transaction of any kind is raised — the whole storm is \
+         pre-filtered out: {log:?}"
+    );
+    assert!(
+        log.iter()
+            .filter(|line| line.starts_with("pacman -Qi "))
+            .count()
+            >= 10,
+        "the pre-filter actually ran per candidate: {log:?}"
+    );
+}
+
+/// Class: a package the machine satisfies under another name is not missing.
+/// `matugen-bin` provides `matugen`; asking pacman by name alone (`-Qq`) said
+/// `matugen` was absent, and the switch tried to install the repo `matugen`
+/// over the package that already stood in for it — a transaction pacman
+/// refuses whole, taking `neovim` down with it.
+fn provider_fixture(sandbox: &Sandbox) {
+    sandbox.write_profile(
+        "gamma",
+        &profile_toml("gamma", &["matugen", "neovim"], &[], &[], &[]),
+    );
+    sandbox.mark_installed("matugen-bin");
+    sandbox.provide("matugen-bin", "matugen");
+}
+
+#[test]
+fn plan_does_not_report_a_package_missing_when_another_installed_one_provides_it() {
+    let sandbox = Sandbox::new();
+    provider_fixture(&sandbox);
+
+    let data = sandbox.run(&["plan", "gamma"]).assert_ok();
+
+    assert_eq!(
+        data["install_missing"]["official"],
+        json!(["neovim"]),
+        "matugen is satisfied by matugen-bin: {data}"
+    );
+}
+
+#[test]
+fn switch_never_asks_pacman_to_install_what_an_installed_package_provides() {
+    let sandbox = Sandbox::new();
+    provider_fixture(&sandbox);
+    sandbox.clear_log();
+
+    let run = sandbox.run(&["switch", "gamma"]);
+    let data = run.assert_ok();
+
+    assert_eq!(data["report"]["installed"], json!(["neovim"]), "{data}");
+    let installs: Vec<String> = sandbox
+        .log()
+        .into_iter()
+        .filter(|line| line.contains("pacman -S") || line.starts_with("pacman -S"))
+        .collect();
+    assert!(
+        installs.iter().all(|line| !line.contains("matugen")),
+        "the provided package stays out of the transaction: {installs:?}"
+    );
+}
+
+/// Class: the verdict names what actually failed. When polkit has no agent
+/// and `sudo` authenticates, a transaction that then fails on its own terms
+/// (a package conflict, a missing repo) is pacman's failure — reporting the
+/// discarded polkit refusal instead tells the user their password was wrong
+/// when it was accepted.
+#[test]
+fn a_transaction_that_fails_after_sudo_authenticated_reports_its_own_error() {
+    let sandbox = Sandbox::new();
+    fixture(&sandbox);
+    sandbox.script("pkexec", Mode::Denied);
+    sandbox.fail_on("pacman", "-S");
+    sandbox.clear_log();
+
+    let run = sandbox.run(&["switch", "beta"]);
+    let error = run.assert_failed();
+
+    assert!(
+        error.contains("scripted failure"),
+        "pacman's own failure is the verdict: {error}"
+    );
+    assert!(
+        !error.contains("Not authorized"),
+        "an accepted password is not reported as a refused one: {error}"
+    );
+}
+
+/// Class: the compositor that answers is the one the switch reloads. A shell
+/// started before a Hyprland restart keeps that session's instance signature
+/// in its environment; the dead instance's socket file is still on disk, and
+/// `hyprctl reload` aimed at it exits 4. The switch swallowed that, reported
+/// success, and left Hyprland on the old config with the new rice's shell
+/// on top of it.
+#[test]
+fn a_stale_instance_signature_does_not_stop_the_reload_reaching_the_live_compositor() {
+    use std::os::unix::net::UnixListener;
+
+    let sandbox = Sandbox::new();
+    fixture(&sandbox);
+    let runtime = sandbox.outside_home("runtime");
+    let socket = |signature: &str| {
+        let dir = runtime.join("hypr").join(signature);
+        fs::create_dir_all(&dir).expect("create instance dir");
+        UnixListener::bind(dir.join(".socket.sock")).expect("bind instance socket")
+    };
+    drop(socket("stale-instance"));
+    let _live = socket("live-instance");
+    sandbox.set_env("XDG_RUNTIME_DIR", runtime.to_str().expect("utf-8 path"));
+    sandbox.set_env("HYPRLAND_INSTANCE_SIGNATURE", "stale-instance");
+    sandbox.set_env("RICESWAP_STUB_LIVE_SIG", "live-instance");
+
+    let run = sandbox.run(&["switch", "beta"]);
+    let data = run.assert_ok();
+
+    assert_eq!(
+        data["report"]["reloaded"],
+        json!(true),
+        "the reload reached the compositor that is listening: {data}"
+    );
+    assert!(
+        run.warnings().iter().all(|w| !w.contains("hyprctl is not usable")),
+        "hyprctl is usable once aimed at the live instance: {:?}",
+        run.warnings()
+    );
 }

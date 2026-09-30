@@ -99,8 +99,9 @@ Judgment calls (also reported on the ticket):
   wallpaper-import candidates, progress from the live stream, success
   pops back to Profiles.
 - `views/SwitchView.qml` — the switch flow on one view: confirm (real
-  `plan` diff with expandable sections and a Snapshot-first chain for
-  blocked paths), progress (live step list from state.json / the NDJSON
+  `plan` diff with expandable sections, and a note naming the files the
+  switch will copy into the profile's `backups/` before replacing them),
+  progress (live step list from state.json / the NDJSON
   stream, inline streamed warnings, SIGTERM cancel at a step boundary),
   and result (success report or recovery screen with one-click restore
   from `resume_hint`). Reopening the panel mid-switch resumes the
