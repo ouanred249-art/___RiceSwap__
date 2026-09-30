@@ -56,7 +56,11 @@ done
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 USER_NAME="riceswap-test-${TS}"
-ARTIFACTS="accept/artifacts/${TS}"
+# Absolute, because `su -l` chdirs to the target user's home: a relative
+# evidence path would resolve there, the inner `>>` redirect would fail,
+# and the launch would die before Hyprland existed. (This, not the seat,
+# is what produced the 0-byte session logs.)
+ARTIFACTS="$REPO_ROOT/accept/artifacts/${TS}"
 mkdir -p "$ARTIFACTS"
 FIXTURE_DIR=""
 VT_PID=""
@@ -90,6 +94,13 @@ cleanup() {
   if [[ -n "$DRIVER_VT" ]]; then
     info "Returning console to tty$DRIVER_VT"
     sudo chvt "$DRIVER_VT"
+  fi
+
+  # Undo a sabotage the run never got to: a renamed qs would strand every
+  # quickshell start on the machine, including the driver's own.
+  if [[ -n "${QS_BAK:-}" ]] && [[ -e "$QS_BAK" ]]; then
+    warn "Restoring qs from $QS_BAK (the run died mid-sabotage)"
+    sudo mv "$QS_BAK" "${QS_PATH:-/usr/bin/qs}"
   fi
 
   # Remove sudoers drop-in
@@ -331,17 +342,21 @@ HYPRCONF
 # point of #31); cleanup chvt's back to the driver's VT.
 HYPRLAND_LOG="$ARTIFACTS/hyprland.log"
 DRIVER_VT="$(sudo fgconsole)"
+touch "$HYPRLAND_LOG"
+sudo chmod 666 "$HYPRLAND_LOG"
 
 wait_for_socket() { # <seconds>
-  local end="${1:-30}" i sock
+  # The runtime dir is 0700 owned by the test user — an unprivileged glob
+  # of it can never match, which read a live session as "no socket" and
+  # killed it for being dead. Every look must go through sudo.
+  local end="${1:-30}" i found
   HYPR_INSTANCE=""
   for i in $(seq 1 "$end"); do
-    for sock in "$RUNTIME_DIR"/hypr/*/; do
-      if [[ -d "$sock" ]]; then
-        HYPR_INSTANCE="$(basename "$sock")"
-        return 0
-      fi
-    done
+    found="$(sudo ls -1 "$RUNTIME_DIR/hypr/" 2>/dev/null | head -1 || true)"
+    if [[ -n "$found" ]] && sudo test -d "$RUNTIME_DIR/hypr/$found"; then
+      HYPR_INSTANCE="$found"
+      return 0
+    fi
     # A dead launcher will never produce a socket — stop waiting early.
     kill -0 "$VT_PID" 2>/dev/null || break
     sleep 1
@@ -366,12 +381,15 @@ wait_for_socket() { # <seconds>
 # "in use" and openvt refuses without force. The guard we actually need is
 # the one above: `sudo fuser` proved no *process* holds this VT, and it is
 # never the driver's own. `-w` waits for the switch to land before exec'ing.
-info "Starting Hyprland on tty$FREE_VT (openvt + libseat/seatd preload)"
+# The openvt child's stdio belongs to tty3 — it must be redirected INSIDE
+# the su -l command line to reach us; the outer redirection only catches
+# openvt/su's own messages.
+info "Starting Hyprland on tty$FREE_VT (openvt + libseat/seatd)"
 sudo openvt -f -w -c "$FREE_VT" -s -- \
   su -l "$USER_NAME" -c \
-  "XDG_RUNTIME_DIR='$RUNTIME_DIR' LD_PRELOAD=/usr/lib/libseat.so LIBSEAT_BACKEND=seatd \
-   exec Hyprland --config '/home/$USER_NAME/.config/hypr/hyprland.conf'" \
-  </dev/null >"$HYPRLAND_LOG" 2>&1 &
+  "XDG_RUNTIME_DIR='$RUNTIME_DIR' LIBSEAT_BACKEND=seatd \
+   exec Hyprland --config '/home/$USER_NAME/.config/hypr/hyprland.conf' >>'$HYPRLAND_LOG' 2>&1" \
+  </dev/null >>"$HYPRLAND_LOG" 2>&1 &
 VT_PID=$!
 
 info "Waiting for Hyprland to come up..."
@@ -385,7 +403,7 @@ if ! wait_for_socket 30; then
   sudo openvt -f -w -c "$FREE_VT" -s -- \
     su -l "$USER_NAME" -c \
     "XDG_RUNTIME_DIR='$RUNTIME_DIR' exec start-hyprland Hyprland \
-     --config '/home/$USER_NAME/.config/hypr/hyprland.conf'" \
+     --config '/home/$USER_NAME/.config/hypr/hyprland.conf' >>'$HYPRLAND_LOG' 2>&1" \
     </dev/null >>"$HYPRLAND_LOG" 2>&1 &
   VT_PID=$!
   wait_for_socket 30 || true
@@ -395,12 +413,17 @@ if [[ -z "$HYPR_INSTANCE" ]]; then
   fail "Hyprland did not start (see $HYPRLAND_LOG)"
   echo "---- last lines of the session log ----" >&2
   tail -40 "$HYPRLAND_LOG" >&2 || true
+  echo "---- Hyprland's own logfile ----" >&2
+  sudo find "$RUNTIME_DIR/hypr" -name hyprland.log -exec tail -n 60 {} \; 2>/dev/null \
+    || echo "(no hyprland.log under $RUNTIME_DIR/hypr — the session never got that far)" >&2
+  echo "---- seatd ----" >&2
+  sudo journalctl -u seatd -n 15 --no-pager 2>/dev/null || true
   exit 1
 fi
 # The Wayland socket this session created — grim/ydotool find the composer
 # through it. Not the driver shell's WAYLAND_DISPLAY: same name, different
 # runtime dir, different session.
-TEST_WAYLAND_DISPLAY="$(basename "$(ls -1 "$RUNTIME_DIR"/wayland-* 2>/dev/null | head -1)" 2>/dev/null || true)"
+TEST_WAYLAND_DISPLAY="$(sudo ls -1 "$RUNTIME_DIR" 2>/dev/null | grep '^wayland-' | head -1 || true)"
 ok "Hyprland running (instance: $HYPR_INSTANCE, display: ${TEST_WAYLAND_DISPLAY:-unknown})"
 
 # Override the binary path for run_as — use the one in the test user's home
@@ -525,8 +548,9 @@ phase "7: Sabotage — shell-not-alive"
 # profile, try to launch the shell, fail, and roll back.
 QS_PATH="$(which qs 2>/dev/null || echo "/usr/bin/qs")"
 if [[ -x "$QS_PATH" ]]; then
-  sudo mv "$QS_PATH" "${QS_PATH}.riceswap-bak"
-  info "Renamed $QS_PATH → ${QS_PATH}.riceswap-bak"
+  QS_BAK="${QS_PATH}.riceswap-bak"
+  sudo mv "$QS_PATH" "$QS_BAK"
+  info "Renamed $QS_PATH → $QS_BAK"
 
   # Force a switch that would try to start the shell
   ENVELOPE="$(run_as "sabotage-shell-dead" switch caelestia)"
@@ -549,7 +573,8 @@ print(d.get('data',{}).get('reason_code',''))
   fi
 
   # Restore qs
-  sudo mv "${QS_PATH}.riceswap-bak" "$QS_PATH"
+  sudo mv "$QS_BAK" "$QS_PATH"
+  QS_BAK=""
   info "Restored $QS_PATH"
 else
   warn "qs binary not found at $QS_PATH — skipping shell-not-alive test"
@@ -582,13 +607,26 @@ print(d.get('data',{}).get('reason_code',''))
 " 2>/dev/null || true)"
 
 if [[ "$IDEM_OK" == "False" ]] && [[ "$IDEM_REASON" == "profile-exists" ]]; then
-  ok "idempotent: second install refused with profile-exists"
+  ok "idempotent: second install refused with profile-exists (first completed)"
 elif [[ "$IDEM_OK" == "False" ]]; then
-  warn "idempotent: refused with $IDEM_REASON (expected profile-exists)"
-  ok "idempotent: correctly refused"
+  warn "idempotent: refused with reason_code=$IDEM_REASON"
+  ok "idempotent: correctly refused (not silently accepted)"
 else
-  fail "idempotent: second install should have been refused, but succeeded"
-  exit 1
+  # ok:true on a re-run is ONLY legitimate as a journal RESUME of an install
+  # whose switch failed verification — the AC's "second identical install"
+  # case. Check the resume flag; anything else is the bug this whole ritual
+  # exists to catch.
+  RESUMED="$(printf '%s' "$ENVELOPE" | python3 -c "
+import json,sys; d=json.load(sys.stdin)
+print(d.get('data',{}).get('resumed',''))
+" 2>/dev/null || true)"
+  if [[ "$RESUMED" == "True" ]]; then
+    warn "idempotent: first install did not complete verification; re-run RESUMED it (contract-correct)"
+    ok "idempotent: resume path taken, refusal rule intact for completed installs"
+  else
+    fail "idempotent: a completed install was re-run as a fresh success — refusal rule broken"
+    exit 1
+  fi
 fi
 
 # Verify backup set is unchanged (zero-write idempotency)
