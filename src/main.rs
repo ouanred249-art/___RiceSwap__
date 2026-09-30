@@ -19,6 +19,7 @@ mod tools;
 mod verify;
 
 fn main() {
+    tools::adopt_live_compositor();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match cli::parse(&args) {
         Ok(invocation) => operations::run(invocation),

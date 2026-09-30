@@ -226,6 +226,11 @@ if [ -n "$RICESWAP_STUB_FAULT_DIR" ] && [ -r "$RICESWAP_STUB_FAULT_DIR/$name" ];
     esac
   done < "$RICESWAP_STUB_FAULT_DIR/$name"
 fi
+if [ "$name" = "hyprctl" ] && [ -n "$RICESWAP_STUB_LIVE_SIG" ] \
+  && [ "$HYPRLAND_INSTANCE_SIGNATURE" != "$RICESWAP_STUB_LIVE_SIG" ]; then
+  printf "Couldn't connect to the Hyprland socket. (4)\n" >&2
+  exit 4
+fi
 if [ -n "$RICESWAP_STUB_FAIL_DIR" ] && [ -r "$RICESWAP_STUB_FAIL_DIR/$name" ]; then
   while read -r pattern; do
     [ -n "$pattern" ] || continue

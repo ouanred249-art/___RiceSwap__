@@ -7,6 +7,8 @@
 
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::process::Command;
 
 /// An external tool the backend shells out to.
@@ -96,6 +98,52 @@ impl ToolStatus {
     /// The tool answered cleanly.
     pub fn succeeded(&self) -> bool {
         self.available && self.exit_code == Some(0)
+    }
+}
+
+/// The instance signature of the one live Hyprland this process should talk
+/// to, when the inherited signature names a dead one.
+///
+/// A terminal opened before Hyprland restarted keeps the old session's
+/// `HYPRLAND_INSTANCE_SIGNATURE`, and the dead instance's socket file stays on
+/// disk, so `hyprctl` connects to a corpse and exits 4. Nothing in the switch
+/// noticed: the reload "ran", the envelope said ok, and the compositor kept the
+/// old config under the new rice's shell.
+///
+/// Only a signature that is *set and dead* is corrected. An inherited signature
+/// that answers is the caller's choice, and an unset one is how a scratch
+/// drive says "no compositor here": re-acquiring the desktop for it would
+/// undo that isolation. With more than one live instance there is no honest
+/// pick, so the inherited value is left alone.
+pub fn live_instance_for(runtime_dir: &Path, inherited: Option<&str>) -> Option<String> {
+    let inherited = inherited.filter(|signature| !signature.is_empty())?;
+    let hypr = runtime_dir.join("hypr");
+    let answers = |signature: &str| UnixStream::connect(hypr.join(signature).join(".socket.sock")).is_ok();
+    if answers(inherited) {
+        return None;
+    }
+    let mut live = std::fs::read_dir(&hypr)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|signature| answers(signature));
+    let only = live.next()?;
+    live.next().is_none().then_some(only)
+}
+
+/// Points this process's environment at the live compositor, so every child
+/// it spawns reaches the desktop that is actually running.
+///
+/// Called once, first thing in `main`, before any thread exists.
+pub fn adopt_live_compositor() {
+    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return;
+    };
+    let inherited = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
+    if let Some(live) = live_instance_for(Path::new(&runtime), inherited.as_deref()) {
+        // SAFETY: single-threaded at this point; `main` calls this before
+        // anything is spawned.
+        unsafe { std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", live) };
     }
 }
 

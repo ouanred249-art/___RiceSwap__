@@ -2098,3 +2098,42 @@ fn a_transaction_that_fails_after_sudo_authenticated_reports_its_own_error() {
         "an accepted password is not reported as a refused one: {error}"
     );
 }
+
+/// Class: the compositor that answers is the one the switch reloads. A shell
+/// started before a Hyprland restart keeps that session's instance signature
+/// in its environment; the dead instance's socket file is still on disk, and
+/// `hyprctl reload` aimed at it exits 4. The switch swallowed that, reported
+/// success, and left Hyprland on the old config with the new rice's shell
+/// on top of it.
+#[test]
+fn a_stale_instance_signature_does_not_stop_the_reload_reaching_the_live_compositor() {
+    use std::os::unix::net::UnixListener;
+
+    let sandbox = Sandbox::new();
+    fixture(&sandbox);
+    let runtime = sandbox.outside_home("runtime");
+    let socket = |signature: &str| {
+        let dir = runtime.join("hypr").join(signature);
+        fs::create_dir_all(&dir).expect("create instance dir");
+        UnixListener::bind(dir.join(".socket.sock")).expect("bind instance socket")
+    };
+    drop(socket("stale-instance"));
+    let _live = socket("live-instance");
+    sandbox.set_env("XDG_RUNTIME_DIR", runtime.to_str().expect("utf-8 path"));
+    sandbox.set_env("HYPRLAND_INSTANCE_SIGNATURE", "stale-instance");
+    sandbox.set_env("RICESWAP_STUB_LIVE_SIG", "live-instance");
+
+    let run = sandbox.run(&["switch", "beta"]);
+    let data = run.assert_ok();
+
+    assert_eq!(
+        data["report"]["reloaded"],
+        json!(true),
+        "the reload reached the compositor that is listening: {data}"
+    );
+    assert!(
+        run.warnings().iter().all(|w| !w.contains("hyprctl is not usable")),
+        "hyprctl is usable once aimed at the live instance: {:?}",
+        run.warnings()
+    );
+}
