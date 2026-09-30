@@ -254,13 +254,13 @@ fn switch_runs_the_locked_sequence_in_order() {
     let sequence: Vec<String> = locked_commands(&sandbox)
         .into_iter()
         .filter(|line| {
-            // `pacman -Qq` (what is already installed) and `pacman -Qi`
+            // `pacman -T` (what the machine already satisfies) and `pacman -Qi`
             // (still-needed pre-filter) are read-only queries; like the probes
             // they are not part of the locked sequence.
             !(line.ends_with("--version")
                 || line.ends_with("-h")
                 || line.ends_with(" version")
-                || line == "pacman -Qq"
+                || line.starts_with("pacman -T")
                 || line.starts_with("pacman -Qi "))
         })
         .collect();
@@ -1250,7 +1250,7 @@ fn the_confirmation_plan_is_read_only_so_cancel_aborts_before_anything_runs() {
     );
     for line in sandbox.log() {
         assert!(
-            line == "pacman -Qq" || line.ends_with("--version"),
+            line.starts_with("pacman -T") || line.ends_with("--version"),
             "plan only probes tools and asks pacman what is installed, never transacts: {line}"
         );
         assert!(
@@ -2021,5 +2021,80 @@ fn every_removal_still_needed_raises_no_transaction() {
             .count()
             >= 10,
         "the pre-filter actually ran per candidate: {log:?}"
+    );
+}
+
+/// Class: a package the machine satisfies under another name is not missing.
+/// `matugen-bin` provides `matugen`; asking pacman by name alone (`-Qq`) said
+/// `matugen` was absent, and the switch tried to install the repo `matugen`
+/// over the package that already stood in for it — a transaction pacman
+/// refuses whole, taking `neovim` down with it.
+fn provider_fixture(sandbox: &Sandbox) {
+    sandbox.write_profile(
+        "gamma",
+        &profile_toml("gamma", &["matugen", "neovim"], &[], &[], &[]),
+    );
+    sandbox.mark_installed("matugen-bin");
+    sandbox.provide("matugen-bin", "matugen");
+}
+
+#[test]
+fn plan_does_not_report_a_package_missing_when_another_installed_one_provides_it() {
+    let sandbox = Sandbox::new();
+    provider_fixture(&sandbox);
+
+    let data = sandbox.run(&["plan", "gamma"]).assert_ok();
+
+    assert_eq!(
+        data["install_missing"]["official"],
+        json!(["neovim"]),
+        "matugen is satisfied by matugen-bin: {data}"
+    );
+}
+
+#[test]
+fn switch_never_asks_pacman_to_install_what_an_installed_package_provides() {
+    let sandbox = Sandbox::new();
+    provider_fixture(&sandbox);
+    sandbox.clear_log();
+
+    let run = sandbox.run(&["switch", "gamma"]);
+    let data = run.assert_ok();
+
+    assert_eq!(data["report"]["installed"], json!(["neovim"]), "{data}");
+    let installs: Vec<String> = sandbox
+        .log()
+        .into_iter()
+        .filter(|line| line.contains("pacman -S") || line.starts_with("pacman -S"))
+        .collect();
+    assert!(
+        installs.iter().all(|line| !line.contains("matugen")),
+        "the provided package stays out of the transaction: {installs:?}"
+    );
+}
+
+/// Class: the verdict names what actually failed. When polkit has no agent
+/// and `sudo` authenticates, a transaction that then fails on its own terms
+/// (a package conflict, a missing repo) is pacman's failure — reporting the
+/// discarded polkit refusal instead tells the user their password was wrong
+/// when it was accepted.
+#[test]
+fn a_transaction_that_fails_after_sudo_authenticated_reports_its_own_error() {
+    let sandbox = Sandbox::new();
+    fixture(&sandbox);
+    sandbox.script("pkexec", Mode::Denied);
+    sandbox.fail_on("pacman", "-S");
+    sandbox.clear_log();
+
+    let run = sandbox.run(&["switch", "beta"]);
+    let error = run.assert_failed();
+
+    assert!(
+        error.contains("scripted failure"),
+        "pacman's own failure is the verdict: {error}"
+    );
+    assert!(
+        !error.contains("Not authorized"),
+        "an accepted password is not reported as a refused one: {error}"
     );
 }

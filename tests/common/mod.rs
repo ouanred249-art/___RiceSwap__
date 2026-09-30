@@ -94,8 +94,12 @@ impl Mode {
 ///   `RICESWAP_STUB_OWNERS` fixture maps (by exact name or by basename, so a
 ///   PATH-resolved path answers too) and exits 1 for anything unowned;
 /// - `pacman -Qm` lists the fixture entries marked `aur`;
-/// - `pacman -Qq` lists the packages the fixture's install state says are
-///   present, which is what `plan`'s `install_missing` is computed against;
+/// - `pacman -T <names…>` is the dependency-satisfaction query `plan`'s
+///   `install_missing` is computed against: it prints the names nothing on
+///   the machine satisfies and exits 127 when there are any. A name is
+///   satisfied by an installed package of that name, or by an installed
+///   package the `RICESWAP_STUB_PROVIDES` fixture (`<provider> <provided>`)
+///   says provides it — the way `matugen-bin` satisfies `matugen`;
 /// - `grim <path>` writes the screenshot file it was pointed at (its version
 ///   probe is `grim -h`, which falls through to the generic answer);
 /// - `pkexec`, `sudo` and `riceswap-float` answer `--version` like any other
@@ -294,11 +298,25 @@ if [ "$mode" = "ok" ]; then
     printf "error: no possible owner found for '%s'\n" "$query" >&2
     exit 1
   fi
-  if [ "$name" = "pacman" ] && [ "$1" = "-Qq" ]; then
-    if [ -n "$RICESWAP_STUB_PACKAGES" ] && [ -f "$RICESWAP_STUB_PACKAGES" ]; then
-      cat "$RICESWAP_STUB_PACKAGES"
-    fi
-    exit 0
+  if [ "$name" = "pacman" ] && [ "$1" = "-T" ]; then
+    shift
+    unmet=0
+    for wanted in "$@"; do
+      satisfied=0
+      if [ -f "$RICESWAP_STUB_PACKAGES" ] && grep -Fxq "$wanted" "$RICESWAP_STUB_PACKAGES"; then
+        satisfied=1
+      elif [ -r "$RICESWAP_STUB_PROVIDES" ]; then
+        while read -r provider provided; do
+          if [ "$provided" = "$wanted" ] && [ -f "$RICESWAP_STUB_PACKAGES" ] \
+            && grep -Fxq "$provider" "$RICESWAP_STUB_PACKAGES"; then
+            satisfied=1
+          fi
+        done < "$RICESWAP_STUB_PROVIDES"
+      fi
+      if [ "$satisfied" = 0 ]; then printf '%s\n' "$wanted"; unmet=1; fi
+    done
+    [ "$unmet" = 0 ] && exit 0
+    exit 127
   fi
   if [ "$name" = "pacman" ] && [ "$1" = "-Qi" ]; then
     package=$2
@@ -430,6 +448,7 @@ pub struct Sandbox {
     conflicts: PathBuf,
     needed: PathBuf,
     packages: PathBuf,
+    provides: PathBuf,
     delays: PathBuf,
     fails: PathBuf,
     faults: PathBuf,
@@ -477,6 +496,7 @@ impl Sandbox {
         let conflicts = root.path().join("package-conflicts.txt");
         let needed = root.path().join("still-needed.txt");
         let packages = root.path().join("installed-packages.txt");
+        let provides = root.path().join("package-provides.txt");
         let delays = root.path().join("delays");
         let fails = root.path().join("fail-on");
         let faults = root.path().join("faults");
@@ -502,6 +522,7 @@ impl Sandbox {
         fs::write(&conflicts, "").expect("create package conflict fixture");
         fs::write(&needed, "").expect("create still-needed fixture");
         fs::write(&packages, "").expect("create installed-package state");
+        fs::write(&provides, "").expect("create package provides fixture");
         fs::write(&git_source, "").expect("create git clone-source fixture");
         fs::write(&git_sha, "1a2b3c4d5e6f70819a2b3c4d5e6f70819a2b3c4d\n")
             .expect("create git sha fixture");
@@ -525,6 +546,7 @@ impl Sandbox {
             conflicts,
             needed,
             packages,
+            provides,
             delays,
             fails,
             faults,
@@ -580,6 +602,15 @@ impl Sandbox {
             state.push_str(&format!("{package}\n"));
             fs::write(&self.packages, state).expect("write package state");
         }
+    }
+
+    /// Declares that the installed package `provider` satisfies the name
+    /// `provided` without being named that — `matugen-bin` for `matugen`.
+    /// The provider must also be installed (`mark_installed`) to count.
+    pub fn provide(&self, provider: &str, provided: &str) {
+        let mut provides = fs::read_to_string(&self.provides).expect("read provides fixture");
+        provides.push_str(&format!("{provider} {provided}\n"));
+        fs::write(&self.provides, provides).expect("write provides fixture");
     }
 
     /// Every package the stub state holds as installed, in file order.
@@ -832,6 +863,7 @@ impl Sandbox {
             ("RICESWAP_STUB_CONFLICTS", &self.conflicts),
             ("RICESWAP_STUB_NEEDED", &self.needed),
             ("RICESWAP_STUB_PACKAGES", &self.packages),
+            ("RICESWAP_STUB_PROVIDES", &self.provides),
             ("RICESWAP_STUB_DELAY_DIR", &self.delays),
             ("RICESWAP_STUB_FAIL_DIR", &self.fails),
             ("RICESWAP_STUB_FAULT_DIR", &self.faults),

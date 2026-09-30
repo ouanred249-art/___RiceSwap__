@@ -2326,7 +2326,12 @@ fn run_privileged(prefix: &[&str], args: &[&str]) -> std::io::Result<Output> {
     fallback.extend(prefix.iter().skip(1).copied());
     fallback.extend(args.iter().copied());
     match run_command(&fallback, &[]) {
-        Ok(retried) if retried.status.success() => {
+        // sudo authenticated and ran the transaction. Whatever it answered,
+        // success or pacman's own failure, is the verdict: the polkit refusal
+        // it replaced says nothing about why pacman then stopped, and
+        // reporting it tells a user whose password was accepted that it was
+        // not.
+        Ok(retried) if retried.status.success() || !sudo_refused(&retried) => {
             // sudo's credential cache keeps this the only terminal prompt of
             // the switch, however many transactions polkit refused.
             eprintln!(
@@ -2344,6 +2349,15 @@ fn run_privileged(prefix: &[&str], args: &[&str]) -> std::io::Result<Output> {
             Ok(output)
         }
     }
+}
+
+/// Whether a failed `sudo` run died at `sudo` itself — a password it would
+/// not take, no terminal to ask on — rather than inside the command it
+/// elevated. `sudo` prefixes its own complaints with `sudo:`; the elevated
+/// `pacman` speaks as `error:`.
+fn sudo_refused(output: &Output) -> bool {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr.contains(AUTH_REFUSAL) || stderr.lines().any(|line| line.starts_with("sudo:"))
 }
 
 /// What a failed transaction said — or how it died when it said nothing — so
@@ -3315,39 +3329,51 @@ fn compute_symlink_changes(
     (link, unlink)
 }
 
-/// The packages in `wanted` that this machine does not have, per `pacman -Qq`.
+/// The packages in `wanted` that this machine does not satisfy, per `pacman -T`.
 ///
 /// `plan` reports the raw manifest difference, which on a first switch is every
-/// package the target declares. Intersecting with what is actually installed
-/// is what turns "this profile declares 20 packages" into "this machine is
+/// package the target declares. Intersecting with what the machine already
+/// has is what turns "this profile declares 20 packages" into "this machine is
 /// missing 5", which is the number worth putting in front of someone before
 /// they authorise a switch.
 ///
+/// The question goes to pacman's own resolver, not to a list of installed
+/// names: `matugen-bin` provides `matugen`, so a name-only comparison called
+/// `matugen` missing and the switch tried to install the repo package over the
+/// one already standing in for it, a transaction pacman refuses whole. `-T`
+/// prints exactly the names nothing installed satisfies and exits 127 when
+/// there are any.
+///
 /// The query runs under plain `pacman`, never the `OFFICIAL` prefix: `plan` is
 /// a preview, and a preview that asks for a password is not a preview. A query
-/// pacman cannot answer leaves the set alone — the manifest difference stays
-/// the conservative answer.
+/// pacman cannot answer (it did not run, or exited with neither 0 nor 127)
+/// leaves the set alone: the manifest difference stays the conservative answer.
 fn missing_from_machine(wanted: &[String]) -> Vec<String> {
     if wanted.is_empty() {
         return Vec::new();
     }
-    let Ok(output) = run_command(&[Tool::Pacman.name()], &["-Qq"]) else {
+    let mut args: Vec<&str> = vec!["-T"];
+    args.extend(wanted.iter().map(String::as_str));
+    let Ok(output) = run_command(&[Tool::Pacman.name()], &args) else {
         return wanted.to_vec();
     };
-    if !output.status.success() {
-        return wanted.to_vec();
+    match output.status.code() {
+        Some(0) => Vec::new(),
+        Some(127) => {
+            let listing = String::from_utf8_lossy(&output.stdout).into_owned();
+            let unmet: std::collections::HashSet<&str> = listing
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect();
+            wanted
+                .iter()
+                .filter(|package| unmet.contains(package.as_str()))
+                .cloned()
+                .collect()
+        }
+        _ => wanted.to_vec(),
     }
-    let listing = String::from_utf8_lossy(&output.stdout).into_owned();
-    let installed: std::collections::HashSet<&str> = listing
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect();
-    wanted
-        .iter()
-        .filter(|package| !installed.contains(package.as_str()))
-        .cloned()
-        .collect()
 }
 
 /// The real files standing at the paths a switch would link, split by what the
