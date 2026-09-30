@@ -148,23 +148,48 @@ fi
 # Run riceswap as the test user inside their Hyprland session.
 # Usage: run_as <label> <args...>
 # Captures the NDJSON envelope to $ARTIFACTS/<label>.ndjson
-run_as() {
+run_as() { # <label> <args...> — envelope -> $ARTIFACTS/<label>.ndjson
   local label="$1"; shift
-  info "riceswap $* (as $USER_NAME)"
-  local out
-  # Run inside the test user's environment, pointing at their HOME and
-  # the Hyprland socket.
-  out="$(sudo -u "$USER_NAME" \
-    env HOME="/home/$USER_NAME" \
-        XDG_RUNTIME_DIR="/run/user/$(id -u "$USER_NAME")" \
-        HYPRLAND_INSTANCE_SIGNATURE="${HYPR_INSTANCE:-}" \
-        WAYLAND_DISPLAY="${TEST_WAYLAND_DISPLAY:-wayland-1}" \
-    "$BIN" "$@" 2>&1 || true)"
-  printf '%s\n' "$out" > "$ARTIFACTS/$label.ndjson"
-  # Parse the last line as the envelope
-  local envelope
-  envelope="$(printf '%s\n' "$out" | tail -1)"
-  printf '%s\n' "$envelope"
+  # `info` writes to stdout, and this function's stdout is captured as the
+  # envelope — so the banner goes to stderr here. (A stdout banner merged
+  # with the JSON is what made phase 5 "Expecting value" on `▸`.)
+  printf '%s riceswap %s (as %s)\n' "▸" "$*" "$USER_NAME" >&2
+  # env -i is not cosmetic: sudo -u passes the CALLER's env through, and the
+  # last run proved what that does — caelestia inherited the driver's DISPLAY
+  # and tried X11 ("Authorization required", Xlib's refusal), landing a fake
+  # shell-not-alive on a rice that never got to speak Wayland. Only the test
+  # session's own compositor identity may cross.
+  sudo -u "$USER_NAME" env -i \
+    HOME="/home/$USER_NAME" \
+    PATH="/usr/local/bin:/usr/bin:/bin:$HOME_BIN" \
+    XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    XDG_DATA_DIRS="/usr/local/share:/usr/share" \
+    USER="$USER_NAME" LOGNAME="$USER_NAME" \
+    LANG="${LANG:-C.UTF-8}" \
+    HYPRLAND_INSTANCE_SIGNATURE="${HYPR_INSTANCE:-}" \
+    WAYLAND_DISPLAY="${TEST_WAYLAND_DISPLAY:-}" \
+    "$BIN" "$@" > "$ARTIFACTS/$label.ndjson" 2>&1 || true
+  # stdout = the final envelope line, alone.
+  tail -1 "$ARTIFACTS/$label.ndjson"
+}
+
+# env_fact <label> <python expr over the envelope dict `d`> — read one fact
+# straight from the archived NDJSON, so an assertion never depends on a
+# function's stdout shape.
+env_fact() {
+  local f="$ARTIFACTS/$1.ndjson"
+  [[ -f "$f" ]] || { echo ""; return; }
+  tail -1 "$f" | python3 -c "
+import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print(''); raise SystemExit
+try:
+    print($2)
+except Exception:
+    print('')
+" 2>/dev/null || true
 }
 
 # Extract a field from a JSON envelope (stdin)
@@ -387,7 +412,7 @@ wait_for_socket() { # <seconds>
 info "Starting Hyprland on tty$FREE_VT (openvt + libseat/seatd)"
 sudo openvt -f -w -c "$FREE_VT" -s -- \
   su -l "$USER_NAME" -c \
-  "XDG_RUNTIME_DIR='$RUNTIME_DIR' LIBSEAT_BACKEND=seatd \
+  "sleep 4; XDG_RUNTIME_DIR='$RUNTIME_DIR' LD_PRELOAD=/usr/lib/libseat.so LIBSEAT_BACKEND=seatd \
    exec Hyprland --config '/home/$USER_NAME/.config/hypr/hyprland.conf' >>'$HYPRLAND_LOG' 2>&1" \
   </dev/null >>"$HYPRLAND_LOG" 2>&1 &
 VT_PID=$!
@@ -402,7 +427,7 @@ if ! wait_for_socket 30; then
   warn "libseat preload produced no socket — retrying via start-hyprland"
   sudo openvt -f -w -c "$FREE_VT" -s -- \
     su -l "$USER_NAME" -c \
-    "XDG_RUNTIME_DIR='$RUNTIME_DIR' exec start-hyprland Hyprland \
+    "sleep 4; XDG_RUNTIME_DIR='$RUNTIME_DIR' exec start-hyprland Hyprland \
      --config '/home/$USER_NAME/.config/hypr/hyprland.conf' >>'$HYPRLAND_LOG' 2>&1" \
     </dev/null >>"$HYPRLAND_LOG" 2>&1 &
   VT_PID=$!
@@ -416,18 +441,41 @@ if [[ -z "$HYPR_INSTANCE" ]]; then
   echo "---- Hyprland's own logfile ----" >&2
   sudo find "$RUNTIME_DIR/hypr" -name hyprland.log -exec tail -n 60 {} \; 2>/dev/null \
     || echo "(no hyprland.log under $RUNTIME_DIR/hypr — the session never got that far)" >&2
-  echo "---- seatd ----" >&2
-  sudo journalctl -u seatd -n 15 --no-pager 2>/dev/null || true
+  echo "---- seatd, last 3 minutes ----" >&2
+  sudo journalctl -u seatd --since "-3 minutes" --no-pager 2>/dev/null | tail -25 || true
   exit 1
 fi
 # The Wayland socket this session created — grim/ydotool find the composer
 # through it. Not the driver shell's WAYLAND_DISPLAY: same name, different
 # runtime dir, different session.
-TEST_WAYLAND_DISPLAY="$(sudo ls -1 "$RUNTIME_DIR" 2>/dev/null | grep '^wayland-' | head -1 || true)"
-ok "Hyprland running (instance: $HYPR_INSTANCE, display: ${TEST_WAYLAND_DISPLAY:-unknown})"
+TEST_WAYLAND_DISPLAY="$(sudo find "$RUNTIME_DIR" -maxdepth 2 -type s -name 'wayland-*' -printf '%f\n' 2>/dev/null | sort | head -1 || true)"
+# Phase 4 detected the instance DIRECTORY, which Hyprland creates BEFORE it
+# finishes binding the socket or the seat comes fully up. A session that dies
+# in that gap makes every later verdict noise, so prove it answers hyprctl,
+# and on failure dump its OWN logfile (Hyprland silences stdout early — the
+# empty hyprland.log is why the last diagnosis was blind).
+if ! timeout 5 sudo -u "$USER_NAME" env -i HOME="/home/$USER_NAME" \
+     XDG_RUNTIME_DIR="$RUNTIME_DIR" HYPRLAND_INSTANCE_SIGNATURE="$HYPR_INSTANCE" \
+     hyprctl activewindows >/dev/null 2>&1; then
+  fail "the test Hyprland is not answering hyprctl — the session died after startup"
+  echo "──── Hyprland's own logfile ────" >&2
+  sudo find "$RUNTIME_DIR/hypr/$HYPR_INSTANCE" -name 'hyprland.log' -exec tail -n 60 '{}' ';' 2>/dev/null \
+    || echo "(none — Hyprland never wrote it)" >&2
+  echo "──── seatd, last 3 minutes ────" >&2
+  sudo journalctl -u seatd --since "-3 minutes" --no-pager 2>/dev/null | tail -25 || true
+  echo "──── crash reports ────" >&2
+  sudo find "/home/$USER_NAME/.local/share/hyprland" -type f -exec tail -n 20 '{}' ';' 2>/dev/null \
+    || echo "(no crash dir — died before Hyprland wrote it)" >&2
+  exit 1
+fi
+# Alive but the socket scan missed it: a Hyprland session is wayland-1 by
+# default (this machine's driver is Xorg, so no clash on that number).
+[[ -z "$TEST_WAYLAND_DISPLAY" ]] && TEST_WAYLAND_DISPLAY="wayland-1"
+ok "Hyprland running (instance: $HYPR_INSTANCE, display: $TEST_WAYLAND_DISPLAY) — session answers"
 
 # Override the binary path for run_as — use the one in the test user's home
 BIN="/home/$USER_NAME/.local/bin/riceswap"
+HOME_BIN="/home/$USER_NAME/.local/bin"
 
 # Initialize riceswap for the test user
 info "Initializing riceswap store"
